@@ -119,8 +119,9 @@ static int       g_dpi = 96;
 
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
-static HPEN   g_penDim, g_penAccent;      // 标题栏图形（缓存，见 MakeGlyphObjects）
+static HPEN   g_penDim, g_penAccent;      // 标题栏图形（缓存，见 MakeGdiObjects）
 static HBRUSH g_brPinOn, g_brPinOff;
+static HPEN   g_penLine;                  // 格子边框（同出处）
 static int    g_cw, g_ch;
 static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
 static HBITMAP g_memBmp;
@@ -606,13 +607,19 @@ static HICON MakeFolderIcon(int sz)
     return ico;
 }
 
+// 扩展名判断：.lnk 检测等处共用（大小写不敏感）
+static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
+{
+    const WCHAR *dot = wcsrchr(path, L'.');
+    return dot && !_wcsicmp(dot, ext);
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
     DWORD a = GetFileAttributesW(path);
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
         return MakeFolderIcon(want);                        // 不进 shell 图标管线
-    const WCHAR *dot = wcsrchr(path, L'.');
-    if (dot && !_wcsicmp(dot, L".lnk")) {
+    if (HasExt(path, L".lnk")) {
         LnkInfo lnk;
         if (!ParseLnk(path, &lnk)) return NULL;             // 坏 .lnk：通用图标
         HICON h = NULL;
@@ -821,8 +828,7 @@ static void Launch(int idx, BOOL asAdmin)
     const Item *it = &g_items[idx];
     if (!it->path[0]) return;               // 空格：没有可启动的目标
     if (!asAdmin) {
-        const WCHAR *dot = wcsrchr(it->path, L'.');
-        if (dot && !_wcsicmp(dot, L".lnk")) {
+        if (HasExt(it->path, L".lnk")) {
             LnkInfo lnk;
             if (ParseLnk(it->path, &lnk) && lnk.target[0] &&
                 CreateRun(lnk.target,
@@ -1177,16 +1183,18 @@ static void MakeBrushes(void)
     g_brPanel  = CreateSolidBrush(C_PANEL);
 }
 
-// 标题栏两个按钮图形的 GDI 对象：颜色固定、线宽随 DPI，DPI 变化时整套重建。
-// 原来每画一次标题栏就 CreatePen/CreateSolidBrush 再逐个销毁，纯 churn
-static void MakeGlyphObjects(void)
+// 标题栏图形与格子边框的 GDI 对象：颜色固定、线宽随 DPI，DPI 变化时整套重建。
+// 原来每画一次就 CreatePen/CreateSolidBrush 再逐个销毁，纯 churn
+static void MakeGdiObjects(void)
 {
     if (g_penDim)    { DeleteObject(g_penDim);    g_penDim = NULL; }
     if (g_penAccent) { DeleteObject(g_penAccent); g_penAccent = NULL; }
     if (g_brPinOn)   { DeleteObject(g_brPinOn);   g_brPinOn = NULL; }
     if (g_brPinOff)  { DeleteObject(g_brPinOff);  g_brPinOff = NULL; }
+    if (g_penLine)   { DeleteObject(g_penLine);   g_penLine = NULL; }
     g_penDim    = CreatePen(PS_SOLID, S_(1), C_DIM);
     g_penAccent = CreatePen(PS_SOLID, 1, C_ACCENT);
+    g_penLine   = CreatePen(PS_SOLID, 1, C_LINE);
     g_brPinOn   = CreateSolidBrush(C_ACCENT);
     g_brPinOff  = CreateSolidBrush(C_BG);
 }
@@ -1195,7 +1203,7 @@ static void MakeFontsAndBrushes(void)
 {
     MakeFonts();
     MakeBrushes();
-    MakeGlyphObjects();
+    MakeGdiObjects();
 }
 
 // ---------------------------------------------------------------- 悬停文字
@@ -1268,6 +1276,15 @@ static void InvalidateTitle(void)
 {
     RECT r = { 0, 0, g_cw, g_titleH };
     InvalidateRect(g_hwnd, &r, FALSE);
+}
+
+// 钉住开关：标题栏图钉点击与托盘菜单共用
+static void TogglePin(void)
+{
+    g_pinned = !g_pinned;
+    SaveConfig();
+    UpdateHoverText();
+    InvalidateTitle();
 }
 
 static void DrawPinGlyph(HDC dc, RECT r, BOOL on)
@@ -1355,6 +1372,10 @@ static void PaintGrid(HDC dc, const RECT *clip)
     // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
     // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
     RECT hit;
+    // 边框 pen / 底色 brush 循环外只选一次；一个 Rectangle 同时完成填充+1px
+    // 边框（原来 FillRect+FrameRect 两次调用），悬停格才换一次底色画刷
+    HPEN   op = (HPEN)SelectObject(dc, g_penLine);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, g_brCell);
     for (int row = 0; row * g_cols < limit; row++) {
         int y = g_titleH + row * step - g_scroll;
         if (y >= g_ch) break;                       // 整行在可视区下方
@@ -1366,8 +1387,9 @@ static void PaintGrid(HDC dc, const RECT *clip)
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
             int ii = ItemAtView(vi);
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
-            FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
-            FrameRect(dc, &r, g_brLine);
+            if (hov) SelectObject(dc, g_brCellHi);
+            Rectangle(dc, r.left, r.top, r.right, r.bottom);
+            if (hov) SelectObject(dc, g_brCell);
             if (g_dragging && (vi == g_pressCell ||
                                (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
                 RECT r2 = r;                        // 拖动源/落点高亮
@@ -1387,6 +1409,7 @@ static void PaintGrid(HDC dc, const RECT *clip)
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
+    SelectObject(dc, ob); SelectObject(dc, op);
 }
 
 static void PaintWindow(HDC dc, BOOL buffered)
@@ -1731,10 +1754,7 @@ static void TrayShowMenu(void)
 
     if (cmd == IDM_TRAY_SHOW) ShowLauncher();
     else if (cmd == IDM_TRAY_PIN) {
-        g_pinned = !g_pinned;
-        SaveConfig();
-        UpdateHoverText();
-        InvalidateTitle();
+        TogglePin();
     } else if (cmd == IDM_EXIT) {
         ExitApp();
     }
@@ -2164,13 +2184,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
         if (g_hoverBtn == 2) { CloseToTray(); return 0; }
-        if (g_hoverBtn == 1) {
-            g_pinned = !g_pinned;
-            UpdateHoverText();
-            SaveConfig();
-            InvalidateTitle();
-            return 0;
-        }
+        if (g_hoverBtn == 1) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
             g_curGroup = g_hoverGroup;
             ViewDirty();
@@ -2427,6 +2441,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (g_penAccent) DeleteObject(g_penAccent);
     if (g_brPinOn) DeleteObject(g_brPinOn);
     if (g_brPinOff) DeleteObject(g_brPinOff);
+    if (g_penLine) DeleteObject(g_penLine);
         if (g_memDC) DeleteDC(g_memDC);
         if (g_memBmp) DeleteObject(g_memBmp);
         PostQuitMessage(0);
