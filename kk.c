@@ -85,16 +85,18 @@
 #define C_PANEL     RGB(0x33, 0x35, 0x3A)
 
 // ---------------------------------------------------------------- 数据
+// 字段按访问热度排列：绘制只碰 name/icon/group/ownIcon/iconTried（同一缓存行），
+// 启动才碰 path，属性对话框/悬停才碰 args/work/tip——每帧少跨缓存行。
 typedef struct {
-    WCHAR name[48];
-    WCHAR path[MAX_PATH];
-    WCHAR args[192];
-    WCHAR work[MAX_PATH];
-    WCHAR tip[96];
-    int   group;
-    HICON icon;
-    BOOL  ownIcon;
-    BOOL  iconTried;
+    WCHAR name[48];        // 热：每格绘制
+    HICON icon;            // 热：每格绘制
+    int   group;           // 热：视图过滤
+    BOOL  ownIcon;         // 热：图标生命周期
+    BOOL  iconTried;       // 热：按需加载哨兵
+    WCHAR path[MAX_PATH];  // 温：启动 / 失效清理
+    WCHAR args[192];       // 冷：仅属性对话框
+    WCHAR work[MAX_PATH];  // 冷：仅属性对话框
+    WCHAR tip[96];         // 冷：仅悬停文字
 } Item;
 
 typedef struct { WCHAR name[48]; } Group;
@@ -103,6 +105,12 @@ static Item  g_items[MAX_ITEMS];
 static int   g_nItems = 0;
 static Group g_groups[MAX_GROUPS];
 static int   g_nGroups = 1;
+
+// 当前视图：当前分组条目的全局下标（按序）。条目增删移/换组/切组才失效重建，
+// 之后 ViewCount/ItemAtView 都是 O(1) 读表——绘制、悬停、滚轮每帧都走这条路。
+static int  g_viewIdx[MAX_ITEMS];
+static int  g_viewN = 0;
+static BOOL g_viewValid = FALSE;
 
 // ---------------------------------------------------------------- 状态
 static HINSTANCE g_inst;
@@ -117,6 +125,7 @@ static HBITMAP g_memBmp;
 static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
+static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static int  g_curGroup = 0;
@@ -202,18 +211,19 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 
 // ---------------------------------------------------------------- 布局
 // 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）
+// 列数只在 UpdateCell 里算（WM_SIZE/DPI 变化时刷新），其余路径直接读缓存
 static int Cols(void)
 {
-    int w = g_cw - g_sideW;
-    int step = S_(72) + g_gap;
-    int c = (w + g_gap + step / 2) / step;
-    return c < 1 ? 1 : c;
+    return g_cols;
 }
 
 static void UpdateCell(void)
 {
-    int c = Cols();
-    g_cell = (g_cw - g_sideW - (c - 1) * g_gap) / c;
+    int w = g_cw - g_sideW;
+    int step = S_(72) + g_gap;
+    int c = (w + g_gap + step / 2) / step;
+    g_cols = c < 1 ? 1 : c;
+    g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
     if (g_cell < 8) g_cell = 8;
 }
 
@@ -234,24 +244,31 @@ static RECT CellRect(int vi)
     return r;
 }
 
+// 视图缓存失效：条目增/删/移/换组、切组、删组后调用
+static void ViewDirty(void)
+{
+    g_viewValid = FALSE;
+}
+
+static void ViewRebuild(void)
+{
+    g_viewN = 0;
+    for (int i = 0; i < g_nItems; i++)
+        if (g_curGroup == 0 || g_items[i].group == g_curGroup)
+            g_viewIdx[g_viewN++] = i;
+    g_viewValid = TRUE;
+}
+
 static int ViewCount(void)
 {
-    int n = 0;
-    for (int i = 0; i < g_nItems; i++)
-        if (g_curGroup == 0 || g_items[i].group == g_curGroup) n++;
-    return n;
+    if (!g_viewValid) ViewRebuild();
+    return g_viewN;
 }
 
 static int ItemAtView(int vi)
 {
-    int k = -1;
-    for (int i = 0; i < g_nItems; i++) {
-        if (g_curGroup == 0 || g_items[i].group == g_curGroup) {
-            k++;
-            if (k == vi) return i;
-        }
-    }
-    return -1;
+    if (!g_viewValid) ViewRebuild();
+    return (vi >= 0 && vi < g_viewN) ? g_viewIdx[vi] : -1;
 }
 
 // 空格：有格位（占视图序号、参与重排）但没有程序路径的条目。
@@ -273,13 +290,14 @@ static int RealCount(void)
 static int CellAt(POINT p)
 {
     if (p.x < g_sideW || p.y < g_titleH) return -1;
-    int n = ViewCount();
-    if (n > Cols() * Rows()) n = Cols() * Rows();   // 只有可见格子可点
-    for (int vi = 0; vi < n; vi++) {
-        RECT r = CellRect(vi);
-        if (PtInRect(&r, p)) return vi;
-    }
-    return -1;
+    int c = g_cols;
+    int col = (p.x - g_sideW) / (g_cell + g_gap);
+    int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
+    if (col < 0 || row < 0 || col >= c) return -1;
+    int vi = row * c + col;
+    if (vi >= c * Rows() || vi >= ViewCount()) return -1;
+    RECT r = CellRect(vi);
+    return PtInRect(&r, p) ? vi : -1;    // 格子间隙里的点击不算命中（保持原语义）
 }
 
 // 原始格位：不筛已占项，空格也返回序号（拖动落点高亮用）；超出可视格返回 -1
@@ -327,6 +345,7 @@ static void SelectGroup(int gi)
 {
     if (gi < 0 || gi >= g_nGroups || gi == g_curGroup) return;
     g_curGroup = gi;
+    ViewDirty();
     g_scroll = 0;
     ClampScroll();
     EnsureGroupVisible(gi);
@@ -631,7 +650,9 @@ static int AddItemRaw(const WCHAR *name, const WCHAR *path, int group,
     if (work) wcsncpy_s(it->work, MAX_PATH, work, _TRUNCATE);
     if (tip)  wcsncpy_s(it->tip, 96, tip, _TRUNCATE);
     it->group = group;
-    return g_nItems++;
+    g_nItems++;
+    ViewDirty();
+    return g_nItems - 1;
 }
 
 static void NameFromPath(const WCHAR *path, WCHAR *out, int cch)
@@ -658,6 +679,7 @@ static void RemoveItemAt(int k)
     DropIcon(k);
     for (int i = k; i < g_nItems - 1; i++) g_items[i] = g_items[i + 1];
     g_nItems--;
+    ViewDirty();
 }
 
 // 视图内拖动排序：把第 vfrom 格移到 vto，中间项顺移。
@@ -674,6 +696,7 @@ static void MoveItem(int vfrom, int vto)
     else
         for (int k = vfrom; k > vto; k--) g_items[pos[k]] = g_items[pos[k - 1]];
     g_items[pos[vto]] = tmp;
+    ViewDirty();
 }
 
 // 把当前视图补齐到至少覆盖 slot 格：不足就在末尾补空格。
@@ -726,6 +749,7 @@ static void DeleteGroup(int i)
     for (int k = 0; k < g_nItems; k++)
         if (g_items[k].group > i) g_items[k].group--;
     if (g_curGroup >= g_nGroups) g_curGroup = 0;
+    ViewDirty();
     ClampScroll();
 }
 
@@ -742,6 +766,7 @@ static void NewGroup(void)
     int ni = AddGroup(name);
     if (ni >= 0) {
         g_curGroup = ni;
+        ViewDirty();
         g_scroll = 0;
         ClampGrpScroll();
         SaveConfig();
@@ -945,6 +970,7 @@ static void LoadConfig(void)
     CloseHandle(r.f);
     if (g_nGroups < 2) AddGroup(L"常用");
     if (g_curGroup < 0 || g_curGroup >= g_nGroups) g_curGroup = 0;
+    ViewDirty();
 
     int x = 0, y = 0, cx = 0, cy = 0;
     if (rect[0] && swscanf(rect, L"%d %d %d %d", &x, &y, &cx, &cy) == 4 && cx > 200 && cy > 160) {
@@ -1227,8 +1253,6 @@ static void PaintSidebar(HDC dc)
     RECT ln = { g_sideW - 1, 0, g_sideW, g_ch };
     FillRect(dc, &ln, g_brLine);
 
-    HFONT old = (HFONT)SelectObject(dc, g_font);
-    SetBkMode(dc, TRANSPARENT);
     for (int i = 0; i < g_nGroups; i++) {
         RECT r = GroupRect(i);
         if (r.bottom < g_titleH || r.top > g_ch) continue;
@@ -1260,13 +1284,11 @@ static void PaintSidebar(HDC dc)
         RECT th = { g_sideW - S_(5), thumbY, g_sideW - S_(3), thumbY + thumbH };
         FillRect(dc, &th, g_brLine);
     }
-    SelectObject(dc, old);
 }
 
 static void PaintTitle(HDC dc)
 {
     HFONT old = (HFONT)SelectObject(dc, g_fontT);
-    SetBkMode(dc, TRANSPARENT);
     RECT ttl = { g_sideW + S_(8), 0, g_cw - S_(90), g_titleH };
     SetTextColor(dc, g_hoverActive ? C_TEXT : C_DIM);
     DrawTextW(dc, g_hoverText, -1, &ttl,
@@ -1278,15 +1300,18 @@ static void PaintTitle(HDC dc)
 
 static void PaintGrid(HDC dc)
 {
-    HFONT old = (HFONT)SelectObject(dc, g_font);
-    SetBkMode(dc, TRANSPARENT);
-    int slots = Cols() * Rows();
+    int slots = g_cols * Rows();
     int isz = S_(30);
     int n = ViewCount();
     int limit = slots > n ? slots : n;
+    // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
+    RECT clip;
+    BOOL cull = GetClipBox(dc, &clip) != ERROR;
     for (int vi = 0; vi < limit; vi++) {
         RECT r = CellRect(vi);
         if (r.bottom <= g_titleH || r.top >= g_ch) continue;
+        RECT hit;
+        if (cull && !IntersectRect(&hit, &r, &clip)) continue;
         int ii = ItemAtView(vi);
         BOOL hov = (vi == g_hoverCell) && ii >= 0;
         FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
@@ -1309,16 +1334,19 @@ static void PaintGrid(HDC dc)
         DrawTextW(dc, g_items[ii].name, -1, &lr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
-    SelectObject(dc, old);
 }
 
 static void PaintWindow(HDC dc)
 {
     RECT rc = { 0, 0, g_cw, g_ch };
     FillRect(dc, &rc, g_brBG);
+    // 三个绘制段共用同一正文字体/透明背景：选一次就够，各段不再重复 SelectObject
+    HFONT old = (HFONT)SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
     PaintSidebar(dc);
     PaintTitle(dc);
     PaintGrid(dc);
+    SelectObject(dc, old);
 }
 
 // ---------------------------------------------------------------- 对话框（格子属性 / 重命名）
@@ -2087,6 +2115,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         if (g_hoverGroup >= 0) {
             g_curGroup = g_hoverGroup;
+            ViewDirty();
             g_scroll = 0;
             ClampScroll();
             UpdateHoverText();
@@ -2142,6 +2171,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     MoveItem(from, to);    // 落点是已有条目：整体顺移（旧换位行为）
                 }
                 ClampScroll();
+                ViewDirty();
                 SaveConfig();
             }
             InvalidateRect(h, NULL, FALSE);
@@ -2253,6 +2283,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     AddItemByPath(path, g);    // 条目数爆满兜底
                 }
             }
+            ViewDirty();                       // 替换可能改了条目分组
             SaveConfig();
             ClampScroll();
             InvalidateRect(h, NULL, FALSE);
