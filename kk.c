@@ -2,8 +2,9 @@
 // 左侧自定义分组、密集格子（空格也画出来）、拖程序进格子直接单击启动、
 // 悬停顶部居中显示名称、鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、
 // Ctrl+Alt+K 快捷键、右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
-// 内存取向：不用整屏双缓冲（直接绘制 + 精确失效），配置流式读写，
-// 图标按需加载，仅依赖 Win32 + shell32。
+// 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
+// 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
+// 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
 // 常驻内存红线（实测）：不调 SHGetFileInfo、不走 ShellExecute 常规启动
 // （各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开 IME——这三条
 // 任何一条破防都会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
@@ -108,6 +109,8 @@ static int       g_dpi = 96;
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
 static int    g_cw, g_ch;
+static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
+static HBITMAP g_memBmp;
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cellW = 72, g_cellH = 58, g_grpH = 34;
 static BOOL g_pinned = FALSE;
@@ -931,6 +934,12 @@ static void BeginHide(BOOL force)
     SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
 }
 
+// 把工作集裁到最小：任务管理器内存回到低位，触碰时按需软调入（CLaunch 同款策略）
+static void TrimWS(void)
+{
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
 static void StepFade(void)
 {
     if (g_fadeDir > 0) {
@@ -943,8 +952,7 @@ static void StepFade(void)
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
-            // 隐藏即闲置：把工作集裁到最小，任务管理器内存回到低位；唤醒时按需软调入
-            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            TrimWS();
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
         }
@@ -1696,6 +1704,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SIZE: {
         g_cw = LOWORD(l);
         g_ch = HIWORD(l);
+        // 重建离屏缓冲（失败则退回直接绘制）
+        HDC scr = GetDC(h);
+        HDC dc = CreateCompatibleDC(scr);
+        HBITMAP bmp = CreateCompatibleBitmap(scr, g_cw, g_ch);
+        ReleaseDC(h, scr);
+        if (dc && bmp) {
+            SelectObject(dc, bmp);
+            if (g_memDC) { DeleteDC(g_memDC); DeleteObject(g_memBmp); }
+            g_memDC = dc;
+            g_memBmp = bmp;
+        } else {
+            if (dc) DeleteDC(dc);
+            if (bmp) DeleteObject(bmp);
+        }
         int rad = S_(10);
         HRGN rgn = CreateRoundRectRgn(0, 0, g_cw + 1, g_ch + 1, rad, rad);
         if (rgn) SetWindowRgn(h, rgn, TRUE);
@@ -1736,7 +1758,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        PaintWindow(dc);          // 直接绘制：系统按更新区域裁剪，不会闪
+        if (g_memDC) {
+            PaintWindow(g_memDC);     // 离屏画整窗，避免中间帧上屏
+            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                   ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+                   g_memDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        } else {
+            PaintWindow(dc);          // 缓冲不可用：直接绘制
+        }
         EndPaint(h, &ps);
         return 0;
     }
@@ -1894,7 +1923,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_TIMER:
         if (w == TIMER_HIDE) {
-            if (g_pinned || g_dlgOpen || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; break; }
+            if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
+                TrimWS();
+                g_outSince = 0;
+                break;
+            }
+            if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; break; }
             if (GetTickCount() - g_wakeAt < 3000) { g_outSince = 0; break; }
             if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; break; }
             POINT p;
@@ -1948,6 +1982,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_brAccent) DeleteObject(g_brAccent);
         if (g_brAccel) DeleteObject(g_brAccel);
         if (g_brPanel) DeleteObject(g_brPanel);
+        if (g_memDC) DeleteDC(g_memDC);
+        if (g_memBmp) DeleteObject(g_memBmp);
         PostQuitMessage(0);
         return 0;
 
