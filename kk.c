@@ -166,6 +166,7 @@ static void BeginHide(BOOL force);
 static void SaveConfig(void);
 static void InvalidateCell(int vi);
 static void InvalidateTitle(void);
+static int  DefaultGroup(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
 static void ForceForeground(HWND h);
 static void UpdateHoverText(void);
@@ -251,6 +252,22 @@ static int ItemAtView(int vi)
         }
     }
     return -1;
+}
+
+// 空格：有格位（占视图序号、参与重排）但没有程序路径的条目。
+// 配置里记为 I#=||组|||，空路径即空格。空格让"拖到第 N 格就停第 N 格"成为可能。
+static BOOL IsBlank(int i)
+{
+    return i >= 0 && i < g_nItems && !g_items[i].path[0];
+}
+
+// 真实条目数（不含空格）
+static int RealCount(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_nItems; i++)
+        if (g_items[i].path[0]) n++;
+    return n;
 }
 
 static int CellAt(POINT p)
@@ -659,13 +676,25 @@ static void MoveItem(int vfrom, int vto)
     g_items[pos[vto]] = tmp;
 }
 
+// 把当前视图补齐到至少覆盖 slot 格：不足就在末尾补空格。
+// 这样拖到"末尾之外的空格"也能精确落位，前面的格子保持不动。
+static void EnsureSlot(int slot)
+{
+    if (slot < 0) return;
+    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    while (ViewCount() <= slot && g_nItems < MAX_ITEMS)
+        AddItemRaw(L"", L"", g, NULL, NULL, NULL);
+}
+
 // 启动时清理失效项目：路径已不存在（含 .lnk 被删）直接移除并写回配置。
 // URL（含 ://）不走 GetFileAttributes；UNC 断连会让启动卡到网络超时，也跳过。
+// 空格（空路径）不是失效项：那是用户保留的空位，不能清。
 static BOOL PruneInvalidItems(void)
 {
     BOOL removed = FALSE;
     for (int i = 0; i < g_nItems; ) {
         const WCHAR *p = g_items[i].path;
+        if (!p[0]) { i++; continue; }
         if (!wcsstr(p, L"://") && !(p[0] == L'\\' && p[1] == L'\\') &&
             GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) {
             RemoveItemAt(i);
@@ -746,6 +775,7 @@ static void Launch(int idx, BOOL asAdmin)
 {
     if (idx < 0 || idx >= g_nItems) return;
     const Item *it = &g_items[idx];
+    if (!it->path[0]) return;               // 空格：没有可启动的目标
     if (!asAdmin) {
         const WCHAR *dot = wcsrchr(it->path, L'.');
         if (dot && !_wcsicmp(dot, L".lnk")) {
@@ -1112,6 +1142,11 @@ static void UpdateHoverText(void)
     if (g_hoverCell >= 0) {
         int ii = ItemAtView(g_hoverCell);
         if (ii >= 0) {
+            if (IsBlank(ii)) {
+                wcsncpy_s(g_hoverText, 80, L"空位：把程序拖进来", _TRUNCATE);
+                g_hoverActive = TRUE;
+                return;
+            }
             const Item *it = &g_items[ii];
             wcsncpy_s(g_hoverText, 80, it->tip[0] ? it->tip : it->name, _TRUNCATE);
             g_hoverActive = TRUE;
@@ -1128,7 +1163,7 @@ static void UpdateHoverText(void)
     case 2: wcsncpy_s(g_hoverText, 80, L"退出", _TRUNCATE); g_hoverActive = TRUE; return;
     default: break;
     }
-    if (g_nItems == 0) {
+    if (RealCount() == 0) {
         wcsncpy_s(g_hoverText, 80, L"把程序拖进格子里", _TRUNCATE);
         g_hoverActive = FALSE;
         return;
@@ -1262,7 +1297,7 @@ static void PaintGrid(HDC dc)
             InflateRect(&r2, -S_(2), -S_(2));
             FrameRect(dc, &r2, g_brAccent);
         }
-        if (ii < 0) continue;
+        if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
         EnsureIcon(ii);
         if (g_items[ii].icon) {
             int ix = (r.left + r.right - isz) / 2;
@@ -1724,15 +1759,74 @@ static void ShowTitleMenu(void)
 static DWORD s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
 
+// 桌面 ListView 的命中测试消息（不引 commctrl.h，按消息编号直接定义）
+#ifndef LVM_FIRST
+#define LVM_FIRST 0x1000
+#endif
+#define LVM_SUBITEMHITTEST (LVM_FIRST + 57)
+
+// 从“光标下的窗口”沿父链找桌面 ListView：图标由 SysListView32 自绘，
+// WindowFromPoint 落在图标上和落在空白上返回同一个窗口，只能靠它命中测试。
+static HWND DesktopListViewFrom(HWND h)
+{
+    for (HWND w = h; w; w = GetParent(w)) {
+        WCHAR cls[64];
+        GetClassNameW(w, cls, 64);
+        if (!wcscmp(cls, L"SysListView32")) return w;
+        if (!wcscmp(cls, L"SHELLDLL_DefView"))
+            return FindWindowExW(w, NULL, L"SysListView32", NULL);
+    }
+    return NULL;
+}
+
+// 跨进程命中测试：LVHITTESTINFO 必须放在目标进程的内存里，
+// 裸 SendMessage 传指针跨进程是未定义行为。任何一步失败都按“命中图标”处理——
+// 宁可漏唤醒，也绝不能在双击图标启动程序时误弹面板。
+static BOOL PointHitsDesktopIcon(HWND lv, POINT ptScr)
+{
+    struct { POINT pt; UINT flags; int iItem; int iSubItem; } hi;
+    ZeroMemory(&hi, sizeof hi);
+    hi.pt = ptScr;
+    ScreenToClient(lv, &hi.pt);       // ListView 客户坐标
+    hi.flags = 0; hi.iItem = -1; hi.iSubItem = -1;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(lv, &pid);
+    if (!pid) return TRUE;
+    HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ |
+                            PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hp) return TRUE;
+    BOOL hit = TRUE;
+    void *rm = VirtualAllocEx(hp, NULL, sizeof hi, MEM_COMMIT, PAGE_READWRITE);
+    if (rm && WriteProcessMemory(hp, rm, &hi, sizeof hi, NULL)) {
+        DWORD_PTR res = 0;
+        if (SendMessageTimeoutW(lv, LVM_SUBITEMHITTEST, 0, (LPARAM)rm,
+                                SMTO_ABORTIFHUNG, 120, &res) &&
+            ReadProcessMemory(hp, rm, &hi, sizeof hi, NULL))
+            hit = (hi.iItem != -1);   // 未命中任何图标 = 桌面空白
+        // 超时/读写失败：hit 保持 TRUE（保守：当成图标，不唤醒）
+    }
+    if (rm) VirtualFreeEx(hp, rm, 0, MEM_RELEASE);
+    CloseHandle(hp);
+    return hit;
+}
+
 static BOOL IsDesktopPoint(POINT pt)
 {
     HWND h = WindowFromPoint(pt);
     if (!h) return FALSE;
-    h = GetAncestor(h, GA_ROOT);
-    if (!h) return FALSE;
+    HWND root = GetAncestor(h, GA_ROOT);
+    if (!root) return FALSE;
     WCHAR cls[64];
-    GetClassNameW(h, cls, 64);
-    return !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW");
+    GetClassNameW(root, cls, 64);
+    if (wcscmp(cls, L"Progman") && wcscmp(cls, L"WorkerW")) return FALSE;
+
+    // 桌面图标和桌面空白的根窗口都是 Progman/WorkerW，过不了上面的检查只是说明
+    // “在桌面上”。双击桌面图标是要启动程序，不能顺带唤醒面板——再拿落点在桌面
+    // ListView 上做一次图标命中测试，命中图标就不是空白。
+    HWND lv = DesktopListViewFrom(h);
+    if (lv) return !PointHitsDesktopIcon(lv, pt);
+    return TRUE;    // 拿不到 ListView（深度定制桌面）：维持旧行为
 }
 
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -2001,14 +2095,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_hoverCell >= 0) {
-            // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
-            g_pressCell = g_hoverCell;
-            g_pressPt = p;
-            g_dragging = FALSE;
-            g_dropCell = -1;
-            g_dropIn = FALSE;
-            SetCapture(h);
-            return 0;
+            int ii = ItemAtView(g_hoverCell);
+            if (ii >= 0 && !IsBlank(ii)) {
+                // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
+                g_pressCell = g_hoverCell;
+                g_pressPt = p;
+                g_dragging = FALSE;
+                g_dropCell = -1;
+                g_dropIn = FALSE;
+                SetCapture(h);
+                return 0;
+            }
         }
         ReleaseCapture();
         POINT sp = p;                           // NC 消息要屏幕坐标，否则拖动瞬移
@@ -2028,9 +2125,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (ii >= 0) Launch(ii, FALSE);
         } else if (inGrid) {
             int n = ViewCount();
-            if (to < 0 || to >= n) to = n - 1;  // 落在空格：排到末尾
-            if (to != from) {
-                MoveItem(from, to);
+            if (to < 0) to = n - 1;            // 落点解析不出格位（拖到网格下方空白）：排到末尾
+            if (to >= n) {                     // 落点在末尾之外的空格：补齐空格再落
+                EnsureSlot(to);
+                n = ViewCount();
+                if (to >= n) to = n - 1;
+            }
+            if (to != from && to >= 0) {
+                int fi = ItemAtView(from), ti = ItemAtView(to);
+                if (fi >= 0 && ti >= 0 && IsBlank(ti)) {
+                    // 落点是空格：与空位互换，其余格子原位不动——拖进哪个格就停哪个格
+                    Item tmp = g_items[fi];
+                    g_items[fi] = g_items[ti];
+                    g_items[ti] = tmp;
+                } else {
+                    MoveItem(from, to);    // 落点是已有条目：整体顺移（旧换位行为）
+                }
+                ClampScroll();
                 SaveConfig();
             }
             InvalidateRect(h, NULL, FALSE);
@@ -2052,7 +2163,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HoverFromPoint(p);
         if (g_hoverCell >= 0) {
             int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0) ShowCellMenu(ii);
+            if (ii >= 0 && !IsBlank(ii)) ShowCellMenu(ii);   // 空格不给菜单（当成空白区）
         } else if (g_hoverGroup >= 0) {
             ShowGroupMenu(g_hoverGroup);
         } else if (p.x < g_sideW && p.y >= g_titleH) {
@@ -2123,10 +2234,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
                 WCHAR path[MAX_PATH];
                 if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
-                int s  = (slot >= 0) ? slot + (int)k : -1;   // 多文件自落点依次排开
-                int ii = (s >= 0) ? ItemAtView(s) : -1;
+                if (slot < 0) { AddItemByPath(path, g); continue; }   // 网格外：追加末尾
+                int s = slot + (int)k;          // 多文件自落点依次排开
+                EnsureSlot(s);                  // 落点在末尾之外：先补空格，前面的格子不动
+                int ii = ItemAtView(s);
                 if (ii >= 0) {
-                    // 落点已占用：就地换成新文件
+                    // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
                     DropIcon(ii);
                     WCHAR name[48];
                     NameFromPath(path, name, 48);
@@ -2137,12 +2250,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     g_items[ii].work[0] = 0;
                     EnsureIcon(ii);
                 } else {
-                    // 落点是空格：先追加，再整体转排到该格位（拖到哪个空格就落哪个格子）
-                    int ni = AddItemByPath(path, g);
-                    if (ni >= 0 && s >= 0) {
-                        int n = ViewCount();
-                        if (s < n - 1) MoveItem(n - 1, s);
-                    }
+                    AddItemByPath(path, g);    // 条目数爆满兜底
                 }
             }
             SaveConfig();
@@ -2174,7 +2282,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             } else {
                 DWORD now = GetTickCount();
                 if (!g_outSince) g_outSince = now;
-                else if (now - g_outSince > 300) BeginHide(FALSE);
+                else if (now - g_outSince > 150) BeginHide(FALSE);   // 移出 150ms 即开始消失
             }
         } else if (w == TIMER_FADE) {
             StepFade();
