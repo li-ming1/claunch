@@ -111,6 +111,7 @@ static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_br
 static int    g_cw, g_ch;
 static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
 static HBITMAP g_memBmp;
+static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cellW = 72, g_cellH = 58, g_grpH = 34;
 static BOOL g_pinned = FALSE;
@@ -1714,6 +1715,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (g_memDC) { DeleteDC(g_memDC); DeleteObject(g_memBmp); }
             g_memDC = dc;
             g_memBmp = bmp;
+            g_memFresh = TRUE;
         } else {
             if (dc) DeleteDC(dc);
             if (bmp) DeleteObject(bmp);
@@ -1759,10 +1761,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         if (g_memDC) {
-            PaintWindow(g_memDC);     // 离屏画整窗，避免中间帧上屏
-            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
-                   ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
-                   g_memDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
+            // 其余缓冲内容保持上一帧，与屏幕一致。
+            RECT rc;
+            if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
+            else            rc = ps.rcPaint;
+            HRGN clip = CreateRectRgnIndirect(&rc);
+            SelectClipRgn(g_memDC, clip);
+            DeleteObject(clip);
+            PaintWindow(g_memDC);
+            SelectClipRgn(g_memDC, NULL);
+            BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                   g_memDC, rc.left, rc.top, SRCCOPY);
+            g_memFresh = FALSE;
         } else {
             PaintWindow(dc);          // 缓冲不可用：直接绘制
         }
