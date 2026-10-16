@@ -133,6 +133,7 @@ static int  g_scroll = 0;       // 格子区滚动（像素）
 static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 
 static int  g_hoverCell = -1, g_hoverGroup = -1, g_hoverBtn = 0; // btn: 1 钉 2 关
+static int  g_hoverItem = -1;   // 悬停格对应的全局条目下标（空格/空白为 -1），随 HoverFromPoint 刷新
 static WCHAR g_hoverText[80];
 
 static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
@@ -175,6 +176,7 @@ static void BeginHide(BOOL force);
 static void SaveConfig(void);
 static void InvalidateCell(int vi);
 static void InvalidateTitle(void);
+static int  PopupAt(HMENU m);
 static int  DefaultGroup(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
 static void ForceForeground(HWND h);
@@ -673,6 +675,21 @@ static int AddItemByPath(const WCHAR *path, int group)
     return AddItemRaw(name, path, group, NULL, NULL, NULL);
 }
 
+// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数/工作目录、重取图标。
+// 拖放替换与未来的“改目标”路径共用（ShowCellMenu 属性框保持自己的字段级逻辑）
+static void SetItemTarget(int ii, const WCHAR *path, int group)
+{
+    DropIcon(ii);
+    WCHAR name[48];
+    NameFromPath(path, name, 48);
+    wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
+    wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
+    g_items[ii].group = group;
+    g_items[ii].args[0] = 0;
+    g_items[ii].work[0] = 0;
+    EnsureIcon(ii);
+}
+
 static void RemoveItemAt(int k)
 {
     if (k < 0 || k >= g_nItems) return;
@@ -1165,39 +1182,36 @@ static void MakeFontsAndBrushes(void)
 }
 
 // ---------------------------------------------------------------- 悬停文字
+// 设置悬停文字（顺带置激活态）。原来 6 处各写一遍 wcsncpy_s，收拢到这里
+static void SetHover(const WCHAR *s, BOOL active)
+{
+    wcsncpy_s(g_hoverText, 80, s, _TRUNCATE);
+    g_hoverActive = active;
+}
+
 static void UpdateHoverText(void)
 {
     if (g_hoverCell >= 0) {
-        int ii = ItemAtView(g_hoverCell);
-        if (ii >= 0) {
-            if (IsBlank(ii)) {
-                wcsncpy_s(g_hoverText, 80, L"空位：把程序拖进来", _TRUNCATE);
-                g_hoverActive = TRUE;
-                return;
+        g_hoverItem = ItemAtView(g_hoverCell);
+        if (g_hoverItem >= 0) {
+            if (IsBlank(g_hoverItem)) {
+                SetHover(L"空位：把程序拖进来", TRUE);
+            } else {
+                const Item *it = &g_items[g_hoverItem];
+                SetHover(it->tip[0] ? it->tip : it->name, TRUE);
             }
-            const Item *it = &g_items[ii];
-            wcsncpy_s(g_hoverText, 80, it->tip[0] ? it->tip : it->name, _TRUNCATE);
-            g_hoverActive = TRUE;
             return;
         }
     }
-    if (g_hoverGroup >= 0) {
-        wcsncpy_s(g_hoverText, 80, g_groups[g_hoverGroup].name, _TRUNCATE);
-        g_hoverActive = TRUE;
-        return;
-    }
+    g_hoverItem = -1;
+    if (g_hoverGroup >= 0) { SetHover(g_groups[g_hoverGroup].name, TRUE); return; }
     switch (g_hoverBtn) {
-    case 1: wcsncpy_s(g_hoverText, 80, g_pinned ? L"取消定住" : L"定住窗口", _TRUNCATE); g_hoverActive = TRUE; return;
-    case 2: wcsncpy_s(g_hoverText, 80, L"退出", _TRUNCATE); g_hoverActive = TRUE; return;
+    case 1: SetHover(g_pinned ? L"取消定住" : L"定住窗口", TRUE); return;
+    case 2: SetHover(L"退出", TRUE); return;
     default: break;
     }
-    if (RealCount() == 0) {
-        wcsncpy_s(g_hoverText, 80, L"把程序拖进格子里", _TRUNCATE);
-        g_hoverActive = FALSE;
-        return;
-    }
-    wcsncpy_s(g_hoverText, 80, g_groups[g_curGroup].name, _TRUNCATE);   // 闲时显示当前分组
-    g_hoverActive = FALSE;
+    if (RealCount() == 0) { SetHover(L"把程序拖进格子里", FALSE); return; }
+    SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
 }
 
 // 返回悬停文字/激活态是否变化（没变就不重绘标题栏）
@@ -1219,6 +1233,13 @@ static void InvalidateCell(int vi)
     if (vi < 0) return;
     RECT r = CellRect(vi);
     InvalidateRect(g_hwnd, &r, FALSE);
+}
+
+// 重绘 [a, b] 闭区间格子（顺序无关）：拖动顺移/落点区间/高亮擦除共用
+static void InvalidateCells(int a, int b)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    for (int i = a; i <= b; i++) InvalidateCell(i);
 }
 
 static void InvalidateTitle(void)
@@ -1253,16 +1274,18 @@ static void DrawCloseGlyph(HDC dc, RECT r)
     DeleteObject(pen);
 }
 
-static void PaintSidebar(HDC dc)
+static void PaintSidebar(HDC dc, const RECT *clip)
 {
     RECT sr = { 0, 0, g_sideW, g_ch };
     FillRect(dc, &sr, g_brSide);
     RECT ln = { g_sideW - 1, 0, g_sideW, g_ch };
     FillRect(dc, &ln, g_brLine);
 
+    RECT hit;
     for (int i = 0; i < g_nGroups; i++) {
         RECT r = GroupRect(i);
         if (r.bottom < g_titleH || r.top > g_ch) continue;
+        if (clip && !IntersectRect(&hit, &r, clip)) continue;   // 行不在脏区：整行跳过
         BOOL sel = (i == g_curGroup), hov = (i == g_hoverGroup);
         // 只用“选中高亮”，不再叠加悬停灰底，避免两种高亮重复
         if (sel) FillRect(dc, &r, g_brCell);
@@ -1305,7 +1328,7 @@ static void PaintTitle(HDC dc)
     DrawCloseGlyph(dc, CloseBtnRect());
 }
 
-static void PaintGrid(HDC dc)
+static void PaintGrid(HDC dc, const RECT *clip)
 {
     int step = g_cell + g_gap;
     int isz = S_(30);
@@ -1313,9 +1336,8 @@ static void PaintGrid(HDC dc)
     int limit = g_cols * Rows();
     if (n > limit) limit = n;
     // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
-    RECT clip;
-    BOOL cull = GetClipBox(dc, &clip) != ERROR;
     // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
+    RECT hit;
     for (int row = 0; row * g_cols < limit; row++) {
         int y = g_titleH + row * step - g_scroll;
         if (y >= g_ch) break;                       // 整行在可视区下方
@@ -1324,8 +1346,7 @@ static void PaintGrid(HDC dc)
             int vi = row * g_cols + col;
             RECT r = { g_sideW + col * step, y,
                        g_sideW + col * step + g_cell, y + g_cell };
-            RECT hit;
-            if (cull && !IntersectRect(&hit, &r, &clip)) continue;
+            if (clip && !IntersectRect(&hit, &r, clip)) continue;
             int ii = ItemAtView(vi);
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
             FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
@@ -1358,24 +1379,19 @@ static void PaintWindow(HDC dc, BOOL buffered)
     // 三个绘制段共用同一正文字体/透明背景：选一次就够，各段不再重复 SelectObject
     HFONT old = (HFONT)SelectObject(dc, g_font);
     SetBkMode(dc, TRANSPARENT);
-    if (buffered) {
-        // 双缓冲：脏区没碰到的段落，缓冲里存的就是上一帧，整段跳过
-        RECT clip, hit;
-        if (GetClipBox(dc, &clip) == ERROR) {
-            PaintSidebar(dc); PaintTitle(dc); PaintGrid(dc);
-        } else {
-            RECT sr = { 0, 0, g_sideW, g_ch };
-            RECT tr = { 0, 0, g_cw, g_titleH };
-            RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-            if (IntersectRect(&hit, &clip, &sr)) PaintSidebar(dc);
-            if (IntersectRect(&hit, &clip, &tr)) PaintTitle(dc);
-            if (IntersectRect(&hit, &clip, &gr)) PaintGrid(dc);
-        }
-    } else {
-        PaintSidebar(dc);
-        PaintTitle(dc);
-        PaintGrid(dc);
-    }
+
+    // 双缓冲时才做段级/行级剔除（脏区没碰到的段落，缓冲里就是上一帧）；
+    // 直绘兜底路径没有可靠缓冲，必须全画
+    RECT clip, hit;
+    const RECT *cl = NULL;
+    if (buffered && GetClipBox(dc, &clip) != ERROR) cl = &clip;
+
+    RECT sr = { 0, 0, g_sideW, g_ch };
+    RECT tr = { 0, 0, g_cw, g_titleH };
+    RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
+    if (!cl || IntersectRect(&hit, &sr, cl)) PaintSidebar(dc, cl);
+    if (!cl || IntersectRect(&hit, &tr, cl)) PaintTitle(dc);
+    if (!cl || IntersectRect(&hit, &gr, cl)) PaintGrid(dc, cl);
     SelectObject(dc, old);
 }
 
@@ -1694,13 +1710,7 @@ static void TrayShowMenu(void)
                 g_pinned ? L"取消定住" : L"定住窗口");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
-    POINT pt;
-    GetCursorPos(&pt);
-    // 让菜单出现在托盘图标附近并能自动消失
-    SetForegroundWindow(g_hwnd);
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                             pt.x, pt.y, 0, g_hwnd, NULL);
-    DestroyMenu(m);
+    int cmd = PopupAt(m);
 
     if (cmd == IDM_TRAY_SHOW) ShowLauncher();
     else if (cmd == IDM_TRAY_PIN) {
@@ -1714,6 +1724,19 @@ static void TrayShowMenu(void)
 }
 
 // ---------------------------------------------------------------- 菜单
+// 四个菜单（格子/分组/标题/托盘）弹出前的动作完全一样，收拢到这一处：
+// 光标处弹出、置前台、拿命令、销毁。用 ForceForeground 而非裸
+// SetForegroundWindow——输入队列没挂反时菜单会秒关，看起来像没反应
+static int PopupAt(HMENU m)
+{
+    POINT p;
+    GetCursorPos(&p);
+    ForceForeground(g_hwnd);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
+    return cmd;
+}
+
 static void ShowCellMenu(int ii)
 {
     HMENU m = CreatePopupMenu();
@@ -1723,11 +1746,7 @@ static void ShowCellMenu(int ii)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_PROPS, L"格子属性(&R)...");
     AppendMenuW(m, MF_STRING, IDM_DEL, L"从格子移除");
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(g_hwnd);          // 不置前台菜单会秒关，看起来像没反应
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
-    DestroyMenu(m);
+    int cmd = PopupAt(m);
     if (!cmd) return;
     switch (cmd) {
     case IDM_LAUNCH: Launch(ii, FALSE); break;
@@ -1751,7 +1770,7 @@ static void ShowCellMenu(int ii)
             }
             SaveConfig();
             UpdateHoverText();
-            InvalidateCell(ItemAtView(g_hoverCell));
+            InvalidateCell(g_hoverCell);
             InvalidateTitle();
             InvalidateRect(g_hwnd, NULL, FALSE);
         }
@@ -1770,11 +1789,7 @@ static void ShowGroupMenu(int gi)
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
     AppendMenuW(m, MF_STRING, IDM_GRP_NEW, L"新建分组");
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(g_hwnd);
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
-    DestroyMenu(m);
+    int cmd = PopupAt(m);
     if (cmd == IDM_GRP_RENAME) {
         DlgField f[1] = { { L"名称(N):", g_groups[gi].name, 48, 0 } };
         if (RunDialog(g_hwnd, L"重命名分组", f, 1)) {
@@ -1798,11 +1813,7 @@ static void ShowTitleMenu(void)
     AppendMenuW(m, MF_STRING | (g_topmost ? MF_CHECKED : 0), IDM_TOP, L"总在最前面");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(g_hwnd);
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
-    DestroyMenu(m);
+    int cmd = PopupAt(m);
     if (cmd == IDM_TOP) {
         g_topmost = !g_topmost;
         SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
@@ -2154,8 +2165,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_hoverCell >= 0) {
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0 && !IsBlank(ii)) {
+            if (g_hoverItem >= 0 && !IsBlank(g_hoverItem)) {
                 // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
                 g_pressCell = g_hoverCell;
                 g_pressPt = p;
@@ -2205,10 +2215,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 SaveConfig();
             }
             // 只重绘受影响的格子区间（顺移整段都变），不必整窗重绘
-            {
-                int lo = from < to ? from : to, hi = from < to ? to : from;
-                for (int i = lo; i <= hi; i++) InvalidateCell(i);
-            }
+            InvalidateCells(from, to);
         } else {
             InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
             if (to >= 0 && to != from) InvalidateCell(to);
@@ -2220,8 +2227,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_pressCell >= 0) {
             int a = g_pressCell, b = g_dropCell;
             g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
-            InvalidateCell(a);                 // 只擦源/落点两格高亮
-            if (b >= 0 && b != a) InvalidateCell(b);
+            InvalidateCells(a, b >= 0 ? b : a);   // 只擦源/落点高亮
         }
         return 0;
 
@@ -2229,8 +2235,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
         if (g_hoverCell >= 0) {
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0 && !IsBlank(ii)) ShowCellMenu(ii);   // 空格不给菜单（当成空白区）
+            if (g_hoverItem >= 0 && !IsBlank(g_hoverItem)) ShowCellMenu(g_hoverItem);   // 空格不给菜单（当成空白区）
         } else if (g_hoverGroup >= 0) {
             ShowGroupMenu(g_hoverGroup);
         } else if (p.x < g_sideW && p.y >= g_titleH) {
@@ -2310,15 +2315,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 int ii = ItemAtView(s);
                 if (ii >= 0) {
                     // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
-                    DropIcon(ii);
-                    WCHAR name[48];
-                    NameFromPath(path, name, 48);
-                    wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
-                    wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
-                    g_items[ii].group = g;
-                    g_items[ii].args[0] = 0;
-                    g_items[ii].work[0] = 0;
-                    EnsureIcon(ii);
+                    SetItemTarget(ii, path, g);
                 } else {
                     AddItemByPath(path, g);    // 条目数爆满兜底
                 }
@@ -2329,7 +2326,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (lo < 0) {
                 InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
             } else {
-                for (int i = lo; i <= hi; i++) InvalidateCell(i);   // 只重绘落点区间
+                InvalidateCells(lo, hi);                 // 只重绘落点区间
             }
         }
         DragFinish(hd);
