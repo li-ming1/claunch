@@ -155,6 +155,20 @@ static void BeginHide(BOOL force);
 static void TrayAdd(void);
 static void TrayRemove(void);
 
+// 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
+static void CloseToTray(void)
+{
+    SaveConfig();
+    if (g_trayIcon) BeginHide(TRUE);
+    else DestroyWindow(g_hwnd);
+}
+
+static void ExitApp(void)
+{
+    SaveConfig();
+    DestroyWindow(g_hwnd);
+}
+
 // ---------------------------------------------------------------- 工具
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
 
@@ -1295,7 +1309,7 @@ static void TrayAdd(void)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
-    wcsncpy_s(g_nid.szTip, 64, L"桌面格子 — 单击显示面板，右键菜单", _TRUNCATE);
+    wcsncpy_s(g_nid.szTip, 64, L"桌面格子 — 单击显示面板，右键菜单可退出", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
@@ -1336,8 +1350,7 @@ static void TrayShowMenu(void)
         UpdateHoverText();
         InvalidateTitle();
     } else if (cmd == IDM_EXIT) {
-        SaveConfig();
-        DestroyWindow(g_hwnd);
+        ExitApp();
     }
 }
 
@@ -1434,8 +1447,7 @@ static void ShowTitleMenu(void)
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SaveConfig();
     } else if (cmd == IDM_EXIT) {
-        SaveConfig();
-        DestroyWindow(g_hwnd);
+        ExitApp();
     }
 }
 
@@ -1588,7 +1600,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
-        if (g_hoverBtn == 2) { SaveConfig(); DestroyWindow(h); return 0; }
+        if (g_hoverBtn == 2) { CloseToTray(); return 0; }
         if (g_hoverBtn == 1) {
             g_pinned = !g_pinned;
             UpdateHoverText();
@@ -1652,6 +1664,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
         if (w == VK_ESCAPE) BeginHide(TRUE);
         return 0;
+
+    // 标题栏 ✕、Alt+F4、任务栏关闭：都只是隐藏到托盘，托盘菜单才能真正退出
+    case WM_CLOSE:
+        CloseToTray();
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(w) == IDM_EXIT) { ExitApp(); return 0; }
+        break;
 
     case WM_DROPFILES: {
         HDROP hd = (HDROP)w;
