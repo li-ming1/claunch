@@ -4,6 +4,9 @@
 // Ctrl+Alt+K 快捷键、右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
 // 内存取向：不用整屏双缓冲（直接绘制 + 精确失效），配置流式读写，
 // 图标按需加载，仅依赖 Win32 + shell32。
+// 常驻内存红线（实测）：不调 SHGetFileInfo、不走 ShellExecute 常规启动
+// （各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开 IME——这三条
+// 任何一条破防都会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -14,6 +17,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <commdlg.h>
+#include <imm.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -22,9 +26,9 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "imm32.lib")
 
 // ---------------------------------------------------------------- 常量
 #define MAX_GROUPS      16
@@ -321,34 +325,20 @@ static int BtnAt(POINT p)
 }
 
 // ---------------------------------------------------------------- 图标（按需加载）
-// 取图标优先走 user32 内部函数 PrivateExtractIconsW：它直接从文件资源里取，
-// 不会把 shell 的图标/缩略图处理栈（shell.dll、PROPSYS、thumbcache…，
-// 实测多出 10 个模块、约 2.5 MB 常驻）拉进本进程。
+// 只用 user32 的 PrivateExtractIconsW 直接读文件资源，失败再退 ExtractIconExW /
+// 资源映射；绝不调 SHGetFileInfo——它会拖来 shell 图标管线（shell.dll、PROPSYS、
+// WindowsCodecs、Windows.Storage…约 15MB 映像），加载后常驻不卸载。
 typedef int (WINAPI *PFN_PrivateExtractIconsW)(LPCWSTR, int, int, int,
                                                HICON *, int *, int, int);
 static PFN_PrivateExtractIconsW pExtractIcons = NULL;
 
-// 是否是“可执行映像”（图标直接来自自身资源，无需 shell 参与）
-static BOOL IsImageFile(const WCHAR *path)
+// 从映像文件（exe/dll/ico…）取指定大小/索引的图标；失败返回 NULL
+static HICON IconFromImage(const WCHAR *path, int want, int idx)
 {
-    static const WCHAR *exts[] = { L".exe", L".dll", L".ico", L".cpl", L".scr",
-                                   L".ocx", L".ax",  L".mui", L".efi", L".sys" };
-    const WCHAR *dot = wcsrchr(path, L'.');
-    const WCHAR *bs = wcsrchr(path, L'\\');
-    if (!dot || (bs && dot < bs)) return FALSE;
-    for (int i = 0; i < (int)(sizeof exts / sizeof exts[0]); i++)
-        if (!_wcsicmp(dot, exts[i])) return TRUE;
-    return FALSE;
-}
-
-static HICON IconFor(const WCHAR *path, int want)
-{
-    if (pExtractIcons) {
-        HICON icons[1] = { 0 };
-        int ids[1] = { 0 };
-        if (pExtractIcons(path, 0, want, want, icons, ids, 1, 0) > 0 && icons[0])
-            return icons[0];
-    }
+    HICON icons[1] = { 0 };
+    int ids[1] = { 0 };
+    if (pExtractIcons && pExtractIcons(path, idx, want, want, icons, ids, 1, 0) > 0 && icons[0])
+        return icons[0];
     // 把目标当数据文件映射，遍历它的 RT_GROUP_ICON（存根程序图标 ID 不一定是 1）
     HMODULE hm = LoadLibraryExW(path, NULL,
                                 LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
@@ -374,29 +364,185 @@ static HICON IconFor(const WCHAR *path, int want)
     }
     // 再试轻量的 ExtractIconEx（不触发缩略图管道）
     // 注意：变量名不能叫 small —— Windows 头里有 #define small char
-    {
-        HICON big = NULL, sml = NULL;
-        if (ExtractIconExW(path, 0, &big, &sml, 1) && (big || sml)) {
-            if (big) return big;
-            if (sml) {
-                HICON scaled = (HICON)CopyImage(sml, IMAGE_ICON, want, want, LR_DEFAULTCOLOR);
-                DestroyIcon(sml);
-                return scaled;
+    HICON big = NULL, sml = NULL;
+    if (ExtractIconExW(path, idx, &big, &sml, 1) && (big || sml)) {
+        if (big) return big;
+        HICON scaled = (HICON)CopyImage(sml, IMAGE_ICON, want, want, LR_DEFAULTCOLOR);
+        DestroyIcon(sml);
+        return scaled;
+    }
+    return NULL;
+}
+
+// ---------------------------------------------------------------- .lnk 解析（MS-SHLLINK 最小实现）
+// 图标和启动都不过 shell。字段缺失不算失败（target/iconLoc 为空即无），越界才拒绝。
+typedef struct {
+    WCHAR target[MAX_PATH];
+    WCHAR iconLoc[MAX_PATH];
+    int   iconIdx;
+    WCHAR args[192];
+    WCHAR work[MAX_PATH];
+} LnkInfo;
+
+static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
+{
+    if (n < 0x4C) return FALSE;
+    const BYTE *end = b + n;
+    DWORD hdr   = *(const DWORD *)(b + 0x00);
+    DWORD flags = *(const DWORD *)(b + 0x14);
+    DWORD hicon = *(const DWORD *)(b + 0x38);               // 头部 IconIndex
+    if (hdr < 0x4C || b + hdr > end) return FALSE;
+    ZeroMemory(li, sizeof *li);
+    const BYTE *p = b + hdr;
+
+    if (flags & 0x0001) {                                   // HasLinkTargetIDList
+        if (p + 2 > end) return FALSE;
+        p += 2 + *(const WORD *)p;
+    }
+    const BYTE *linfo = NULL;
+    if (flags & 0x0002) {                                   // HasLinkInfo
+        if (p + 4 > end) return FALSE;
+        DWORD lisz = *(const DWORD *)p;
+        if (lisz < 0x1C || p + lisz > end) return FALSE;
+        linfo = p;
+        p += lisz;
+    }
+    // StringData：固定顺序 NAME/REL_PATH/WORK_DIR/ARGS/ICON_LOC，各自带 u16 长度前缀
+    BOOL uni = (flags & 0x0080) != 0;
+    struct { DWORD bit; WCHAR *dst; int cch; } ss[5] = {
+        { 0x0004, NULL,          0   },                     // NAME_STRING：跳过
+        { 0x0008, NULL,          0   },                     // RELATIVE_PATH：跳过
+        { 0x0010, li->work,    MAX_PATH },
+        { 0x0020, li->args,    192 },
+        { 0x0040, li->iconLoc, MAX_PATH },
+    };
+    for (int i = 0; i < 5; i++) {
+        if (!(flags & ss[i].bit)) continue;
+        if (p + 2 > end) return FALSE;
+        DWORD cch = *(const WORD *)p;
+        p += 2;
+        DWORD nb = uni ? cch * 2u : cch;
+        if (nb && p + nb > end) return FALSE;
+        if (ss[i].dst && cch) {
+            // cch 有两种实现：规范含尾 NUL、WScript/PowerShell 不含。
+            // 尾字符为 0 就当含 NUL 处理，两种写法通吃（字段总长都是 cch*2）。
+            if (uni) {
+                DWORD cnt = cch;
+                if (*(const WCHAR *)(p + (cnt - 1) * 2) == 0) cnt--;
+                int m = (int)cnt;
+                if (m > ss[i].cch - 1) m = ss[i].cch - 1;
+                memcpy(ss[i].dst, p, (size_t)m * 2);
+                ss[i].dst[m] = 0;
+            } else {
+                int m = (int)cch;
+                if (p[m - 1] == 0) m--;
+                if (m > ss[i].cch - 1) m = ss[i].cch - 1;
+                MultiByteToWideChar(CP_ACP, 0, (const char *)p, m, ss[i].dst, ss[i].cch);
+                ss[i].dst[ss[i].cch - 1] = 0;
+            }
+        }
+        p += nb;
+    }
+    // LinkInfo → 本地目标路径（Unicode 优先，退 ANSI）
+    if (linfo) {
+        DWORD lisz = *(const DWORD *)linfo;
+        DWORD lhs  = *(const DWORD *)(linfo + 4);
+        DWORD lfl  = *(const DWORD *)(linfo + 8);
+        if (lfl & 0x01) {                                   // VolumeIDAndLocalBasePath
+            DWORD offu = (lhs >= 0x24) ? *(const DWORD *)(linfo + 0x1C)
+                                       : 0;                 // LocalBasePathOffsetUnicode
+            if (offu && offu + 2 <= lisz) {
+                const WCHAR *s  = (const WCHAR *)(linfo + offu);
+                const WCHAR *se = (const WCHAR *)(linfo + lisz);
+                int m = 0;
+                while (s + m < se && s[m] && m < MAX_PATH - 1) { li->target[m] = s[m]; m++; }
+                li->target[m] = 0;
+            } else {
+                DWORD off = *(const DWORD *)(linfo + 0x10); // LocalBasePathOffset（ANSI）
+                if (off && off < lisz) {
+                    const char *s  = (const char *)(linfo + off);
+                    const char *se = (const char *)(linfo + lisz);
+                    int m = 0;
+                    while (s + m < se && s[m] && m < MAX_PATH - 1) m++;
+                    MultiByteToWideChar(CP_ACP, 0, s, m, li->target, MAX_PATH - 1);
+                    li->target[MAX_PATH - 1] = 0;
+                }
             }
         }
     }
-    // 文件夹、快捷方式、脚本、文档：只能用 shell（SHGetFileInfo）。
-    // 但对 exe/dll 不走这条路——它会把 shell.dll、PROPSYS、thumbcache 等
-    // 10 个模块和约 2.4 MB 常驻内存带进来。
-    if (IsImageFile(path)) return NULL;
-    SHFILEINFOW si;
-    ZeroMemory(&si, sizeof si);
+    // ICON_LOCATION 的 ",N" 后缀 → 图标索引；没有则用头部 IconIndex
+    WCHAR *c = wcsrchr(li->iconLoc, L',');
+    if (c && c[1] >= L'0' && c[1] <= L'9') {
+        li->iconIdx = _wtoi(c + 1);
+        *c = 0;
+    } else if (!li->iconIdx && (hicon & 0x7FFFFFFF)) {
+        li->iconIdx = (int)(hicon & 0x7FFFFFFF);
+    }
+    return TRUE;
+}
+
+static BOOL ParseLnk(const WCHAR *path, LnkInfo *li)
+{
+    BYTE buf[8192];   // ponytail: 超过 8KB 的 .lnk 视为异常，走 ShellExecute 兜底
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD n = 0;
+    BOOL ok = ReadFile(f, buf, sizeof buf, &n, NULL) && n > 0x4C;
+    CloseHandle(f);
+    return ok && ParseLnkBuf(buf, n, li);
+}
+
+// 文件夹：画一个最简琥珀色文件夹。颜色位图 alpha 全 0 时 CreateIconIndirect
+// 回退按掩码渲染，掩码全 0 即全不透明，掩码位图不用画。
+static HICON MakeFolderIcon(int sz)
+{
+    HDC scr = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(scr);
+    if (!dc) { ReleaseDC(NULL, scr); return NULL; }
+    HBITMAP col = CreateBitmap(sz, sz, 1, 32, NULL);
+    HBITMAP msk = CreateBitmap(sz, sz, 1, 1, NULL);
+    HICON ico = NULL;
+    if (col && msk) {
+        HGDIOBJ oc = SelectObject(dc, col);
+        HGDIOBJ om = SelectObject(dc, msk);
+        HBRUSH fb  = CreateSolidBrush(RGB(0xE2, 0xB2, 0x3E));
+        RECT tab   = { sz / 8, sz / 5, sz / 8 + sz / 3, sz / 5 + sz / 6 };
+        RECT body  = { sz / 8, sz / 5 + sz / 6 - 1, sz - sz / 8, sz - sz / 5 };
+        FillRect(dc, &tab, fb);
+        FillRect(dc, &body, fb);
+        DeleteObject(fb);
+        ICONINFO ii;
+        ZeroMemory(&ii, sizeof ii);
+        ii.fIcon = TRUE;
+        ii.hbmColor = col;
+        ii.hbmMask = msk;
+        ico = CreateIconIndirect(&ii);
+        SelectObject(dc, oc);
+        SelectObject(dc, om);
+    }
+    if (col) DeleteObject(col);
+    if (msk) DeleteObject(msk);
+    DeleteDC(dc);
+    ReleaseDC(NULL, scr);
+    return ico;
+}
+
+static HICON IconFor(const WCHAR *path, int want)
+{
     DWORD a = GetFileAttributesW(path);
-    UINT fl = SHGFI_ICON | SHGFI_LARGEICON;
-    if (a == INVALID_FILE_ATTRIBUTES) { fl |= SHGFI_USEFILEATTRIBUTES; a = FILE_ATTRIBUTE_NORMAL; }
-    else if (a & FILE_ATTRIBUTE_DIRECTORY) { fl |= SHGFI_USEFILEATTRIBUTES; }
-    if (SHGetFileInfoW(path, a, &si, sizeof si, fl)) return si.hIcon;
-    return NULL;
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
+        return MakeFolderIcon(want);                        // 不进 shell 图标管线
+    const WCHAR *dot = wcsrchr(path, L'.');
+    if (dot && !_wcsicmp(dot, L".lnk")) {
+        LnkInfo lnk;
+        if (!ParseLnk(path, &lnk)) return NULL;             // 坏 .lnk：通用图标
+        HICON h = NULL;
+        if (lnk.iconLoc[0]) h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
+        if (!h && lnk.target[0]) h = IconFromImage(lnk.target, want, 0);
+        return h;
+    }
+    return IconFromImage(path, want, 0);
 }
 
 static void DropIcon(int i)
@@ -502,10 +648,45 @@ static void NewGroup(void)
 }
 
 // ---------------------------------------------------------------- 启动
+// 常规启动一律 CreateProcess：ShellExecuteW 会把 WinRT 启动栈
+// （Windows.System.Launcher → Windows.Storage 等约 15MB）拉进进程且常驻不卸。
+// ShellExecuteW 只留给 runas 提权和 CreateProcess 不认识的目标兜底。
+static BOOL CreateRun(const WCHAR *exe, const WCHAR *args, const WCHAR *work)
+{
+    WCHAR cmd[MAX_PATH + 208];
+    swprintf(cmd, MAX_PATH + 208, L"\"%s\"%s%s", exe, args[0] ? L" " : L"", args);
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof si);
+    si.cb = sizeof si;
+    ZeroMemory(&pi, sizeof pi);
+    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL,
+                             work[0] ? work : NULL, &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return ok;
+}
+
 static void Launch(int idx, BOOL asAdmin)
 {
     if (idx < 0 || idx >= g_nItems) return;
     const Item *it = &g_items[idx];
+    if (!asAdmin) {
+        const WCHAR *dot = wcsrchr(it->path, L'.');
+        if (dot && !_wcsicmp(dot, L".lnk")) {
+            LnkInfo lnk;
+            if (ParseLnk(it->path, &lnk) && lnk.target[0] &&
+                CreateRun(lnk.target,
+                          it->args[0] ? it->args : lnk.args,
+                          it->work[0] ? it->work : lnk.work))
+                return;
+        } else if (CreateRun(it->path, it->args, it->work)) {
+            return;
+        }
+        // CreateProcess 不认识的目标（文件夹/文档/协议）：退回 shell
+    }
     ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", it->path,
                   it->args[0] ? it->args : NULL,
                   it->work[0] ? it->work : NULL, SW_SHOWNORMAL);
@@ -515,7 +696,7 @@ static void OpenLocation(const WCHAR *path)
 {
     WCHAR args[MAX_PATH + 16];
     swprintf(args, MAX_PATH + 16, L"/select,\"%s\"", path);
-    ShellExecuteW(g_hwnd, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+    CreateRun(L"explorer.exe", args, L"");
 }
 
 // ---------------------------------------------------------------- 配置：流式读写（低内存）
@@ -762,6 +943,8 @@ static void StepFade(void)
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
+            // 隐藏即闲置：把工作集裁到最小，任务管理器内存回到低位；唤醒时按需软调入
+            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
         }
@@ -1665,6 +1848,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == VK_ESCAPE) BeginHide(TRUE);
         return 0;
 
+    // 主窗不进 TSF：默认处理会激活输入上下文，把 MSCTF/textinputframework/
+    // Windows.Storage（~12MB）拖进进程。属性对话框不受影响（独立窗口）。
+    case WM_IME_SETCONTEXT:
+        return 0;
+
     // 标题栏 ✕、Alt+F4、任务栏关闭：都只是隐藏到托盘，托盘菜单才能真正退出
     case WM_CLOSE:
         CloseToTray();
@@ -1828,6 +2016,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         WS_EX_TOOLWINDOW | WS_EX_LAYERED, APP_CLASS, APPNAME, WS_POPUP,
         g_savedX, g_savedY, g_savedW, g_savedH, NULL, NULL, inst, NULL);
     if (!g_hwnd) return 1;
+
+    // 主窗没有输入框：断开 IME。否则窗口一拿焦点，整条输入法链
+    // （SogouPY.ime/SogouTSF/MSCTF/textinputframework/d2d1/DWrite ~30MB）就被拉进进程。
+    // 属性对话框是独立窗口，保持默认 IME，中文输入不受影响。
+    ImmAssociateContext(g_hwnd, NULL);
 
     ClampToWorkArea();
     ShowWindow(g_hwnd, SW_SHOW);
