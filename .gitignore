@@ -16,5 +16,6 @@ kk.ini
 *.tmp
 Thumbs.db
 desktop.ini
+.workbuddy/
 
 tmp/

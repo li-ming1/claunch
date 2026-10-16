@@ -41,7 +41,8 @@
 #define ININAME         L"kk.ini"
 
 #define WM_APP_WAKE     (WM_APP + 1)
-#define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板可见未聚焦时也可用）
+#define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板置顶且未聚焦时也可用）
+#define WM_APP_WAKE_CAND (WM_APP + 4)  // 钩子转发的“疑似桌面双击”候选，UI 线程确认后再唤醒
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
 #define HOTKEY_ID       1
@@ -1746,20 +1747,33 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             BOOL dbl = s_lastClick && (now - s_lastClick) <= (DWORD)GetDoubleClickTime()
                        && dx <= GetSystemMetrics(SM_CXDLGFRAME)
                        && dy <= GetSystemMetrics(SM_CYDLGFRAME);
-            if (dbl && !IsWindowVisible(g_hwnd) && IsDesktopPoint(p->pt))
-                PostMessageW(g_hwnd, WM_APP_WAKE, 0, 0);
+            // 钩子回调跑在全局输入路径上：这里只做时序判断。
+            // WindowFromPoint 是跨线程窗口调用，被查窗口卡死会拖住整个系统的鼠标输入，
+            // 所以“点的是不是桌面”放到 UI 线程再确认（WM_APP_WAKE_CAND）。
+            if (dbl && !IsWindowVisible(g_hwnd) && !g_dlgOpen)
+                PostMessageW(g_hwnd, WM_APP_WAKE_CAND, 0,
+                             MAKELPARAM((WORD)p->pt.x, (WORD)p->pt.y));
             s_lastClick = now;
             s_lastPt = p->pt;
         } else if (wParam == WM_MOUSEWHEEL) {
-            // 面板可见时光标悬停即可滚：滚轮不需要焦点（未聚焦时事件原本到不了面板）
+            // 接管条件收到最窄，缺一不可：
+            //   面板可见（否则没有转发的意义）、面板置顶（这一像素确实属于面板，
+            //   没有被别的窗口盖住）、自家对话框没开、面板当前无焦点。
+            // 四条全中才把滚轮转给面板并吞掉 —— 全局钩子只要有丝毫越界，
+            // 用户在其他窗口的正常滚动就会被偷走，这是绝不能碰的红线。
+            // 不置顶时光标底下是谁的窗口就归谁滚，绝不插手。
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
-            RECT r;
-            if (IsWindowVisible(g_hwnd) && GetWindowRect(g_hwnd, &r) && PtInRect(&r, p->pt)) {
-                POINT c = p->pt;
-                ScreenToClient(g_hwnd, &c);
-                int d = (short)HIWORD(p->mouseData);
-                PostMessageW(g_hwnd, WM_APP_WHEEL, (WPARAM)(short)d, MAKELPARAM(c.x, c.y));
-                return 1;               // 吞掉，不再穿透给焦点窗口
+            if (IsWindowVisible(g_hwnd) && g_topmost && !g_dlgOpen &&
+                GetForegroundWindow() != g_hwnd) {
+                RECT r;
+                GetWindowRect(g_hwnd, &r);
+                if (PtInRect(&r, p->pt)) {
+                    POINT c = p->pt;
+                    ScreenToClient(g_hwnd, &c);
+                    int d = (short)HIWORD(p->mouseData);
+                    PostMessageW(g_hwnd, WM_APP_WHEEL, (WPARAM)(short)d, MAKELPARAM(c.x, c.y));
+                    return 1;               // 确认这一格归面板，才吞
+                }
             }
         }
     }
@@ -2093,25 +2107,43 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_DROPFILES: {
         HDROP hd = (HDROP)w;
-        WCHAR path[MAX_PATH];
-        if (DragQueryFileW(hd, 0, path, MAX_PATH)) {
+        UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+        if (nf > 0) {
             POINT p;
-            DragQueryPoint(hd, &p);
-            int vi = CellAt(p);
+            // DragQueryPoint 给的是本窗客户坐标；拿不到（少数拖放路径）就退回光标位置
+            if (!DragQueryPoint(hd, &p)) {
+                GetCursorPos(&p);
+                ScreenToClient(h, &p);
+            }
+            // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
+            // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
+            // 光标明明停在空格上，格子却没有任何变化。
+            int slot = SlotAt(p);
             int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
-            int ii = (vi >= 0) ? ItemAtView(vi) : -1;
-            if (ii >= 0) {
-                DropIcon(ii);
-                WCHAR name[48];
-                NameFromPath(path, name, 48);
-                wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
-                wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
-                g_items[ii].group = g;
-                g_items[ii].args[0] = 0;
-                g_items[ii].work[0] = 0;
-                EnsureIcon(ii);
-            } else {
-                AddItemByPath(path, g);
+            for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
+                WCHAR path[MAX_PATH];
+                if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
+                int s  = (slot >= 0) ? slot + (int)k : -1;   // 多文件自落点依次排开
+                int ii = (s >= 0) ? ItemAtView(s) : -1;
+                if (ii >= 0) {
+                    // 落点已占用：就地换成新文件
+                    DropIcon(ii);
+                    WCHAR name[48];
+                    NameFromPath(path, name, 48);
+                    wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
+                    wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
+                    g_items[ii].group = g;
+                    g_items[ii].args[0] = 0;
+                    g_items[ii].work[0] = 0;
+                    EnsureIcon(ii);
+                } else {
+                    // 落点是空格：先追加，再整体转排到该格位（拖到哪个空格就落哪个格子）
+                    int ni = AddItemByPath(path, g);
+                    if (ni >= 0 && s >= 0) {
+                        int n = ViewCount();
+                        if (s < n - 1) MoveItem(n - 1, s);
+                    }
+                }
             }
             SaveConfig();
             ClampScroll();
@@ -2165,6 +2197,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_APP_WAKE:
         ShowLauncher();
         return 0;
+
+    // 桌面双击唤醒候选：钩子只报时序，这里在 UI 线程确认落点确实是桌面再唤醒
+    case WM_APP_WAKE_CAND: {
+        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (!IsWindowVisible(h) && IsDesktopPoint(p)) ShowLauncher();
+        return 0;
+    }
 
     case WM_DESTROY:
         SaveConfig();
