@@ -129,6 +129,7 @@ static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
+static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static int  g_curGroup = 0;
@@ -180,6 +181,8 @@ static void SaveConfig(void);
 static void InvalidateCell(int vi);
 static void InvalidateTitle(void);
 static int  PopupAt(HMENU m);
+static int  Cols(void);
+static int  Rows(void);
 static int  DefaultGroup(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
 static void ForceForeground(HWND h);
@@ -230,6 +233,7 @@ static void UpdateCell(void)
     g_cols = c < 1 ? 1 : c;
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
     if (g_cell < 8) g_cell = 8;
+    g_slots = g_cols * Rows();   // 每帧命中/绘制/滚动钳制直接读缓存
 }
 
 static int Rows(void)
@@ -300,7 +304,7 @@ static int CellAt(POINT p)
     int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
     if (col < 0 || row < 0 || col >= c) return -1;
     int vi = row * c + col;
-    if (vi >= c * Rows() || vi >= ViewCount()) return -1;
+    if (vi >= g_slots || vi >= ViewCount()) return -1;
     RECT r = CellRect(vi);
     return PtInRect(&r, p) ? vi : -1;    // 格子间隙里的点击不算命中（保持原语义）
 }
@@ -313,13 +317,13 @@ static int SlotAt(POINT p)
     int col = (p.x - g_sideW) / (g_cell + g_gap);
     int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
     int vi = row * c + col;
-    return vi < c * Rows() ? vi : -1;
+    return vi < g_slots ? vi : -1;
 }
 
 static void ClampScroll(void)
 {
     int need = ViewCount();
-    int visible = Cols() * Rows();
+    int visible = g_slots;
     int maxS = need > visible ? (need - visible + Cols() - 1) / Cols() * (g_cell + g_gap) : 0;
     if (g_scroll > maxS) g_scroll = maxS;
     if (g_scroll < 0) g_scroll = 0;
@@ -1367,7 +1371,7 @@ static void PaintGrid(HDC dc, const RECT *clip)
     int step = g_cell + g_gap;
     int isz = S_(30);
     int n = ViewCount();
-    int limit = g_cols * Rows();
+    int limit = g_slots;
     if (n > limit) limit = n;
     // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
     // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
@@ -1376,6 +1380,7 @@ static void PaintGrid(HDC dc, const RECT *clip)
     // 边框（原来 FillRect+FrameRect 两次调用），悬停格才换一次底色画刷
     HPEN   op = (HPEN)SelectObject(dc, g_penLine);
     HBRUSH ob = (HBRUSH)SelectObject(dc, g_brCell);
+    SetTextColor(dc, C_TEXT);            // 所有格子的标签同色：循环外设一次
     for (int row = 0; row * g_cols < limit; row++) {
         int y = g_titleH + row * step - g_scroll;
         if (y >= g_ch) break;                       // 整行在可视区下方
@@ -1404,7 +1409,6 @@ static void PaintGrid(HDC dc, const RECT *clip)
                 DrawIconEx(dc, ix, iy, g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
             }
             RECT lr = { r.left + S_(2), r.bottom - S_(17), r.right - S_(2), r.bottom - S_(3) };
-            SetTextColor(dc, C_TEXT);
             DrawTextW(dc, g_items[ii].name, -1, &lr,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
@@ -1609,15 +1613,7 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
 
     int dlgH = g_dlg.titleH + S_(10) + n * g_dlg.rowH + S_(12) + S_(27) + S_(14);
 
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof wc);
-    wc.cbSize = sizeof wc;
-    wc.lpfnWndProc = DlgProc;
-    wc.hInstance = g_inst;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = DLG_CLASS;
-    RegisterClassExW(&wc);
+    // 对话框窗口类已在 wWinMain 注册一次，这里不再重复注册
 
     RECT or_;
     GetWindowRect(owner, &or_);
@@ -2507,6 +2503,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     wc.hbrBackground = NULL;
     wc.lpszClassName = APP_CLASS;
     RegisterClassExW(&wc);
+
+    // 对话框类只注册一次：原在 RunDialog 里每打开一次属性框就注册一遍，纯重复劳动
+    WNDCLASSEXW dwc;
+    ZeroMemory(&dwc, sizeof dwc);
+    dwc.cbSize = sizeof dwc;
+    dwc.lpfnWndProc = DlgProc;
+    dwc.hInstance = g_inst;
+    dwc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    dwc.hbrBackground = NULL;
+    dwc.lpszClassName = DLG_CLASS;
+    RegisterClassExW(&dwc);
 
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_LAYERED, APP_CLASS, APPNAME, WS_POPUP,
