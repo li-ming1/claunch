@@ -119,6 +119,8 @@ static int       g_dpi = 96;
 
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
+static HPEN   g_penDim, g_penAccent;      // 标题栏图形（缓存，见 MakeGlyphObjects）
+static HBRUSH g_brPinOn, g_brPinOff;
 static int    g_cw, g_ch;
 static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
 static HBITMAP g_memBmp;
@@ -1175,10 +1177,25 @@ static void MakeBrushes(void)
     g_brPanel  = CreateSolidBrush(C_PANEL);
 }
 
+// 标题栏两个按钮图形的 GDI 对象：颜色固定、线宽随 DPI，DPI 变化时整套重建。
+// 原来每画一次标题栏就 CreatePen/CreateSolidBrush 再逐个销毁，纯 churn
+static void MakeGlyphObjects(void)
+{
+    if (g_penDim)    { DeleteObject(g_penDim);    g_penDim = NULL; }
+    if (g_penAccent) { DeleteObject(g_penAccent); g_penAccent = NULL; }
+    if (g_brPinOn)   { DeleteObject(g_brPinOn);   g_brPinOn = NULL; }
+    if (g_brPinOff)  { DeleteObject(g_brPinOff);  g_brPinOff = NULL; }
+    g_penDim    = CreatePen(PS_SOLID, S_(1), C_DIM);
+    g_penAccent = CreatePen(PS_SOLID, 1, C_ACCENT);
+    g_brPinOn   = CreateSolidBrush(C_ACCENT);
+    g_brPinOff  = CreateSolidBrush(C_BG);
+}
+
 static void MakeFontsAndBrushes(void)
 {
     MakeFonts();
     MakeBrushes();
+    MakeGlyphObjects();
 }
 
 // ---------------------------------------------------------------- 悬停文字
@@ -1214,15 +1231,20 @@ static void UpdateHoverText(void)
     SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
 }
 
-// 返回悬停文字/激活态是否变化（没变就不重绘标题栏）
+// 返回悬停文字/激活态是否变化（没变就不重绘标题栏）。
+// 悬停目标没变时直接返回：鼠标在同一个格子上滑动是最高频的事件，
+// 此时不该再做 160 字节的文字拷贝/回写/比较
 static BOOL HoverFromPoint(POINT p)
 {
+    int nc = CellAt(p);
+    int ng = (nc >= 0) ? -1 : GroupAt(p);
+    int nb = (nc >= 0 || ng >= 0) ? 0 : BtnAt(p);
+    if (nc == g_hoverCell && ng == g_hoverGroup && nb == g_hoverBtn)
+        return FALSE;
     WCHAR oldText[80];
     BOOL oldAct = g_hoverActive;
     wcsncpy_s(oldText, 80, g_hoverText, _TRUNCATE);
-    g_hoverCell  = CellAt(p);
-    g_hoverGroup = (g_hoverCell >= 0) ? -1 : GroupAt(p);
-    g_hoverBtn   = (g_hoverCell >= 0 || g_hoverGroup >= 0) ? 0 : BtnAt(p);
+    g_hoverCell = nc; g_hoverGroup = ng; g_hoverBtn = nb;
     UpdateHoverText();
     return oldAct != g_hoverActive || wcscmp(oldText, g_hoverText) != 0;
 }
@@ -1252,26 +1274,21 @@ static void DrawPinGlyph(HDC dc, RECT r, BOOL on)
 {
     int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2 - 2;
     int rad = S_(4);
-    HPEN pen = CreatePen(PS_SOLID, 1, on ? C_ACCENT : C_DIM);
-    HBRUSH br = CreateSolidBrush(on ? C_ACCENT : C_BG);
-    HPEN op = (HPEN)SelectObject(dc, pen);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    HPEN op = (HPEN)SelectObject(dc, on ? g_penAccent : g_penDim);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, on ? g_brPinOn : g_brPinOff);
     Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
     MoveToEx(dc, cx, cy + rad, NULL);
     LineTo(dc, cx, r.bottom - 3);
     SelectObject(dc, op); SelectObject(dc, ob);
-    DeleteObject(pen); DeleteObject(br);
 }
 
 static void DrawCloseGlyph(HDC dc, RECT r)
 {
-    HPEN pen = CreatePen(PS_SOLID, S_(1), C_DIM);
-    HPEN op = (HPEN)SelectObject(dc, pen);
+    HPEN op = (HPEN)SelectObject(dc, g_penDim);
     int m = S_(8);
     MoveToEx(dc, r.left + m, r.top + m, NULL); LineTo(dc, r.right - m, r.bottom - m);
     MoveToEx(dc, r.right - m, r.top + m, NULL); LineTo(dc, r.left + m, r.bottom - m);
     SelectObject(dc, op);
-    DeleteObject(pen);
 }
 
 static void PaintSidebar(HDC dc, const RECT *clip)
@@ -2406,6 +2423,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_brAccent) DeleteObject(g_brAccent);
         if (g_brAccel) DeleteObject(g_brAccel);
         if (g_brPanel) DeleteObject(g_brPanel);
+    if (g_penDim) DeleteObject(g_penDim);
+    if (g_penAccent) DeleteObject(g_penAccent);
+    if (g_brPinOn) DeleteObject(g_brPinOn);
+    if (g_brPinOff) DeleteObject(g_brPinOff);
         if (g_memDC) DeleteDC(g_memDC);
         if (g_memBmp) DeleteObject(g_memBmp);
         PostQuitMessage(0);
