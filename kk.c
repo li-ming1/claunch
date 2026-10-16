@@ -168,7 +168,7 @@ static PFN_SetProcDpiCtx pSetDpi = NULL;
 // 前向声明
 static void ScaleMetrics(void);
 static void MakeFontsAndBrushes(void);
-static void PaintWindow(HDC dc);
+static void PaintWindow(HDC dc, BOOL buffered);
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
@@ -1051,6 +1051,7 @@ static void ShowLauncher(void)
     SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
     g_fadeDir = 1;
     SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+    SetTimer(g_hwnd, TIMER_HIDE, 120, NULL);   // 隐藏期间定时器是停的，这里才重启
 }
 
 static void BeginHide(BOOL force)
@@ -1078,6 +1079,7 @@ static void StepFade(void)
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
+            KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
             TrimWS();
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
@@ -1198,12 +1200,17 @@ static void UpdateHoverText(void)
     g_hoverActive = FALSE;
 }
 
-static void HoverFromPoint(POINT p)
+// 返回悬停文字/激活态是否变化（没变就不重绘标题栏）
+static BOOL HoverFromPoint(POINT p)
 {
+    WCHAR oldText[80];
+    BOOL oldAct = g_hoverActive;
+    wcsncpy_s(oldText, 80, g_hoverText, _TRUNCATE);
     g_hoverCell  = CellAt(p);
     g_hoverGroup = (g_hoverCell >= 0) ? -1 : GroupAt(p);
     g_hoverBtn   = (g_hoverCell >= 0 || g_hoverGroup >= 0) ? 0 : BtnAt(p);
     UpdateHoverText();
+    return oldAct != g_hoverActive || wcscmp(oldText, g_hoverText) != 0;
 }
 
 // ---------------------------------------------------------------- 绘制
@@ -1300,52 +1307,75 @@ static void PaintTitle(HDC dc)
 
 static void PaintGrid(HDC dc)
 {
-    int slots = g_cols * Rows();
+    int step = g_cell + g_gap;
     int isz = S_(30);
     int n = ViewCount();
-    int limit = slots > n ? slots : n;
+    int limit = g_cols * Rows();
+    if (n > limit) limit = n;
     // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
     RECT clip;
     BOOL cull = GetClipBox(dc, &clip) != ERROR;
-    for (int vi = 0; vi < limit; vi++) {
-        RECT r = CellRect(vi);
-        if (r.bottom <= g_titleH || r.top >= g_ch) continue;
-        RECT hit;
-        if (cull && !IntersectRect(&hit, &r, &clip)) continue;
-        int ii = ItemAtView(vi);
-        BOOL hov = (vi == g_hoverCell) && ii >= 0;
-        FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
-        FrameRect(dc, &r, g_brLine);
-        if (g_dragging && (vi == g_pressCell ||
-                           (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
-            RECT r2 = r;                        // 拖动源/落点高亮
-            InflateRect(&r2, -S_(2), -S_(2));
-            FrameRect(dc, &r2, g_brAccent);
+    // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
+    for (int row = 0; row * g_cols < limit; row++) {
+        int y = g_titleH + row * step - g_scroll;
+        if (y >= g_ch) break;                       // 整行在可视区下方
+        if (y + g_cell <= g_titleH) continue;       // 整行已滚出上方
+        for (int col = 0; col < g_cols; col++) {
+            int vi = row * g_cols + col;
+            RECT r = { g_sideW + col * step, y,
+                       g_sideW + col * step + g_cell, y + g_cell };
+            RECT hit;
+            if (cull && !IntersectRect(&hit, &r, &clip)) continue;
+            int ii = ItemAtView(vi);
+            BOOL hov = (vi == g_hoverCell) && ii >= 0;
+            FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
+            FrameRect(dc, &r, g_brLine);
+            if (g_dragging && (vi == g_pressCell ||
+                               (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
+                RECT r2 = r;                        // 拖动源/落点高亮
+                InflateRect(&r2, -S_(2), -S_(2));
+                FrameRect(dc, &r2, g_brAccent);
+            }
+            if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
+            EnsureIcon(ii);
+            if (g_items[ii].icon) {
+                int ix = (r.left + r.right - isz) / 2;
+                int iy = r.top + (g_cell - S_(20) - isz) / 2;   // 标签上方垂直居中
+                DrawIconEx(dc, ix, iy, g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
+            }
+            RECT lr = { r.left + S_(2), r.bottom - S_(17), r.right - S_(2), r.bottom - S_(3) };
+            SetTextColor(dc, C_TEXT);
+            DrawTextW(dc, g_items[ii].name, -1, &lr,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
-        if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
-        EnsureIcon(ii);
-        if (g_items[ii].icon) {
-            int ix = (r.left + r.right - isz) / 2;
-            int iy = r.top + (g_cell - S_(20) - isz) / 2;   // 标签上方垂直居中
-            DrawIconEx(dc, ix, iy, g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
-        }
-        RECT lr = { r.left + S_(2), r.bottom - S_(17), r.right - S_(2), r.bottom - S_(3) };
-        SetTextColor(dc, C_TEXT);
-        DrawTextW(dc, g_items[ii].name, -1, &lr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 }
 
-static void PaintWindow(HDC dc)
+static void PaintWindow(HDC dc, BOOL buffered)
 {
     RECT rc = { 0, 0, g_cw, g_ch };
-    FillRect(dc, &rc, g_brBG);
+    FillRect(dc, &rc, g_brBG);           // DC 带裁剪时本条只碰脏区
     // 三个绘制段共用同一正文字体/透明背景：选一次就够，各段不再重复 SelectObject
     HFONT old = (HFONT)SelectObject(dc, g_font);
     SetBkMode(dc, TRANSPARENT);
-    PaintSidebar(dc);
-    PaintTitle(dc);
-    PaintGrid(dc);
+    if (buffered) {
+        // 双缓冲：脏区没碰到的段落，缓冲里存的就是上一帧，整段跳过
+        RECT clip, hit;
+        if (GetClipBox(dc, &clip) == ERROR) {
+            PaintSidebar(dc); PaintTitle(dc); PaintGrid(dc);
+        } else {
+            RECT sr = { 0, 0, g_sideW, g_ch };
+            RECT tr = { 0, 0, g_cw, g_titleH };
+            RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
+            if (IntersectRect(&hit, &clip, &sr)) PaintSidebar(dc);
+            if (IntersectRect(&hit, &clip, &tr)) PaintTitle(dc);
+            if (IntersectRect(&hit, &clip, &gr)) PaintGrid(dc);
+        }
+    } else {
+        PaintSidebar(dc);
+        PaintTitle(dc);
+        PaintGrid(dc);
+    }
     SelectObject(dc, old);
 }
 
@@ -2027,13 +2057,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             HRGN clip = CreateRectRgnIndirect(&rc);
             SelectClipRgn(g_memDC, clip);
             DeleteObject(clip);
-            PaintWindow(g_memDC);
+            PaintWindow(g_memDC, TRUE);
             SelectClipRgn(g_memDC, NULL);
             BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
                    g_memDC, rc.left, rc.top, SRCCOPY);
             g_memFresh = FALSE;
         } else {
-            PaintWindow(dc);          // 缓冲不可用：直接绘制
+            PaintWindow(dc, FALSE);      // 缓冲不可用：直接绘制
         }
         EndPaint(h, &ps);
         return 0;
@@ -2069,13 +2099,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         }
         int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
-        HoverFromPoint(p);
+        BOOL txtChg = HoverFromPoint(p);
         if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
             InvalidateCell(oc);
             InvalidateCell(g_hoverCell);
             RECT sr = { 0, 0, g_sideW, g_ch };
             if (og != g_hoverGroup) InvalidateRect(h, &sr, FALSE);
-            InvalidateTitle();
+            if (txtChg) InvalidateTitle();   // 文字没变的悬停切换不碰标题栏
         }
         if (!g_tracking) {
             TRACKMOUSEEVENT tme;
@@ -2174,17 +2204,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 ViewDirty();
                 SaveConfig();
             }
-            InvalidateRect(h, NULL, FALSE);
+            // 只重绘受影响的格子区间（顺移整段都变），不必整窗重绘
+            {
+                int lo = from < to ? from : to, hi = from < to ? to : from;
+                for (int i = lo; i <= hi; i++) InvalidateCell(i);
+            }
         } else {
-            InvalidateRect(h, NULL, FALSE);     // 拖出格子区：取消
+            InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
+            if (to >= 0 && to != from) InvalidateCell(to);
         }
         return 0;
     }
 
     case WM_CAPTURECHANGED:                     // 捕获被抢：作废未完成的按下/拖动
         if (g_pressCell >= 0) {
+            int a = g_pressCell, b = g_dropCell;
             g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
-            InvalidateRect(h, NULL, FALSE);
+            InvalidateCell(a);                 // 只擦源/落点两格高亮
+            if (b >= 0 && b != a) InvalidateCell(b);
         }
         return 0;
 
@@ -2261,11 +2298,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             // 光标明明停在空格上，格子却没有任何变化。
             int slot = SlotAt(p);
             int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+            int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
             for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
                 WCHAR path[MAX_PATH];
                 if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
                 if (slot < 0) { AddItemByPath(path, g); continue; }   // 网格外：追加末尾
                 int s = slot + (int)k;          // 多文件自落点依次排开
+                if (lo < 0) lo = hi = s;        // 记下受影响的格子范围
+                else { if (s < lo) lo = s; if (s > hi) hi = s; }
                 EnsureSlot(s);                  // 落点在末尾之外：先补空格，前面的格子不动
                 int ii = ItemAtView(s);
                 if (ii >= 0) {
@@ -2286,7 +2326,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             ViewDirty();                       // 替换可能改了条目分组
             SaveConfig();
             ClampScroll();
-            InvalidateRect(h, NULL, FALSE);
+            if (lo < 0) {
+                InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
+            } else {
+                for (int i = lo; i <= hi; i++) InvalidateCell(i);   // 只重绘落点区间
+            }
         }
         DragFinish(hd);
         return 0;
