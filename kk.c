@@ -1,7 +1,8 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
-// 左侧自定义分组、密集格子（空格也画出来）、拖程序进格子直接单击启动、
-// 悬停顶部居中显示名称、鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、
-// Ctrl+Alt+K 快捷键、右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
+// 左侧自定义分组、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
+// 拖程序进格子单击启动、启动时自动清理失效项目、悬停顶部居中显示名称、
+// 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
+// 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
 // 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
@@ -114,7 +115,7 @@ static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画�
 static HBITMAP g_memBmp;
 static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
-static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cellW = 72, g_cellH = 58, g_grpH = 34;
+static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static int  g_curGroup = 0;
@@ -123,6 +124,12 @@ static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 
 static int  g_hoverCell = -1, g_hoverGroup = -1, g_hoverBtn = 0; // btn: 1 钉 2 关
 static WCHAR g_hoverText[80];
+
+static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
+static BOOL g_dragging;         // 已越过拖动阈值
+static int  g_dropCell = -1;    // 拖动悬停的目标格（视图序号）
+static BOOL g_dropIn;           // 目标在格子区内（区外释放=取消）
+static POINT g_pressPt;
 static BOOL g_hoverActive = FALSE;
 static BOOL g_tracking = FALSE;
 
@@ -192,15 +199,25 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 }
 
 // ---------------------------------------------------------------- 布局
+// 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）
 static int Cols(void)
 {
-    int c = (g_cw - g_sideW + g_gap) / (g_cellW + g_gap);
+    int w = g_cw - g_sideW;
+    int step = S_(72) + g_gap;
+    int c = (w + g_gap + step / 2) / step;
     return c < 1 ? 1 : c;
+}
+
+static void UpdateCell(void)
+{
+    int c = Cols();
+    g_cell = (g_cw - g_sideW - (c - 1) * g_gap) / c;
+    if (g_cell < 8) g_cell = 8;
 }
 
 static int Rows(void)
 {
-    int r = (g_ch - g_titleH + g_gap) / (g_cellH + g_gap);
+    int r = (g_ch - g_titleH + g_gap) / (g_cell + g_gap);
     return r < 1 ? 1 : r;
 }
 
@@ -208,10 +225,10 @@ static RECT CellRect(int vi)
 {
     int c = Cols(), col = vi % c, row = vi / c;
     RECT r;
-    r.left   = g_sideW + col * (g_cellW + g_gap);
-    r.top    = g_titleH + row * (g_cellH + g_gap) - g_scroll;
-    r.right  = r.left + g_cellW;
-    r.bottom = r.top + g_cellH;
+    r.left   = g_sideW + col * (g_cell + g_gap);
+    r.top    = g_titleH + row * (g_cell + g_gap) - g_scroll;
+    r.right  = r.left + g_cell;
+    r.bottom = r.top + g_cell;
     return r;
 }
 
@@ -247,11 +264,22 @@ static int CellAt(POINT p)
     return -1;
 }
 
+// 原始格位：不筛已占项，空格也返回序号（拖动落点高亮用）；超出可视格返回 -1
+static int SlotAt(POINT p)
+{
+    if (p.x < g_sideW || p.y < g_titleH) return -1;
+    int c = Cols();
+    int col = (p.x - g_sideW) / (g_cell + g_gap);
+    int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
+    int vi = row * c + col;
+    return vi < c * Rows() ? vi : -1;
+}
+
 static void ClampScroll(void)
 {
     int need = ViewCount();
     int visible = Cols() * Rows();
-    int maxS = need > visible ? (need - visible + Cols() - 1) / Cols() * (g_cellH + g_gap) : 0;
+    int maxS = need > visible ? (need - visible + Cols() - 1) / Cols() * (g_cell + g_gap) : 0;
     if (g_scroll > maxS) g_scroll = maxS;
     if (g_scroll < 0) g_scroll = 0;
 }
@@ -612,6 +640,41 @@ static void RemoveItemAt(int k)
     DropIcon(k);
     for (int i = k; i < g_nItems - 1; i++) g_items[i] = g_items[i + 1];
     g_nItems--;
+}
+
+// 视图内拖动排序：把第 vfrom 格移到 vto，中间项顺移。
+// 先快照各视图位的全局下标再轮转，避免写途中组员变动影响 ItemAtView。
+static void MoveItem(int vfrom, int vto)
+{
+    int n = ViewCount();
+    if (vfrom < 0 || vto < 0 || vfrom >= n || vto >= n || vfrom == vto) return;
+    int pos[MAX_ITEMS];
+    for (int k = 0; k < n; k++) pos[k] = ItemAtView(k);
+    Item tmp = g_items[pos[vfrom]];
+    if (vfrom < vto)
+        for (int k = vfrom; k < vto; k++) g_items[pos[k]] = g_items[pos[k + 1]];
+    else
+        for (int k = vfrom; k > vto; k--) g_items[pos[k]] = g_items[pos[k - 1]];
+    g_items[pos[vto]] = tmp;
+}
+
+// 启动时清理失效项目：路径已不存在（含 .lnk 被删）直接移除并写回配置。
+// URL（含 ://）不走 GetFileAttributes；UNC 断连会让启动卡到网络超时，也跳过。
+static BOOL PruneInvalidItems(void)
+{
+    BOOL removed = FALSE;
+    for (int i = 0; i < g_nItems; ) {
+        const WCHAR *p = g_items[i].path;
+        if (!wcsstr(p, L"://") && !(p[0] == L'\\' && p[1] == L'\\') &&
+            GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) {
+            RemoveItemAt(i);
+            removed = TRUE;
+        } else {
+            i++;
+        }
+    }
+    if (removed) ClampScroll();
+    return removed;
 }
 
 static int AddGroup(const WCHAR *name)
@@ -1004,8 +1067,6 @@ static void ScaleMetrics(void)
     g_titleH = S_(34);
     g_sideW  = S_(104);
     g_gap    = S_(3);
-    g_cellW  = S_(72);
-    g_cellH  = S_(58);
     g_grpH   = S_(34);
 }
 
@@ -1194,11 +1255,18 @@ static void PaintGrid(HDC dc)
         BOOL hov = (vi == g_hoverCell) && ii >= 0;
         FillRect(dc, &r, hov ? g_brCellHi : g_brCell);
         FrameRect(dc, &r, g_brLine);
+        if (g_dragging && (vi == g_pressCell ||
+                           (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
+            RECT r2 = r;                        // 拖动源/落点高亮
+            InflateRect(&r2, -S_(2), -S_(2));
+            FrameRect(dc, &r2, g_brAccent);
+        }
         if (ii < 0) continue;
         EnsureIcon(ii);
         if (g_items[ii].icon) {
             int ix = (r.left + r.right - isz) / 2;
-            DrawIconEx(dc, ix, r.top + S_(5), g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
+            int iy = r.top + (g_cell - S_(20) - isz) / 2;   // 标签上方垂直居中
+            DrawIconEx(dc, ix, iy, g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
         }
         RECT lr = { r.left + S_(2), r.bottom - S_(17), r.right - S_(2), r.bottom - S_(3) };
         SetTextColor(dc, C_TEXT);
@@ -1741,6 +1809,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SIZE: {
         g_cw = LOWORD(l);
         g_ch = HIWORD(l);
+        UpdateCell();       // 横向铺满的正方格宽随窗口变化
         // 重建离屏缓冲（失败则退回直接绘制）
         HDC scr = GetDC(h);
         HDC dc = CreateCompatibleDC(scr);
@@ -1770,6 +1839,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         mm->ptMinTrackSize.x = S_(260);
         mm->ptMinTrackSize.y = S_(200);
         return 0;
+    }
+
+    // WS_POPUP 无边框：手动给边缘 6px 命中区，窗口才能拉伸
+    case WM_NCHITTEST: {
+        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        ScreenToClient(h, &p);
+        int mg = S_(6);
+        BOOL lft = p.x < mg, rgt = p.x >= g_cw - mg, top = p.y < mg, bot = p.y >= g_ch - mg;
+        if (top && lft) return HTTOPLEFT;
+        if (top && rgt) return HTTOPRIGHT;
+        if (bot && lft) return HTBOTTOMLEFT;
+        if (bot && rgt) return HTBOTTOMRIGHT;
+        if (lft) return HTLEFT;
+        if (rgt) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bot) return HTBOTTOM;
+        break;
     }
 
     case WM_DPICHANGED: {
@@ -1822,6 +1908,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_MOUSEMOVE: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (g_pressCell >= 0) {                 // 拖动排序进行中
+            if (!g_dragging) {
+                int dx = p.x - g_pressPt.x, dy = p.y - g_pressPt.y;
+                if (dx < 0) dx = -dx;
+                if (dy < 0) dy = -dy;
+                if (dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG)) {
+                    g_dragging = TRUE;
+                    g_dropCell = g_pressCell;
+                    g_dropIn = TRUE;
+                    InvalidateCell(g_pressCell);
+                }
+            }
+            if (g_dragging) {
+                int nc = CellAt(p);
+                if (nc < 0) nc = SlotAt(p);     // 空格也可作落点（抬起排到末尾）
+                BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
+                if (nc != g_dropCell || nin != g_dropIn) {
+                    InvalidateCell(g_dropCell);
+                    InvalidateCell(nc);
+                    g_dropCell = nc;
+                    g_dropIn = nin;
+                }
+            }
+        }
         int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
         HoverFromPoint(p);
         if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
@@ -1877,14 +1987,51 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_hoverCell >= 0) {
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0) Launch(ii, FALSE);
+            // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
+            g_pressCell = g_hoverCell;
+            g_pressPt = p;
+            g_dragging = FALSE;
+            g_dropCell = -1;
+            g_dropIn = FALSE;
+            SetCapture(h);
             return 0;
         }
         ReleaseCapture();
-        SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, l);
+        POINT sp = p;                           // NC 消息要屏幕坐标，否则拖动瞬移
+        ClientToScreen(h, &sp);
+        SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(sp.x, sp.y));
         return 0;
     }
+
+    case WM_LBUTTONUP: {
+        if (g_pressCell < 0) break;
+        int from = g_pressCell, to = g_dropCell;
+        BOOL inGrid = g_dropIn, wasDrag = g_dragging;
+        g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
+        ReleaseCapture();
+        if (!wasDrag) {
+            int ii = ItemAtView(from);
+            if (ii >= 0) Launch(ii, FALSE);
+        } else if (inGrid) {
+            int n = ViewCount();
+            if (to < 0 || to >= n) to = n - 1;  // 落在空格：排到末尾
+            if (to != from) {
+                MoveItem(from, to);
+                SaveConfig();
+            }
+            InvalidateRect(h, NULL, FALSE);
+        } else {
+            InvalidateRect(h, NULL, FALSE);     // 拖出格子区：取消
+        }
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED:                     // 捕获被抢：作废未完成的按下/拖动
+        if (g_pressCell >= 0) {
+            g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
 
     case WM_RBUTTONUP: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -1916,7 +2063,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             SelectGroup(gi);
         } else {
             int before = g_scroll;
-            g_scroll += (d > 0 ? -1 : 1) * (g_cellH + g_gap);
+            g_scroll += (d > 0 ? -1 : 1) * (g_cell + g_gap);
             ClampScroll();
             if (g_scroll != before) {
                 RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
@@ -2117,6 +2264,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     ImmAssociateContext(g_hwnd, NULL);
 
     ClampToWorkArea();
+    if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
     ShowWindow(g_hwnd, SW_SHOW);
     ForceForeground(g_hwnd);
     g_alpha = 0;
