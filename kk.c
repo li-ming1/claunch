@@ -50,6 +50,13 @@
 #define IDM_TOP         1009
 #define IDM_EXIT        1010
 
+// 托盘
+#define TRAY_ID             1
+#define WM_TRAY             (WM_APP + 2)   // 托盘回调消息
+#define IDM_TRAY_SHOW       1101
+#define IDM_TRAY_PIN        1102
+#define NOTIFYICON_VERSION_4L 4
+
 #define DLG_OK          1
 #define DLG_CANCEL      2
 #define DLG_BROWSE      100      // 浏览按钮：100 + 字段序号
@@ -120,6 +127,11 @@ static WCHAR g_ini[MAX_PATH];
 static int   g_savedX, g_savedY, g_savedW, g_savedH;
 static BOOL  g_applySavedRect = FALSE;
 
+// 托盘
+static HICON g_trayIcon = NULL;
+static UINT  g_msgTaskbarCreated = 0;
+static NOTIFYICONDATAW g_nid;
+
 typedef BOOL (WINAPI *PFN_SetProcDpiCtx)(HANDLE);
 static PFN_SetProcDpiCtx pSetDpi = NULL;
 
@@ -138,6 +150,10 @@ static void InvalidateTitle(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
 static void ForceForeground(HWND h);
 static void UpdateHoverText(void);
+static void ShowLauncher(void);
+static void BeginHide(BOOL force);
+static void TrayAdd(void);
+static void TrayRemove(void);
 
 // ---------------------------------------------------------------- 工具
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
@@ -1031,7 +1047,6 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CREATE: {
         DlgCtx *c = &g_dlg;
         int y = c->titleH + S_(10);
-        {FILE *dbg=fopen("kk_debug.log","a"); if(dbg){fwprintf(dbg,L"DLGCREATE n=%d dlgW=%d rowH=%d labW=%d titleH=%d\r\n",c->n,c->dlgW,c->rowH,c->labW,c->titleH); fclose(dbg);}}   // TEMP-DEBUG
         for (int i = 0; i < c->n; i++) {
             HWND st = CreateWindowExW(0, L"STATIC", c->f[i].label,
                                       WS_CHILD | WS_VISIBLE | SS_RIGHT,
@@ -1054,7 +1069,6 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
             }
             y += c->rowH;
-            {FILE *dbg=fopen("kk_debug.log","a"); if(dbg){fwprintf(dbg,L"  row %d st=%p ed=%p y=%d\r\n",i,(void*)st,(void*)ed,y); fclose(dbg);}}   // TEMP-DEBUG
         }
         int bw = S_(84), bh = S_(27);
         int by = c->titleH + S_(10) + c->n * c->rowH + S_(12);
@@ -1206,6 +1220,127 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
     return ok;
 }
 
+// ---------------------------------------------------------------- 托盘
+// 运行时画一个 2x2 格子图标：不必引入 .ico 资源，保持单文件
+static HICON MakeTrayIcon(int sz)
+{
+    HDC scr = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(scr);
+    if (!dc) { ReleaseDC(NULL, scr); return NULL; }
+    HBITMAP col = CreateBitmap(sz, sz, 1, 32, NULL);   // 颜色位图
+    HBITMAP msk = CreateBitmap(sz, sz, 1, 1, NULL);    // 掩码：1=透明
+    if (!col || !msk) {
+        if (col) DeleteObject(col);
+        if (msk) DeleteObject(msk);
+        DeleteDC(dc); ReleaseDC(NULL, scr);
+        return NULL;
+    }
+    HGDIOBJ oc = SelectObject(dc, col);
+    HGDIOBJ om = SelectObject(dc, msk);
+
+    RECT all = { 0, 0, sz, sz };
+    HBRUSH bg = CreateSolidBrush(C_BG);
+    FillRect(dc, &all, bg);
+    DeleteObject(bg);
+
+    // 2x2 浅色格子
+    int pad = sz / 6, gap = sz / 10;
+    int cw = (sz - pad * 2 - gap) / 2;
+    int ch = (sz - pad * 2 - gap) / 2;
+    HBRUSH fg = CreateSolidBrush(RGB(0xEC, 0xED, 0xEF));
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++) {
+            RECT r = { pad + j * (cw + gap), pad + i * (ch + gap),
+                       pad + j * (cw + gap) + cw, pad + i * (ch + gap) + ch };
+            FillRect(dc, &r, fg);
+        }
+    DeleteObject(fg);
+
+    // 掩码：圆角外透明 -> 用圆角矩形区域填充黑色（不透明）
+    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(dc, &all, white);
+    HRGN rgn = CreateRoundRectRgn(0, 0, sz + 1, sz + 1, sz / 3, sz / 3);
+    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+    FillRgn(dc, rgn, black);
+    DeleteObject(white);
+    DeleteObject(black);
+    if (rgn) DeleteObject(rgn);
+
+    HICON ico = NULL;
+    ICONINFO ii;
+    ZeroMemory(&ii, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmColor = col;
+    ii.hbmMask = msk;
+    ico = CreateIconIndirect(&ii);
+
+    SelectObject(dc, oc);
+    SelectObject(dc, om);
+    DeleteDC(dc);
+    ReleaseDC(NULL, scr);
+    DeleteObject(col);
+    DeleteObject(msk);
+    return ico;
+}
+
+static void TrayAdd(void)
+{
+    if (!g_trayIcon) g_trayIcon = MakeTrayIcon(GetSystemMetrics(SM_CYSMICON));
+    if (!g_trayIcon) return;
+
+    ZeroMemory(&g_nid, sizeof g_nid);
+    g_nid.cbSize = sizeof g_nid;
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = TRAY_ID;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    g_nid.hIcon = g_trayIcon;
+    wcsncpy_s(g_nid.szTip, 64, L"桌面格子 — 单击显示面板，右键菜单", _TRUNCATE);
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+}
+
+static void TrayRemove(void)
+{
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof nid);
+    nid.cbSize = sizeof nid;
+    nid.hWnd = g_hwnd;
+    nid.uID = TRAY_ID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
+}
+
+static void TrayShowMenu(void)
+{
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN,
+                g_pinned ? L"取消定住" : L"定住窗口");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
+    POINT pt;
+    GetCursorPos(&pt);
+    // 让菜单出现在托盘图标附近并能自动消失
+    SetForegroundWindow(g_hwnd);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                             pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
+
+    if (cmd == IDM_TRAY_SHOW) ShowLauncher();
+    else if (cmd == IDM_TRAY_PIN) {
+        g_pinned = !g_pinned;
+        SaveConfig();
+        UpdateHoverText();
+        InvalidateTitle();
+    } else if (cmd == IDM_EXIT) {
+        SaveConfig();
+        DestroyWindow(g_hwnd);
+    }
+}
+
 // ---------------------------------------------------------------- 菜单
 static void ShowCellMenu(int ii)
 {
@@ -1341,6 +1476,11 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 // ---------------------------------------------------------------- 窗口过程
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    // 资源管理器（explorer.exe）重启后会广播 TaskbarCreated，此时托盘图标已丢失，需要重建
+    if (g_msgTaskbarCreated && (UINT)m == g_msgTaskbarCreated) {
+        TrayAdd();
+        return 0;
+    }
     switch (m) {
     case WM_CREATE: {
         g_hwnd = h;
@@ -1352,16 +1492,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
         RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
         SetTimer(h, TIMER_HIDE, 120, NULL);
+        // 托盘图标
+        g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+        TrayAdd();
         return 0;
     }
 
     case WM_SIZE: {
         g_cw = LOWORD(l);
         g_ch = HIWORD(l);
-        {   // TEMP-DEBUG
-            FILE *dbg = fopen("kk_debug.log", "a");
-            if (dbg) { fwprintf(dbg, L"SIZE %dx%d dpi=%d\r\n", g_cw, g_ch, g_dpi); fclose(dbg); }
-        }
         int rad = S_(10);
         HRGN rgn = CreateRoundRectRgn(0, 0, g_cw + 1, g_ch + 1, rad, rad);
         if (rgn) SetWindowRgn(h, rgn, TRUE);
@@ -1379,16 +1518,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_DPICHANGED: {
-        {   // TEMP-DEBUG
-            FILE *dbg = fopen("kk_debug.log", "a");
-            if (dbg) {
-                RECT *rr = (RECT *)l;
-                fwprintf(dbg, L"DPICHANGED wParam=%d applySaved=%d suggest=(%d,%d %dx%d) cur=%dx%d\r\n",
-                         (int)LOWORD(w), g_applySavedRect, rr->left, rr->top,
-                         rr->right - rr->left, rr->bottom - rr->top, g_cw, g_ch);
-                fclose(dbg);
-            }
-        }
         g_dpi = LOWORD(w);
         ScaleMetrics();
         MakeFontsAndBrushes();
@@ -1582,12 +1711,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         else ShowLauncher();
         return 0;
 
+    // 托盘图标：左键单击显示面板，右键弹菜单
+    case WM_TRAY: {
+        UINT ev = LOWORD(l);           // NOTIFYICON_VERSION_4：事件在 lParam 低字
+        if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) ShowLauncher();
+        else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) TrayShowMenu();
+        return 0;
+    }
+
     case WM_APP_WAKE:
         ShowLauncher();
         return 0;
 
     case WM_DESTROY:
         SaveConfig();
+        TrayRemove();
         if (g_hook) UnhookWindowsHookEx(g_hook);
         UnregisterHotKey(h, HOTKEY_ID);
         for (int i = 0; i < g_nItems; i++) DropIcon(i);
