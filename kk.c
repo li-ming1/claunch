@@ -40,6 +40,7 @@
 #define ININAME         L"kk.ini"
 
 #define WM_APP_WAKE     (WM_APP + 1)
+#define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板可见未聚焦时也可用）
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
 #define HOTKEY_ID       1
@@ -131,6 +132,8 @@ static int   g_alpha = 255, g_fadeDir = 0;
 static BOOL  g_dlgOpen = FALSE;
 
 static HHOOK g_hook = NULL;
+static HANDLE g_hookH;              // 钩子专用线程：回调不再与绘制抢 UI 线程
+static DWORD  g_hookTid;
 static WCHAR g_ini[MAX_PATH];
 static int   g_savedX, g_savedY, g_savedW, g_savedH;
 static BOOL  g_applySavedRect = FALSE;
@@ -282,10 +285,12 @@ static void SelectGroup(int gi)
     ClampScroll();
     EnsureGroupVisible(gi);
     UpdateHoverText();
+    InvalidateTitle();      // 标题闲时显示分组名，切组立即跟上
     RECT sr = { 0, 0, g_sideW, g_ch };
     InvalidateRect(g_hwnd, &sr, FALSE);
     RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
     InvalidateRect(g_hwnd, &gr, FALSE);
+    UpdateWindow(g_hwnd);   // 滚轮连发时 WM_PAINT 会被消息饿死，立即同步重绘
 }
 
 static RECT GroupRect(int i)
@@ -1066,7 +1071,7 @@ static void UpdateHoverText(void)
         g_hoverActive = FALSE;
         return;
     }
-    wcsncpy_s(g_hoverText, 80, APPNAME, _TRUNCATE);
+    wcsncpy_s(g_hoverText, 80, g_groups[g_curGroup].name, _TRUNCATE);   // 闲时显示当前分组
     g_hoverActive = FALSE;
 }
 
@@ -1558,6 +1563,7 @@ static void ShowCellMenu(int ii)
     AppendMenuW(m, MF_STRING, IDM_DEL, L"从格子移除");
     POINT p;
     GetCursorPos(&p);
+    SetForegroundWindow(g_hwnd);          // 不置前台菜单会秒关，看起来像没反应
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
     DestroyMenu(m);
     if (!cmd) return;
@@ -1604,6 +1610,7 @@ static void ShowGroupMenu(int gi)
     AppendMenuW(m, MF_STRING, IDM_GRP_NEW, L"新建分组");
     POINT p;
     GetCursorPos(&p);
+    SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
     DestroyMenu(m);
     if (cmd == IDM_GRP_RENAME) {
@@ -1631,6 +1638,7 @@ static void ShowTitleMenu(void)
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
     POINT p;
     GetCursorPos(&p);
+    SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
     DestroyMenu(m);
     if (cmd == IDM_TOP) {
@@ -1660,21 +1668,49 @@ static BOOL IsDesktopPoint(POINT pt)
 
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN) {
-        MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
-        DWORD now = GetTickCount();
-        int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
-        if (dx < 0) dx = -dx;
-        if (dy < 0) dy = -dy;
-        BOOL dbl = s_lastClick && (now - s_lastClick) <= (DWORD)GetDoubleClickTime()
-                   && dx <= GetSystemMetrics(SM_CXDLGFRAME)
-                   && dy <= GetSystemMetrics(SM_CYDLGFRAME);
-        if (dbl && !IsWindowVisible(g_hwnd) && IsDesktopPoint(p->pt))
-            PostMessageW(g_hwnd, WM_APP_WAKE, 0, 0);
-        s_lastClick = now;
-        s_lastPt = p->pt;
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_LBUTTONDOWN) {
+            MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+            DWORD now = GetTickCount();
+            int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
+            if (dx < 0) dx = -dx;
+            if (dy < 0) dy = -dy;
+            BOOL dbl = s_lastClick && (now - s_lastClick) <= (DWORD)GetDoubleClickTime()
+                       && dx <= GetSystemMetrics(SM_CXDLGFRAME)
+                       && dy <= GetSystemMetrics(SM_CYDLGFRAME);
+            if (dbl && !IsWindowVisible(g_hwnd) && IsDesktopPoint(p->pt))
+                PostMessageW(g_hwnd, WM_APP_WAKE, 0, 0);
+            s_lastClick = now;
+            s_lastPt = p->pt;
+        } else if (wParam == WM_MOUSEWHEEL) {
+            // 面板可见时光标悬停即可滚：滚轮不需要焦点（未聚焦时事件原本到不了面板）
+            MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+            RECT r;
+            if (IsWindowVisible(g_hwnd) && GetWindowRect(g_hwnd, &r) && PtInRect(&r, p->pt)) {
+                POINT c = p->pt;
+                ScreenToClient(g_hwnd, &c);
+                int d = (short)HIWORD(p->mouseData);
+                PostMessageW(g_hwnd, WM_APP_WHEEL, (WPARAM)(short)d, MAKELPARAM(c.x, c.y));
+                return 1;               // 吞掉，不再穿透给焦点窗口
+            }
+        }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+// LL 钩子装在专用线程上：UI 线程忙绘制/菜单时回调照常即时触发，
+// 否则快速滚动时回调超时被系统跳过，滚轮就丢了。
+static DWORD WINAPI HookThread(LPVOID arg)
+{
+    UNREF(arg);
+    g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = NULL; }
+    return 0;
 }
 
 // ---------------------------------------------------------------- 窗口过程
@@ -1693,7 +1729,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
         DragAcceptFiles(h, TRUE);
-        g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
+        g_hookH = CreateThread(NULL, 0, HookThread, NULL, 0, &g_hookTid);
         RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
         SetTimer(h, TIMER_HIDE, 120, NULL);
         // 托盘图标
@@ -1835,6 +1871,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_curGroup = g_hoverGroup;
             g_scroll = 0;
             ClampScroll();
+            UpdateHoverText();
+            InvalidateTitle();
             InvalidateRect(h, NULL, FALSE);
             return 0;
         }
@@ -1856,16 +1894,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (ii >= 0) ShowCellMenu(ii);
         } else if (g_hoverGroup >= 0) {
             ShowGroupMenu(g_hoverGroup);
+        } else if (p.x < g_sideW && p.y >= g_titleH) {
+            ShowGroupMenu(-1);            // 侧边栏空白处（列表下方）：只给“新建分组”
         } else if (g_hoverBtn || p.y < g_titleH) {
             ShowTitleMenu();
         }
         return 0;
     }
 
+    // 滚轮：WM_APP_WHEEL 来自低级钩子（lParam 已是客户坐标），无焦点也可用
+    case WM_APP_WHEEL:
     case WM_MOUSEWHEEL: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        ScreenToClient(h, &p);
-        int d = GET_WHEEL_DELTA_WPARAM(w);
+        if (m == WM_MOUSEWHEEL) ScreenToClient(h, &p);
+        int d = (m == WM_APP_WHEEL) ? (int)(short)w : (int)GET_WHEEL_DELTA_WPARAM(w);
         if (p.x < g_sideW) {
             // 侧栏：滚轮上下切换分组（等同于点击相邻分组），到头后循环
             int gi = g_curGroup + (d > 0 ? -1 : 1);
@@ -1980,7 +2022,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DESTROY:
         SaveConfig();
         TrayRemove();
-        if (g_hook) UnhookWindowsHookEx(g_hook);
+        if (g_hookH) {
+            PostThreadMessageW(g_hookTid, WM_QUIT, 0, 0);
+            WaitForSingleObject(g_hookH, 1000);
+            CloseHandle(g_hookH);
+            g_hookH = NULL;
+        }
         UnregisterHotKey(h, HOTKEY_ID);
         for (int i = 0; i < g_nItems; i++) DropIcon(i);
         if (g_font) DeleteObject(g_font);
