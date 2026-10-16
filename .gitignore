@@ -1,0 +1,18 @@
+# 编译产物
+*.exe
+*.obj
+*.pdb
+*.map
+*.ilk
+*.exp
+*.lib
+
+# 运行时生成的配置（程序自己写入）
+kk.ini
+
+# 编辑器/系统
+.vs/
+.vscode/
+*.tmp
+Thumbs.db
+desktop.ini
