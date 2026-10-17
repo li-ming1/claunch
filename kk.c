@@ -1,5 +1,6 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
-// 左侧自定义分组（行可拖拽排序，决定滚轮切换顺序）、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
+// 左侧自定义分组（行可拖拽排序，决定滚轮切换顺序）、正方形密集格子（槽位模型：
+// 拖放即与落点互换、清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工具提示。
@@ -55,11 +56,13 @@
 #define IDM_LAUNCH      1001
 #define IDM_ADMIN       1002
 #define IDM_LOC         1003
-#define IDM_DEL         1004
-#define IDM_GRP_RENAME  1005
-#define IDM_GRP_DEL     1006
-#define IDM_GRP_NEW     1007
-#define IDM_PROPS       1008
+#define IDM_INS_SLOT    1004
+#define IDM_DEL_SLOT    1005
+#define IDM_CLR_SLOT    1006
+#define IDM_PROPS       1007
+#define IDM_GRP_RENAME  1008
+#define IDM_GRP_DEL     1009
+#define IDM_GRP_NEW     1011
 #define IDM_EXIT        1010
 
 // 托盘
@@ -460,6 +463,15 @@ static HICON IconFromImage(const WCHAR *path, int want, int idx)
     int ids[1] = { 0 };
     if (pExtractIcons && pExtractIcons(path, idx, want, want, icons, ids, 1, 0) > 0 && icons[0])
         return icons[0];
+    // 部分程序图标只在特定尺寸档有资源：换标准档位再试（DrawIconEx 绘制时会缩放到位）
+    if (pExtractIcons) {
+        static const int fb[3] = { 32, 48, 16 };
+        for (int k = 0; k < 3; k++) {
+            icons[0] = NULL;
+            if (pExtractIcons(path, idx, fb[k], fb[k], icons, ids, 1, 0) > 0 && icons[0])
+                return icons[0];
+        }
+    }
     // 把目标当数据文件映射，遍历它的 RT_GROUP_ICON（存根程序图标 ID 不一定是 1）
     HMODULE hm = LoadLibraryExW(path, NULL,
                                 LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
@@ -748,24 +760,7 @@ static void RemoveItemAt(int k)
     ViewDirty();
 }
 
-// 视图内拖动排序：把第 vfrom 格移到 vto，中间项顺移。
-// 先快照各视图位的全局下标再轮转，避免写途中组员变动影响 ItemAtView。
-static void MoveItem(int vfrom, int vto)
-{
-    int n = ViewCount();
-    if (vfrom < 0 || vto < 0 || vfrom >= n || vto >= n || vfrom == vto) return;
-    int pos[MAX_ITEMS];
-    for (int k = 0; k < n; k++) pos[k] = ItemAtView(k);
-    Item tmp = g_items[pos[vfrom]];
-    if (vfrom < vto)
-        for (int k = vfrom; k < vto; k++) g_items[pos[k]] = g_items[pos[k + 1]];
-    else
-        for (int k = vfrom; k > vto; k--) g_items[pos[k]] = g_items[pos[k - 1]];
-    g_items[pos[vto]] = tmp;
-    ViewDirty();
-}
-
-// 侧栏分组重排：把第 from 组移到 to 位，中间顺移（与 MoveItem 同一套轮转）。
+// 侧栏分组重排：把第 from 组移到 to 位，中间顺移。
 // 组 0（“全部”）是伪分组，不参与。条目的 group 编号与被移动组跨越的区间
 // 一起平移，当前组跟着走——否则组序变了、条目还挂在旧编号上
 static void MoveGroup(int from, int to)
@@ -801,6 +796,55 @@ static void EnsureSlot(int slot)
     int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
     while (ViewCount() <= slot && g_nItems < MAX_ITEMS)
         AddItemRaw(L"", L"", g, NULL, NULL);
+}
+
+// ---------------------------------------------------------------- 槽位操作（插入/删除/清空）
+// 槽位模型：格子是固定槽位，条目住在槽位里。清空不挪其他格子；插入/删除才挪。
+
+// 三种槽位操作共用的收尾：视图重算 + 悬停/卡片同步 + 整窗重绘 + 落盘
+static void SlotOpRefresh(void)
+{
+    ViewDirty();
+    ClampScroll();
+    UpdateHoverText();
+    RefreshCard();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    SaveConfig();
+}
+
+// 在视图位 vi 前插入一个空格（其后条目整体后移）；vi 超出视图则追加到末尾
+static void InsertSlotAt(int vi)
+{
+    if (g_nItems >= MAX_ITEMS) return;
+    int at = ItemAtView(vi);
+    int pos = (at >= 0) ? at : g_nItems;
+    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    for (int i = g_nItems; i > pos; i--) g_items[i] = g_items[i - 1];
+    ZeroMemory(&g_items[pos], sizeof g_items[pos]);
+    g_items[pos].group = g;
+    g_nItems++;
+    SlotOpRefresh();
+}
+
+// 清空视图位 vi 的条目成空格：槽位保留，其他格子原位不动
+static void ClearSlotAt(int vi)
+{
+    int at = ItemAtView(vi);
+    if (at < 0) return;
+    int g = g_items[at].group;            // 空格留在原来的组里
+    DropIcon(at);
+    ZeroMemory(&g_items[at], sizeof g_items[at]);
+    g_items[at].group = g;
+    SlotOpRefresh();
+}
+
+// 删除视图位 vi 的整个槽位（条目一并删除，其后条目前移）
+static void DeleteSlotAt(int vi)
+{
+    int at = ItemAtView(vi);
+    if (at < 0) return;
+    RemoveItemAt(at);
+    SlotOpRefresh();
 }
 
 // 启动时清理失效项目：路径已不存在（含 .lnk 被删）直接移除并写回配置。
@@ -2232,22 +2276,33 @@ static int PopupAt(HMENU m)
     return cmd;
 }
 
-static void ShowCellMenu(int ii)
+// 格子右键菜单：有程序的格子给启动/属性等；空格也给槽位菜单（插入/删除）。
+// 菜单按视图位 vi 打开——插入/删除是槽位级操作，作用于可见格位
+static void ShowCellMenu(int vi)
 {
+    int ii = ItemAtView(vi);
+    BOOL hasItem = ii >= 0 && !IsBlank(ii);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_LAUNCH, L"打开");
-    AppendMenuW(m, MF_STRING, IDM_ADMIN, L"以管理员身份运行");
-    AppendMenuW(m, MF_STRING, IDM_LOC, L"打开文件位置");
+    if (hasItem) {
+        AppendMenuW(m, MF_STRING, IDM_LAUNCH, L"打开");
+        AppendMenuW(m, MF_STRING, IDM_ADMIN, L"以管理员身份运行");
+        AppendMenuW(m, MF_STRING, IDM_LOC, L"打开文件位置");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    }
+    AppendMenuW(m, MF_STRING, IDM_INS_SLOT, L"在此插入格子");
+    AppendMenuW(m, MF_STRING, IDM_DEL_SLOT, L"删除格子");
+    if (hasItem) AppendMenuW(m, MF_STRING, IDM_CLR_SLOT, L"清空格子");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, IDM_PROPS, L"格子属性(&R)...");
-    AppendMenuW(m, MF_STRING, IDM_DEL, L"从格子移除");
+    if (hasItem) AppendMenuW(m, MF_STRING, IDM_PROPS, L"格子属性(&R)...");
     int cmd = PopupAt(m);
     if (!cmd) return;
     switch (cmd) {
     case IDM_LAUNCH: Launch(ii, FALSE); break;
     case IDM_ADMIN:  Launch(ii, TRUE); break;
     case IDM_LOC:    OpenLocation(g_items[ii].path); break;
-    case IDM_DEL:    RemoveItemAt(ii); SaveConfig(); ClampScroll(); RefreshCard(); InvalidateRect(g_hwnd, NULL, FALSE); break;
+    case IDM_INS_SLOT: InsertSlotAt(vi); break;
+    case IDM_DEL_SLOT: DeleteSlotAt(vi); break;
+    case IDM_CLR_SLOT: ClearSlotAt(vi); break;
     case IDM_PROPS: {
         WCHAR oldPath[MAX_PATH];
         wcsncpy_s(oldPath, MAX_PATH, g_items[ii].path, _TRUNCATE);
@@ -2716,21 +2771,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             if (to != from && to >= 0) {
                 int fi = ItemAtView(from), ti = ItemAtView(to);
-                if (fi >= 0 && ti >= 0 && IsBlank(ti)) {
-                    // 落点是空格：与空位互换，其余格子原位不动——拖进哪个格就停哪个格
+                if (fi >= 0 && ti >= 0) {
+                    // 槽位模型：落点（空格或程序）与源互换——拖谁跟谁换，其余格子原位不动
                     Item tmp = g_items[fi];
                     g_items[fi] = g_items[ti];
                     g_items[ti] = tmp;
-                } else {
-                    MoveItem(from, to);    // 落点是已有条目：整体顺移（旧换位行为）
+                    SaveConfig();
                 }
                 ClampScroll();
                 ViewDirty();
-                SaveConfig();
             }
-            // 只重绘受影响的格子区间（顺移整段都变），不必整窗重绘
-            InvalidateCells(from, to);
-            RefreshCard();       // 顺移/补空格后同一悬停格对应的条目变了
+            InvalidateCell(from);
+            InvalidateCell(to);
+            RefreshCard();       // 互换后同一悬停格对应的条目变了
         } else {
             InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
             if (to >= 0 && to != from) InvalidateCell(to);
@@ -2756,10 +2809,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
         RefreshCard();
-        if (g_hoverCell >= 0) {
-            int ii = ItemAtView(g_hoverCell);     // 空格不给菜单（当成空白区）
-            if (ii >= 0 && !IsBlank(ii)) ShowCellMenu(ii);
-        } else if (g_hoverGroup >= 0) {
+        if (g_hoverCell >= 0) ShowCellMenu(g_hoverCell);   // 空格也给槽位菜单（插入/删除）
+        else if (g_hoverGroup >= 0) {
             ShowGroupMenu(g_hoverGroup);
         } else if (p.x < g_sideW && p.y >= g_titleH) {
             ShowGroupMenu(-1);            // 侧边栏空白处（列表下方）：只给“新建分组”
