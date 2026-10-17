@@ -2696,6 +2696,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_dpi = LOWORD(w);
         ScaleMetrics();
         MakeFontsAndBrushes();
+        // 图标尺寸 = S_(格基)×3/7 随 DPI 变：缓存图标不丢就会被拉伸到新尺寸（发虚），
+        // 与 ApplyCellBase 同一处理——丢掉，随后那次绘制按新 DPI 重载
+        for (int i = 0; i < g_nItems; i++) DropIcon(i);
         RECT r;
         if (g_applySavedRect) {
             // 首次 DPI 切换：配置里记的是物理像素，必须以它为准，
