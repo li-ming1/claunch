@@ -152,6 +152,7 @@ static BOOL g_topmost = TRUE;
 static BOOL g_silent = FALSE;    // 静默启动：启动直接进托盘不淡入（配置持久化）
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
+static BOOL g_cfgDirty = FALSE;  // 配置有待落盘：缩放等连续操作防抖，避免每格滚轮都写文件
 static int  g_curGroup = 0;
 static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
 static int  g_scroll = 0;       // 格子区滚动（像素）
@@ -1123,9 +1124,11 @@ static void SaveConfig(void)
                 SafeField(sTip, 128, g_items[i].tip));
     }
     CloseHandle(f);
+    g_cfgDirty = FALSE;   // 磁盘已与内存一致（早退的失败路径不清：下个心跳重试）
 }
 
-// 应用格子缩放（Ctrl+滚轮）：重算列数、按新尺寸重载图标、钳制滚动、整窗重绘并写回配置
+// 应用格子缩放（Ctrl+滚轮）：重算列数、按新尺寸重载图标、钳制滚动、整窗重绘。
+// 落盘防抖：连续缩放手势只写一次配置（由 TIMER_HIDE 心跳代劳）
 static void ApplyCellBase(int v)
 {
     v = ClampCellBase(v);
@@ -1135,7 +1138,7 @@ static void ApplyCellBase(int v)
     for (int i = 0; i < g_nItems; i++) DropIcon(i);   // 图标尺寸变了：丢掉，下次绘制按新尺寸重载
     ClampScroll();
     InvalidateRect(g_hwnd, NULL, FALSE);
-    SaveConfig();
+    g_cfgDirty = TRUE;        // 缩放是连续操作：落盘交给心跳防抖，别每格滚轮都写文件
 }
 
 // ---------------------------------------------------------------- 剪贴板（Ctrl+C/V 复制格子）
@@ -1301,6 +1304,7 @@ static void StepFade(void)
             ShowWindow(g_hwnd, SW_HIDE);
             KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
             g_flashAt = 0;                    // 心跳停了：反馈不可能再过期重绘，直接收掉
+            if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 心跳将停：待落盘的立即落
             TrimWS();
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
@@ -2953,6 +2957,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER:
         if (w == TIMER_HIDE) {
             if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
+            if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
             if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
                 TrimWS();
                 g_outSince = 0;
