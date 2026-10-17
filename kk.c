@@ -669,8 +669,9 @@ static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
 }
 
 // 读注册表 DefaultIcon 值并提取图标。值形如 "路径[,索引]"（负索引 = 资源 ID），
-// 引号包路径也认；REG_EXPAND_SZ 的环境变量由 RegGetValueW 自动展开
-static HICON IconFromDefaultKey(const WCHAR *subkey, int want)
+// 引号包路径也认；REG_EXPAND_SZ 的环境变量由 RegGetValueW 自动展开。
+// src：%1/%0 占位符的替换源——exefile 的 DefaultIcon 就是 "%1"（用文件自己当图标）
+static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
 {
     WCHAR val[600];
     DWORD cb = sizeof val;
@@ -690,11 +691,13 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, int want)
         if (c && c[1]) { *c = 0; idx = _wtoi(c + 1); }
     }
     if (!icon[0]) return NULL;
+    if (!wcscmp(icon, L"%1") || !wcscmp(icon, L"%0")) icon = (WCHAR *)src;
     return IconFromImage(icon, want, idx);
 }
 
 // 文档类型关联图标：扩展名 → ProgID → DefaultIcon（.docx→Word、.txt→txtfile…）。
-// 手工走注册表，不碰 SHGetFileInfo 的 shell 图标管线（文件头内存红线）
+// 手工走注册表，不碰 SHGetFileInfo 的 shell 图标管线（文件头内存红线）。
+// 机器默认 ProgID 没有 DefaultIcon 时回落到用户选择的 ProgID（FileExts\UserChoice）
 static HICON AssocIcon(const WCHAR *path, int want)
 {
     const WCHAR *ext = wcsrchr(path, L'.');
@@ -706,13 +709,25 @@ static HICON AssocIcon(const WCHAR *path, int want)
         return NULL;
     WCHAR key[300];
     if (swprintf(key, 300, L"%s\\DefaultIcon", progid) >= 300) return NULL;
-    return IconFromDefaultKey(key, want);
+    HICON h = IconFromDefaultKey(key, path, want);
+    if (h) return h;
+    WCHAR uc[300];
+    if (swprintf(uc, 300,
+                 L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\%s\\UserChoice",
+                 ext) >= 300) return NULL;
+    WCHAR up[128];
+    cb = sizeof up;
+    if (RegGetValueW(HKEY_CURRENT_USER, uc, L"ProgID", RRF_RT_REG_SZ,
+                     NULL, up, &cb) != ERROR_SUCCESS || !up[0])
+        return NULL;
+    if (swprintf(key, 300, L"%s\\DefaultIcon", up) >= 300) return NULL;
+    return IconFromDefaultKey(key, path, want);
 }
 
 // 文件夹图标：Directory\DefaultIcon（系统真实文件夹），失败退手绘琥珀文件夹
-static HICON FolderIcon(int want)
+static HICON FolderIcon(const WCHAR *path, int want)
 {
-    HICON h = IconFromDefaultKey(L"Directory\\DefaultIcon", want);
+    HICON h = IconFromDefaultKey(L"Directory\\DefaultIcon", path, want);
     return h ? h : MakeFolderIcon(want);
 }
 
@@ -720,7 +735,7 @@ static HICON IconFor(const WCHAR *path, int want)
 {
     DWORD a = GetFileAttributesW(path);
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
-        return FolderIcon(want);                // 不进 shell 图标管线
+        return FolderIcon(path, want);          // 不进 shell 图标管线
     HICON h = NULL;
     if (HasExt(path, L".lnk")) {
         LnkInfo lnk;
@@ -729,7 +744,7 @@ static HICON IconFor(const WCHAR *path, int want)
             if (!h && lnk.target[0]) {
                 DWORD ta = GetFileAttributesW(lnk.target);
                 if (ta != INVALID_FILE_ATTRIBUTES && (ta & FILE_ATTRIBUTE_DIRECTORY))
-                    h = FolderIcon(want);       // 指向文件夹的快捷方式
+                    h = FolderIcon(lnk.target, want);   // 指向文件夹的快捷方式
                 else
                     h = IconFromImage(lnk.target, want, 0);
             }
