@@ -193,6 +193,7 @@ static int  Rows(void);
 static int  DefaultGroup(void);
 static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
+static void UpdateTrayTip(void);
 
 // 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
 static void CloseToTray(void)
@@ -1430,6 +1431,7 @@ static void TogglePin(void)
     SaveConfig();
     UpdateHoverText();
     InvalidateTitle();
+    UpdateTrayTip();      // 托盘提示里的“定住”标记跟着变
 }
 
 // 静默启动开关：只影响下次启动（当次不隐藏，正在用的窗口不动）
@@ -1437,6 +1439,7 @@ static void ToggleSilent(void)
 {
     g_silent = !g_silent;
     SaveConfig();
+    UpdateTrayTip();      // 托盘提示里的“静默”标记跟着变
 }
 
 static void DrawPinGlyph(HDC dc, RECT r, BOOL on)
@@ -1841,11 +1844,41 @@ static BOOL SetAutostart(BOOL on)
 
 static void ToggleAutostart(void)
 {
-    if (SetAutostart(!g_autostart)) g_autostart = !g_autostart;
+    if (SetAutostart(!g_autostart)) {
+        g_autostart = !g_autostart;
+        UpdateTrayTip();      // 托盘提示里的“自启”标记跟着变
+    }
 }
 
 // ---------------------------------------------------------------- 托盘
 // 运行时画一个 2x2 格子图标：不必引入 .ico 资源，保持单文件
+
+// 组装托盘提示：应用名 + 当前激活的开关（全关时退化为纯操作提示）。
+// 开关状态一目了然，不用每次都右键开菜单看勾选
+static void BuildTrayTip(WCHAR *out, size_t cch)
+{
+    WCHAR flags[40] = L"";
+    if (g_pinned)    wcscat_s(flags, 40, L"定住·");
+    if (g_topmost)   wcscat_s(flags, 40, L"置顶·");
+    if (g_autostart) wcscat_s(flags, 40, L"自启·");
+    if (g_silent)    wcscat_s(flags, 40, L"静默·");
+    if (flags[0]) {
+        flags[wcslen(flags) - 1] = 0;                     // 去掉末尾分隔符
+        swprintf(out, cch, L"桌面格子 — %s — 单击显示，右键菜单", flags);
+    } else {
+        swprintf(out, cch, L"桌面格子 — 单击显示，右键菜单");
+    }
+}
+
+// 开关变化后刷新托盘提示（无托盘图标时是空操作；只改 tip，不动图标/回调）
+static void UpdateTrayTip(void)
+{
+    if (!g_trayIcon) return;
+    BuildTrayTip(g_nid.szTip, 64);
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
 static HICON MakeTrayIcon(int sz)
 {
     HDC scr = GetDC(NULL);
@@ -1919,7 +1952,7 @@ static void TrayAdd(void)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
-    wcsncpy_s(g_nid.szTip, 64, L"桌面格子 — 单击显示面板，右键菜单可退出", _TRUNCATE);
+    BuildTrayTip(g_nid.szTip, 64);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
@@ -2059,6 +2092,7 @@ static void ShowTitleMenu(void)
         SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SaveConfig();
+        UpdateTrayTip();      // 托盘提示里的“置顶”标记跟着变
     } else if (cmd == IDM_EXIT) {
         ExitApp();
     }
