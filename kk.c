@@ -139,6 +139,9 @@ static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 static int  g_hoverCell = -1, g_hoverGroup = -1, g_hoverBtn = 0; // btn: 1 钉 2 关
 static int  g_hoverItem = -1;   // 悬停格对应的全局条目下标（空格/空白为 -1），随 HoverFromPoint 刷新
 static WCHAR g_hoverText[80];
+static BOOL  g_cardOn = FALSE;  // 悬停小卡片可见（悬停格子/分组时浮在其上方）
+static RECT  g_cardRect;        // 卡片区域：悬停目标变化时重算，绘制只读
+static WCHAR g_cardText[80];    // 卡片文字：程序名/组名
 
 static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
 static BOOL g_dragging;         // 已越过拖动阈值
@@ -180,6 +183,7 @@ static int  PopupAt(HMENU m);
 static int  Rows(void);
 static int  DefaultGroup(void);
 static void UpdateHoverText(void);
+static void RefreshCard(void);
 
 // 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
 static void CloseToTray(void)
@@ -213,7 +217,7 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 static void UpdateCell(void)
 {
     int w = g_cw - g_sideW;
-    int step = S_(72) + g_gap;
+    int step = S_(56) + g_gap;
     int c = (w + g_gap + step / 2) / step;
     g_cols = c < 1 ? 1 : c;
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
@@ -349,6 +353,7 @@ static void SelectGroup(int gi)
     InvalidateRect(g_hwnd, &sr, FALSE);
     RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
     InvalidateRect(g_hwnd, &gr, FALSE);
+    RefreshCard();          // 视图换了：同一悬停格对应的条目可能变了，卡片重锚
     UpdateWindow(g_hwnd);   // 滚轮连发时 WM_PAINT 会被消息饿死，立即同步重绘
 }
 
@@ -627,7 +632,7 @@ static void EnsureIcon(int i)
     if (g_items[i].iconTried) return;
     g_items[i].iconTried = TRUE;
     if (!g_items[i].path[0]) return;
-    HICON h = IconFor(g_items[i].path, S_(30));
+    HICON h = IconFor(g_items[i].path, S_(24));
     if (h) { g_items[i].icon = h; g_items[i].ownIcon = TRUE; }
     else    g_items[i].icon = LoadIconW(NULL, IDI_APPLICATION);   // 共享图标，不销毁
 }
@@ -1133,7 +1138,7 @@ static void MoveToPoint(POINT pt)
 static void ScaleMetrics(void)
 {
     g_titleH = S_(34);
-    g_sideW  = S_(104);
+    g_sideW  = S_(84);
     g_gap    = S_(3);
     g_grpH   = S_(34);
 }
@@ -1241,6 +1246,67 @@ static BOOL HoverFromPoint(POINT p)
     return oldAct != g_hoverActive || wcscmp(oldText, g_hoverText) != 0;
 }
 
+// ---------------------------------------------------------------- 悬停小卡片
+// 悬停格子/分组时在目标上方浮一张小卡片显示程序名/组名（类工具提示）。
+// 位置锚定悬停目标而非光标：光标每帧都在动，锚光标意味着每帧重算+重绘；
+// 锚目标则只在悬停目标变化时算一次（GetDC + DT_CALCRECT 量宽），
+// 绘制阶段只读缓存的状态，零分配、零新 GDI 对象（复用面板刷/线刷/字体）
+static void UpdateCard(void)
+{
+    const WCHAR *txt = NULL;
+    RECT anc = { 0, 0, 0, 0 };                 // 锚点：悬停目标矩形
+    if (g_hoverCell >= 0) {
+        int ii = ItemAtView(g_hoverCell);
+        if (ii >= 0 && !IsBlank(ii)) { txt = g_items[ii].name; anc = CellRect(g_hoverCell); }
+    } else if (g_hoverGroup >= 0) {
+        txt = g_groups[g_hoverGroup].name;
+        anc = GroupRect(g_hoverGroup);
+    }
+    if (!txt || !txt[0]) { g_cardOn = FALSE; return; }   // 空格/空白/按钮不出卡片
+
+    HDC dc = GetDC(g_hwnd);
+    if (!dc) { g_cardOn = FALSE; return; }
+    HFONT old = (HFONT)SelectObject(dc, g_font);
+    RECT tr = { 0, 0, 0, 0 };
+    DrawTextW(dc, txt, -1, &tr, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(g_hwnd, dc);
+
+    int w = tr.right - tr.left + S_(16);
+    int h = tr.bottom - tr.top + S_(8);
+    if (w > g_cw - S_(8)) w = g_cw - S_(8);     // 超长名：收窄 + DT_END_ELLIPSIS
+    int x = (anc.left + anc.right) / 2 - w / 2;
+    int y = anc.top - h - S_(4);                // 默认浮在目标上方
+    if (y < g_titleH) y = anc.bottom + S_(4);   // 上方是标题栏/首行：改放下方
+    if (x < S_(4)) x = S_(4);
+    if (x + w > g_cw - S_(4)) x = g_cw - S_(4) - w;
+    if (y + h > g_ch - S_(4)) y = g_ch - S_(4) - h;
+    wcsncpy_s(g_cardText, 80, txt, _TRUNCATE);
+    g_cardRect.left = x; g_cardRect.top = y;
+    g_cardRect.right = x + w; g_cardRect.bottom = y + h;
+    g_cardOn = TRUE;
+}
+
+// 悬停目标/视图/名称/滚动变化后刷新：擦除旧卡片区域，重算并弄脏新区域
+static void RefreshCard(void)
+{
+    if (g_cardOn) { InvalidateRect(g_hwnd, &g_cardRect, FALSE); g_cardOn = FALSE; }
+    UpdateCard();
+    if (g_cardOn) InvalidateRect(g_hwnd, &g_cardRect, FALSE);
+}
+
+static void DrawCard(HDC dc)
+{
+    RECT r = g_cardRect;
+    FillRect(dc, &r, g_brPanel);
+    FrameRect(dc, &r, g_brLine);
+    HFONT old = (HFONT)SelectObject(dc, g_font);
+    SetTextColor(dc, C_TEXT);
+    DrawTextW(dc, g_cardText, -1, &r,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(dc, old);
+}
+
 // ---------------------------------------------------------------- 绘制
 static void InvalidateCell(int vi)
 {
@@ -1308,9 +1374,9 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         // 只用“选中高亮”，不再叠加悬停灰底，避免两种高亮重复
         if (sel) FillRect(dc, &r, g_brCell);
         SetTextColor(dc, sel ? C_ACCEL : (hov ? C_TEXT : C_DIM));
-        RECT tr = { r.left + S_(6), r.top, r.right - S_(4), r.bottom };
+        RECT tr = { r.left + S_(4), r.top, r.right - S_(4), r.bottom };
         DrawTextW(dc, g_groups[i].name, -1, &tr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         // 选中标记放在下方（原来在左侧）
         if (sel) {
             RECT bar = { r.left, r.bottom - S_(2), r.right, r.bottom };
@@ -1349,7 +1415,7 @@ static void PaintTitle(HDC dc)
 static void PaintGrid(HDC dc, const RECT *clip)
 {
     int step = g_cell + g_gap;
-    int isz = S_(30);
+    int isz = S_(24);
     int n = ViewCount();
     int limit = g_slots;
     if (n > limit) limit = n;
@@ -1416,6 +1482,8 @@ static void PaintWindow(HDC dc, BOOL buffered)
     if (!cl || IntersectRect(&hit, &sr, cl)) PaintSidebar(dc, cl);
     if (!cl || IntersectRect(&hit, &tr, cl)) PaintTitle(dc);
     if (!cl || IntersectRect(&hit, &gr, cl)) PaintGrid(dc, cl);
+    // 小卡片最后画：压在侧栏/标题/格子之上；脏区不碰卡片时整段跳过
+    if (g_cardOn && (!cl || IntersectRect(&hit, &g_cardRect, cl))) DrawCard(dc);
     SelectObject(dc, old);
 }
 
@@ -1786,6 +1854,7 @@ static void ShowCellMenu(int ii)
             InvalidateCell(g_hoverCell);
             InvalidateTitle();
             InvalidateRect(g_hwnd, NULL, FALSE);
+            RefreshCard();                   // 名称可能被改，卡片文字同步
         }
         break;
     }
@@ -1810,6 +1879,7 @@ static void ShowGroupMenu(int gi)
             SaveConfig();
             UpdateHoverText();
             InvalidateRect(g_hwnd, NULL, FALSE);
+            RefreshCard();                   // 组名可能被改，卡片文字同步
         }
     } else if (cmd == IDM_GRP_DEL) {
         DeleteGroup(gi);
@@ -2020,6 +2090,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (rgn) SetWindowRgn(h, rgn, TRUE);
         ClampScroll();
         ClampGrpScroll();
+        RefreshCard();      // 尺寸变了：卡片按新布局重新锚定/钳制
         InvalidateRect(h, NULL, FALSE);
         return 0;
     }
@@ -2132,6 +2203,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             RECT sr = { 0, 0, g_sideW, g_ch };
             if (og != g_hoverGroup) InvalidateRect(h, &sr, FALSE);
             if (txtChg) InvalidateTitle();   // 文字没变的悬停切换不碰标题栏
+            RefreshCard();                   // 小卡片跟着悬停目标（内部含擦除旧区域）
         }
         if (!g_tracking) {
             TRACKMOUSEEVENT tme;
@@ -2155,12 +2227,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             RECT sr = { 0, 0, g_sideW, g_ch };
             InvalidateRect(h, &sr, FALSE);
             InvalidateTitle();
+            RefreshCard();                   // 鼠标离开：收起小卡片
         }
         return 0;
 
     case WM_LBUTTONDOWN: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
+        RefreshCard();      // 悬停可能瞬变（如唤醒后首次点击），卡片同步
         if (g_hoverBtn == 2) { CloseToTray(); return 0; }
         if (g_hoverBtn == 1) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
@@ -2171,6 +2245,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             UpdateHoverText();
             InvalidateTitle();
             InvalidateRect(h, NULL, FALSE);
+            RefreshCard();       // 视图换了：同一悬停格对应的条目可能变了
             return 0;
         }
         if (g_hoverCell >= 0) {
@@ -2225,6 +2300,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             // 只重绘受影响的格子区间（顺移整段都变），不必整窗重绘
             InvalidateCells(from, to);
+            RefreshCard();       // 顺移/补空格后同一悬停格对应的条目变了
         } else {
             InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
             if (to >= 0 && to != from) InvalidateCell(to);
@@ -2243,6 +2319,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_RBUTTONUP: {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
+        RefreshCard();
         if (g_hoverCell >= 0) {
             if (g_hoverItem >= 0 && !IsBlank(g_hoverItem)) ShowCellMenu(g_hoverItem);   // 空格不给菜单（当成空白区）
         } else if (g_hoverGroup >= 0) {
@@ -2274,6 +2351,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (g_scroll != before) {
                 RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
                 InvalidateRect(h, &gr, FALSE);
+                RefreshCard();       // 格子滚动了：卡片跟着锚点走
             }
         }
         return 0;
@@ -2332,6 +2410,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             ViewDirty();                       // 替换可能改了条目分组
             SaveConfig();
             ClampScroll();
+            RefreshCard();                     // 视图/名称可能变了，卡片同步
             if (lo < 0) {
                 InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
             } else {
