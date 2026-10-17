@@ -1061,11 +1061,17 @@ static BOOL Launch(int idx, BOOL asAdmin)
     if (!asAdmin) {
         if (HasExt(it->path, L".lnk")) {
             LnkInfo lnk;
-            if (ParseLnk(it->path, &lnk) && lnk.target[0] &&
-                CreateRun(lnk.target,
-                          it->args[0] ? it->args : lnk.args,
-                          lnk.work))
-                return TRUE;
+            if (ParseLnk(it->path, &lnk) && lnk.target[0]) {
+                // .lnk 的工作目录常含环境变量（如 Git CMD 的 %HOMEDRIVE%%HOMEPATH%），
+                // CreateProcess 不展开 lpCurrentDirectory：不先展开直启必败，
+                // 白白退到 shell 兜底路径
+                WCHAR wexp[MAX_PATH];
+                const WCHAR *work = lnk.work;
+                if (work[0] && ExpandEnvironmentStringsW(work, wexp, MAX_PATH) && wexp[0])
+                    work = wexp;
+                if (CreateRun(lnk.target, it->args[0] ? it->args : lnk.args, work))
+                    return TRUE;
+            }
         } else if (CreateRun(it->path, it->args, L"")) {
             return TRUE;
         }
