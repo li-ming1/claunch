@@ -614,6 +614,29 @@ static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
                 }
             }
         }
+        // CommonPathSuffix：本地路径的后半段（路径被拆开存时 LocalBasePath 只是
+        // 前缀，完整目标 = LocalBasePath + CommonPathSuffix——漏掉它目标被截断）
+        DWORD sfxoff = *(const DWORD *)(linfo + 0x18);
+        if (lhs >= 0x28) {
+            DWORD soffu = *(const DWORD *)(linfo + 0x20);
+            if (soffu && soffu + 2 <= lisz) {
+                const WCHAR *s = (const WCHAR *)(linfo + soffu);
+                const WCHAR *se = (const WCHAR *)(linfo + lisz);
+                int m = (int)wcslen(li->target);
+                while (s < se && *s && m < MAX_PATH - 1) li->target[m++] = *s++;
+                li->target[m] = 0;
+            }
+        } else if (sfxoff && sfxoff < lisz) {
+            const char *s  = (const char *)(linfo + sfxoff);
+            const char *se = (const char *)(linfo + lisz);
+            int r = 0;
+            while (s + r < se && s[r]) r++;
+            int m = (int)wcslen(li->target);
+            if (r) {
+                MultiByteToWideChar(CP_ACP, 0, s, r, li->target + m, MAX_PATH - m);
+                li->target[MAX_PATH - 1] = 0;
+            }
+        }
     }
     // ICON_LOCATION 的 ",N" 后缀 → 图标索引；没有则用头部 IconIndex
     WCHAR *c = wcsrchr(li->iconLoc, L',');
