@@ -2007,7 +2007,10 @@ static void BrowseForFile(HWND edit)
     of.lpstrFilter = L"程序\0*.exe;*.lnk;*.bat;*.cmd\0所有文件\0*.*\0\0";
     of.lpstrFile = file;
     of.nMaxFile = MAX_PATH;
-    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    // OFN_NOCHANGEDIR：浏览对话框默认会把进程当前目录改成用户看过的目录，
+    // 而无工作目录的条目直启时 lpCurrentDirectory=NULL（继承我们的 CWD）——
+    // 不拦这一下，浏览过一次之后所有启动的 CWD 都漂了
+    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
     if (GetOpenFileNameW(&of)) SetWindowTextW(edit, file);
 }
 
