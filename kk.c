@@ -1689,7 +1689,7 @@ static void InvalidateCell(int vi)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
-// 重绘 [a, b] 闭区间格子（顺序无关）：拖动顺移/落点区间/高亮擦除共用
+// 重绘 [a, b] 闭区间格子（顺序无关）：多文件拖放的落点区间重绘用
 static void InvalidateCells(int a, int b)
 {
     if (a > b) { int t = a; a = b; b = t; }
@@ -2877,7 +2877,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_pressCell >= 0) {
             int a = g_pressCell, b = g_dropCell;
             g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
-            InvalidateCells(a, b >= 0 ? b : a);   // 只擦源/落点高亮
+            InvalidateCell(a);                    // 互换模型下高亮只有源/落点两格，逐格擦
+            if (b >= 0 && b != a) InvalidateCell(b);
         }
         if (g_pressGroup >= 0) {
             int a = g_pressGroup, b = g_dropGroup;
