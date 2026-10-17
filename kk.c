@@ -156,6 +156,7 @@ static int  g_curGroup = 0;
 static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
 static int  g_scroll = 0;       // 格子区滚动（像素）
 static int  g_grpScroll = 0;    // 侧栏滚动（像素）
+static int  g_scrollMemo[MAX_GROUPS];   // 每个分组各自的格子滚动位：切组时保存/恢复
 
 static int  g_hoverCell = -1, g_hoverGroup = -1, g_hoverBtn = 0; // btn: 1 钉 2 关
 static WCHAR g_hoverText[80];
@@ -412,10 +413,11 @@ static void EnsureGroupVisible(int gi)
 static void SelectGroup(int gi)
 {
     if (gi < 0 || gi >= g_nGroups || gi == g_curGroup) return;
+    g_scrollMemo[g_curGroup] = g_scroll;    // 记住离开时的滚动位
     g_curGroup = gi;
     ViewDirty();
-    g_scroll = 0;
-    ClampScroll();
+    g_scroll = g_scrollMemo[gi];            // 恢复目标组上次的滚动位
+    ClampScroll();                          // 内容可能变了：钳回范围
     EnsureGroupVisible(gi);
     UpdateHoverText();
     InvalidateRect(g_hwnd, NULL, FALSE);   // 标题/侧栏/格子全区都变（原三个分区矩形的并集就是全窗）
@@ -1352,7 +1354,9 @@ static BOOL ClipSet(const ClipItem *ci)
     return TRUE;
 }
 
-// 从剪贴板取条目：优先私有格式（全字段），退化到纯文本（只当路径，名字由路径推导）
+// 从剪贴板取条目：优先私有格式（全字段），退化到纯文本（只当路径，名字由路径推导），
+// 最后退化到 CF_HDROP（资源管理器里"复制"文件给的是文件句柄表而非文本——
+// 不认它，复制文件后 Ctrl+V 会莫名其妙地失败）。多文件复制只取第一个
 static BOOL ClipGet(ClipItem *ci)
 {
     if (!OpenClipboard(g_hwnd)) return FALSE;
@@ -1375,6 +1379,18 @@ static BOOL ClipGet(ClipItem *ci)
                 ok = TRUE;
             }
             if (s) GlobalUnlock(h);
+        }
+    }
+    if (!ok) {
+        HANDLE h = GetClipboardData(CF_HDROP);           // 剪贴板里的文件列表
+        if (h) {
+            WCHAR p[MAX_PATH];
+            if (DragQueryFileW((HDROP)h, 0, p, MAX_PATH) > 0) {   // 取第一个文件
+                ZeroMemory(ci, sizeof *ci);
+                wcsncpy_s(ci->path, MAX_PATH, p, _TRUNCATE);
+                NameFromPath(ci->path, ci->name, 48);
+                ok = TRUE;
+            }
         }
     }
     CloseClipboard();
@@ -2829,9 +2845,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_hoverBtn == 2) { CloseToTray(); return 0; }
         if (g_hoverBtn == 1) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
+            int og = g_curGroup;
+            g_scrollMemo[og] = g_scroll;               // 记住离开时的滚动位
             g_curGroup = g_hoverGroup;
             ViewDirty();
-            g_scroll = 0;
+            // 点当前组 = 回到顶部（既有行为）；切到别的组 = 恢复该组上次的滚动位
+            g_scroll = (g_curGroup == og) ? 0 : g_scrollMemo[g_curGroup];
             ClampScroll();
             UpdateHoverText();
             InvalidateRect(h, NULL, FALSE);
