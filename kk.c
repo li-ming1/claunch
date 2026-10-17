@@ -732,31 +732,36 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
 
 // 文档类型关联图标：扩展名 → ProgID → DefaultIcon（.docx→Word、.txt→txtfile…）。
 // 手工走注册表，不碰 SHGetFileInfo 的 shell 图标管线（文件头内存红线）。
-// 机器默认 ProgID 没有 DefaultIcon 时回落到用户选择的 ProgID（FileExts\UserChoice）
+// 顺序与资源管理器的有效关联一致：先用户选择（FileExts\UserChoice），
+// 用户没选或其 ProgID 无图标时才退机器默认（HKCR 扩展名→ProgID）——
+// 顺序反了会显示用户已经换掉的旧关联的图标
 static HICON AssocIcon(const WCHAR *path, int want)
 {
     const WCHAR *ext = wcsrchr(path, L'.');
     if (!ext || wcslen(ext) < 2 || wcslen(ext) > 30) return NULL;
-    WCHAR progid[128];
-    DWORD cb = sizeof progid;
-    if (RegGetValueW(HKEY_CLASSES_ROOT, ext, NULL, RRF_RT_REG_SZ,
-                     NULL, progid, &cb) != ERROR_SUCCESS || !progid[0])
-        return NULL;
     WCHAR key[300];
-    if (swprintf(key, 300, L"%s\\DefaultIcon", progid) >= 300) return NULL;
-    HICON h = IconFromDefaultKey(key, path, want);
-    if (h) return h;
     WCHAR uc[300];
     if (swprintf(uc, 300,
                  L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\%s\\UserChoice",
-                 ext) >= 300) return NULL;
-    WCHAR up[128];
-    cb = sizeof up;
-    if (RegGetValueW(HKEY_CURRENT_USER, uc, L"ProgID", RRF_RT_REG_SZ,
-                     NULL, up, &cb) != ERROR_SUCCESS || !up[0])
-        return NULL;
-    if (swprintf(key, 300, L"%s\\DefaultIcon", up) >= 300) return NULL;
-    return IconFromDefaultKey(key, path, want);
+                 ext) < 300) {
+        WCHAR up[128];
+        DWORD cb = sizeof up;
+        if (RegGetValueW(HKEY_CURRENT_USER, uc, L"ProgID", RRF_RT_REG_SZ,
+                         NULL, up, &cb) == ERROR_SUCCESS && up[0]) {
+            if (swprintf(key, 300, L"%s\\DefaultIcon", up) < 300) {
+                HICON h = IconFromDefaultKey(key, path, want);
+                if (h) return h;
+            }
+        }
+    }
+    WCHAR progid[128];
+    DWORD cb = sizeof progid;
+    if (RegGetValueW(HKEY_CLASSES_ROOT, ext, NULL, RRF_RT_REG_SZ,
+                     NULL, progid, &cb) == ERROR_SUCCESS && progid[0]) {
+        if (swprintf(key, 300, L"%s\\DefaultIcon", progid) < 300)
+            return IconFromDefaultKey(key, path, want);
+    }
+    return NULL;
 }
 
 // 文件夹图标：Directory\DefaultIcon（系统真实文件夹），失败退手绘琥珀文件夹
