@@ -865,8 +865,11 @@ static int AddItemByPath(const WCHAR *path, int group)
     return AddItemRaw(name, path, group, NULL, NULL);
 }
 
-// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、重取图标。
-// 拖放替换与未来的“改目标”路径共用（ShowCellMenu 属性框保持自己的字段级逻辑）
+// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、丢掉旧图标。
+// 不在这里 EnsureIcon：图标一律由 PaintGrid 按格按需加载（绘制时才对可见格
+// 解析）。批量拖入时拖放处理器对每个落点调本函数——若就地加载，拖 50 个
+// 文档到列表末尾（屏幕外）要同步付 50 次图标链解析（每次约 0.4~1ms），
+// 全压在 UI 线程上；延迟到绘制后只有进入视野的格子才解析
 static void SetItemTarget(int ii, const WCHAR *path, int group)
 {
     DropIcon(ii);
@@ -876,7 +879,6 @@ static void SetItemTarget(int ii, const WCHAR *path, int group)
     wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
     g_items[ii].group = group;
     g_items[ii].args[0] = 0;
-    EnsureIcon(ii);
 }
 
 static void RemoveItemAt(int k)
@@ -1379,7 +1381,8 @@ static BOOL ClipGet(ClipItem *ci)
     return ok;
 }
 
-// 粘进指定格：替换全部文本字段并重取图标；组号不变（粘到哪格就入哪组）
+// 粘进指定格：替换全部文本字段、丢掉旧图标；组号不变（粘到哪格就入哪组）。
+// 同 SetItemTarget：不就地加载，图标由随后那次绘制按需加载
 static void PasteItemAt(int ii, const ClipItem *ci)
 {
     wcsncpy_s(g_items[ii].name, 48, ci->name, _TRUNCATE);
@@ -1387,7 +1390,6 @@ static void PasteItemAt(int ii, const ClipItem *ci)
     wcsncpy_s(g_items[ii].args, 192, ci->args, _TRUNCATE);
     wcsncpy_s(g_items[ii].tip, 96, ci->tip, _TRUNCATE);
     DropIcon(ii);
-    EnsureIcon(ii);
     ViewDirty();                     // 名字可能变了：过滤视图要重建
     SyncAndSave();
 }
@@ -2435,10 +2437,8 @@ static void ShowCellMenu(int vi)
             { L"工具提示(T):", g_items[ii].tip,  96,       0 },
         };
         if (RunDialog(g_hwnd, L"格子属性", f, 4)) {
-            if (wcscmp(oldPath, g_items[ii].path)) {   // 目标变了，重取图标
+            if (wcscmp(oldPath, g_items[ii].path))   // 目标变了：丢掉旧图标，绘制时按新目标重载
                 DropIcon(ii);
-                EnsureIcon(ii);
-            }
             SyncAndSave();
         }
         break;
