@@ -63,7 +63,6 @@
 #define WM_TRAY             (WM_APP + 2)   // 托盘回调消息
 #define IDM_TRAY_SHOW       1101
 #define IDM_TRAY_PIN        1102
-#define NOTIFYICON_VERSION_4L 4
 
 #define DLG_OK          1
 #define DLG_CANCEL      2
@@ -926,7 +925,6 @@ static void LoadConfig(void)
 
     g_pinned = FALSE;
     g_topmost = TRUE;
-    g_nGroups = 0;
     wcsncpy_s(g_groups[0].name, 48, L"全部", _TRUNCATE);
     g_nGroups = 1;
 
@@ -2543,11 +2541,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         return 0;
     }
 
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");   // 两个导出都取自 user32，取一次句柄
     pSetDpi = (PFN_SetProcDpiCtx)
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+        GetProcAddress(u32, "SetProcessDpiAwarenessContext");
     if (pSetDpi) pSetDpi((HANDLE)-4);   // PerMonitorV2
     pExtractIcons = (PFN_PrivateExtractIconsW)
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "PrivateExtractIconsW");
+        GetProcAddress(u32, "PrivateExtractIconsW");
 
     HDC scr = GetDC(NULL);
     g_dpi = GetDeviceCaps(scr, LOGPIXELSX);
