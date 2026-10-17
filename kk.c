@@ -191,6 +191,7 @@ static BOOL  g_applySavedRect = FALSE;
 
 // 托盘
 static HICON g_trayIcon = NULL;
+static int   g_traySz = 0;      // 图标的绘制尺寸：DPI 变化时比对，变了才重建
 static UINT  g_msgTaskbarCreated = 0;
 static NOTIFYICONDATAW g_nid;
 
@@ -2387,7 +2388,9 @@ static void UpdateTrayTip(void)
 {
     if (!g_trayIcon) return;
     BuildTrayTip(g_nid.szTip, 64);
-    g_nid.uFlags = NIF_TIP;
+    // NIF_SHOWTIP 不能省：NOTIFYICON_VERSION_4 行为下不带它，shell 存下
+    // szTip 却不弹悬停提示——鼠标浮动到托盘图标上什么都没有
+    g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -2422,14 +2425,19 @@ static HICON MakeTrayIcon(int sz)
 
 static void TrayAdd(void)
 {
-    if (!g_trayIcon) g_trayIcon = MakeTrayIcon(GetSystemMetrics(SM_CYSMICON));
+    if (!g_trayIcon) {
+        g_traySz = GetSystemMetrics(SM_CYSMICON);
+        g_trayIcon = MakeTrayIcon(g_traySz);
+    }
     if (!g_trayIcon) return;
 
     ZeroMemory(&g_nid, sizeof g_nid);
     g_nid.cbSize = sizeof g_nid;
     g_nid.hWnd = g_hwnd;
     g_nid.uID = TRAY_ID;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    // NIF_SHOWTIP 与 NIF_TIP 必须同时给：V4 行为下只给 NIF_TIP 的话，
+    // szTip 存得进去但悬停时不弹提示（实测复现：鼠标浮动托盘什么都没有）
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
     BuildTrayTip(g_nid.szTip, 64);
@@ -2792,6 +2800,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         // 图标尺寸 = S_(格基)×3/7 随 DPI 变：缓存图标不丢就会被拉伸到新尺寸（发虚），
         // 与 ApplyCellBase 同一处理——丢掉，随后那次绘制按新 DPI 重载
         for (int i = 0; i < g_nItems; i++) DropIcon(i);
+        // 托盘图标同理：shell 按任务栏所在显示器的 DPI 要图标，尺寸变了不重建
+        // 就被拉伸发虚（多显示器跨屏场景）
+        if (g_trayIcon) {
+            int tsz = GetSystemMetrics(SM_CYSMICON);
+            if (tsz != g_traySz) {
+                DestroyIcon(g_trayIcon);
+                g_trayIcon = MakeTrayIcon(tsz);
+                if (g_trayIcon) {
+                    g_traySz = tsz;
+                    g_nid.hIcon = g_trayIcon;
+                    g_nid.uFlags = NIF_ICON;
+                    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+                }
+            }
+        }
         RECT r;
         if (g_applySavedRect) {
             // 首次 DPI 切换：配置里记的是物理像素，必须以它为准，
@@ -2858,8 +2881,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 int nc = SlotAt(p);
                 BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
                 if (nc != g_dropCell || nin != g_dropIn) {
-                    InvalidateCell(g_dropCell);
-                    InvalidateCell(nc);
+                    // 新旧落点都有效时合成一个外接矩形：相邻格拖动每次移动
+                    // 少发一个更新区（-1 表示窗外/网格外，各自单发即可）
+                    if (g_dropCell >= 0 && nc >= 0) InvalidateCells(g_dropCell, nc);
+                    else {
+                        InvalidateCell(g_dropCell);
+                        InvalidateCell(nc);
+                    }
                     g_dropCell = nc;
                     g_dropIn = nin;
                 }
