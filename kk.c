@@ -3,6 +3,7 @@
 // 拖程序进格子单击启动、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
+// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
 // 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
@@ -129,6 +130,7 @@ static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
+static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static int  g_curGroup = 0;
@@ -177,6 +179,7 @@ static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
 static void SaveConfig(void);
 static void InvalidateTitle(void);
+static void InvalidateCell(int vi);
 static int  PopupAt(HMENU m);
 static int  Rows(void);
 static int  DefaultGroup(void);
@@ -200,6 +203,18 @@ static void ExitApp(void)
 // ---------------------------------------------------------------- 工具
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
 
+// 格子缩放基准的合法区间（配置与 Ctrl+滚轮共用同一处钳制）
+static int ClampCellBase(int v) { return v < 40 ? 40 : v > 160 ? 160 : v; }
+
+// 图标尺寸随缩放等级走：加载（EnsureIcon）与绘制（PaintGrid）共用同一公式，
+// 保证拿到的图标就是绘制尺寸，不重采样；只跟 g_cellBase 走而不跟 g_cell 走，
+// 窗口缩放时图标尺寸不变，不会引发重新加载
+static int IconSize(void)
+{
+    int v = S_(g_cellBase) * 3 / 7;
+    return v < 12 ? 12 : v > 64 ? 64 : v;
+}
+
 // 把 '|' 换成 '_'，避免破坏配置格式
 static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 {
@@ -215,7 +230,7 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 static void UpdateCell(void)
 {
     int w = g_cw - g_sideW;
-    int step = S_(56) + g_gap;
+    int step = S_(g_cellBase) + g_gap;
     int c = (w + g_gap + step / 2) / step;
     g_cols = c < 1 ? 1 : c;
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
@@ -626,7 +641,7 @@ static void EnsureIcon(int i)
     if (g_items[i].iconTried) return;
     g_items[i].iconTried = TRUE;
     if (!g_items[i].path[0]) return;
-    HICON h = IconFor(g_items[i].path, S_(24));
+    HICON h = IconFor(g_items[i].path, IconSize());
     if (h) { g_items[i].icon = h; g_items[i].ownIcon = TRUE; }
     else    g_items[i].icon = LoadIconW(NULL, IDI_APPLICATION);   // 共享图标，不销毁
 }
@@ -949,6 +964,7 @@ static void LoadConfig(void)
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Topmost")) g_topmost = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
+            else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
             else if (!wcscmp(key, L"Rect"))    wcsncpy_s(rect, 64, val, _TRUNCATE);
         } else if (!wcscmp(section, L"Groups")) {
             if (key[0] == L'G' && _wtoi(key + 1) == g_nGroups) AddGroup(val);
@@ -1008,6 +1024,7 @@ static void SaveConfig(void)
     FmtLine(f, L"Pinned=%d\r\n", g_pinned ? 1 : 0);
     FmtLine(f, L"Topmost=%d\r\n", g_topmost ? 1 : 0);
     FmtLine(f, L"Group=%d\r\n", g_curGroup);
+    FmtLine(f, L"Cell=%d\r\n", g_cellBase);
     FmtLine(f, L"[Groups]\r\n");
     FmtLine(f, L"Count=%d\r\n", g_nGroups);
     for (int i = 0; i < g_nGroups; i++) {
@@ -1028,6 +1045,19 @@ static void SaveConfig(void)
                 SafeField(sTip, 128, g_items[i].tip));
     }
     CloseHandle(f);
+}
+
+// 应用格子缩放（Ctrl+滚轮）：重算列数、按新尺寸重载图标、钳制滚动、整窗重绘并写回配置
+static void ApplyCellBase(int v)
+{
+    v = ClampCellBase(v);
+    if (v == g_cellBase) return;
+    g_cellBase = v;
+    UpdateCell();
+    for (int i = 0; i < g_nItems; i++) DropIcon(i);   // 图标尺寸变了：丢掉，下次绘制按新尺寸重载
+    ClampScroll();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    SaveConfig();
 }
 
 // ---------------------------------------------------------------- 显示/隐藏
@@ -1298,6 +1328,20 @@ static void RefreshCard(void)
     if (g_cardOn) InvalidateRect(g_hwnd, &g_cardRect, FALSE);
 }
 
+// 悬停目标变化后的统一刷新（鼠标移动/键盘导航共用）：重绘旧/新格、侧栏、标题、卡片。
+// ob（按钮悬停）不参与绘制——按钮没有悬停高亮，故不收
+static void RefreshHoverSpots(int oc, int og, BOOL txtChg)
+{
+    InvalidateCell(oc);
+    InvalidateCell(g_hoverCell);
+    if (og != g_hoverGroup) {
+        RECT sr = { 0, 0, g_sideW, g_ch };
+        InvalidateRect(g_hwnd, &sr, FALSE);
+    }
+    if (txtChg) InvalidateTitle();   // 文字没变的悬停切换不碰标题栏
+    RefreshCard();                   // 小卡片跟着悬停目标（内部含擦除旧区域）
+}
+
 // 字体沿用 PaintWindow 已选好的 g_font，这里只设文字色
 static void DrawCard(HDC dc)
 {
@@ -1417,7 +1461,7 @@ static void PaintTitle(HDC dc)
 static void PaintGrid(HDC dc, const RECT *clip)
 {
     int step = g_cell + g_gap;
-    int isz = S_(24);
+    int isz = IconSize();
     int n = ViewCount();
     int limit = g_slots;
     if (n > limit) limit = n;
@@ -2194,14 +2238,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
         BOOL txtChg = HoverFromPoint(p);
-        if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
-            InvalidateCell(oc);
-            InvalidateCell(g_hoverCell);
-            RECT sr = { 0, 0, g_sideW, g_ch };
-            if (og != g_hoverGroup) InvalidateRect(h, &sr, FALSE);
-            if (txtChg) InvalidateTitle();   // 文字没变的悬停切换不碰标题栏
-            RefreshCard();                   // 小卡片跟着悬停目标（内部含擦除旧区域）
-        }
+        if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn)
+            RefreshHoverSpots(oc, og, txtChg);
         if (!g_tracking) {
             TRACKMOUSEEVENT tme;
             ZeroMemory(&tme, sizeof tme);
@@ -2336,6 +2374,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (m == WM_MOUSEWHEEL) ScreenToClient(h, &p);
         int d = (m == WM_APP_WHEEL) ? (int)(short)w : (int)GET_WHEEL_DELTA_WPARAM(w);
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {   // Ctrl+滚轮：缩放格子（光标在左右区域都响应）
+            ApplyCellBase(g_cellBase + (d > 0 ? 4 : -4));
+            return 0;
+        }
         if (p.x < g_sideW) {
             // 侧栏：滚轮上下切换分组（等同于点击相邻分组），到头后循环
             int gi = g_curGroup + (d > 0 ? -1 : 1);
@@ -2355,9 +2397,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
 
-    case WM_KEYDOWN:
-        if (w == VK_ESCAPE) BeginHide(TRUE);
+    case WM_KEYDOWN: {
+        if (w == VK_ESCAPE) { BeginHide(TRUE); return 0; }
+        if (g_dlgOpen || g_pressCell >= 0) return 0;   // 对话框/拖动排序进行中：不抢键
+        if (w >= '1' && w <= '9') {                     // 数字键：启动当前组第 N 格
+            int ii = ItemAtView((int)(w - '1'));
+            if (ii >= 0 && !IsBlank(ii)) Launch(ii, FALSE);
+            return 0;
+        }
+        if (w == VK_RETURN) {                           // 回车：启动悬停格
+            int ii = ItemAtView(g_hoverCell);
+            if (ii >= 0 && !IsBlank(ii)) Launch(ii, FALSE);
+            return 0;
+        }
+        int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
+        if (n <= 0) return 0;
+        int c = g_hoverCell;
+        if (c < 0 || c >= n) c = 0;                     // 悬停失效时从第一格起
+        int nc = c;
+        switch (w) {
+        case VK_LEFT:  nc = c - 1;      break;
+        case VK_RIGHT: nc = c + 1;      break;
+        case VK_UP:    nc = c - g_cols; break;
+        case VK_DOWN:  nc = c + g_cols; break;
+        default: return 0;
+        }
+        if (nc < 0 || nc >= n) return 0;
+        int og = g_hoverGroup;
+        g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
+        UpdateHoverText();
+        RefreshHoverSpots(c, og, TRUE);
         return 0;
+    }
 
     // 主窗不进 TSF：默认处理会激活输入上下文，把 MSCTF/textinputframework/
     // Windows.Storage（~12MB）拖进进程。属性对话框不受影响（独立窗口）。
