@@ -91,6 +91,9 @@
 #define C_TEXT      RGB(0xEC, 0xED, 0xEF)
 #define C_DIM       RGB(0x9C, 0x9F, 0xA5)
 #define C_PANEL     RGB(0x33, 0x35, 0x3A)
+#define C_CLOSE     RGB(0xC4, 0x2B, 0x2B)   // 关闭键悬停底：Windows 标题栏惯例暗红
+#define C_CLOSE_PR  RGB(0x9C, 0x22, 0x22)   // 关闭键按下底：深一档
+#define C_BTN_PR    RGB(0x41, 0x44, 0x4B)   // 钉住键按下底：比悬停底深一档
 
 // ---------------------------------------------------------------- 数据
 // 字段按访问热度排列：绘制只碰 name/icon/group/ownIcon/iconTried（同一缓存行），
@@ -135,8 +138,9 @@ static int       g_dpi = 96;
 
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
-static HPEN   g_penDim, g_penAccent;      // 标题栏图形（缓存，见 MakeGdiObjects）
-static HBRUSH g_brPinOn, g_brPinOff;
+// 标题栏按钮的图形对象（缓存，见 MakeGdiObjects）：钉住三态填色 +
+// 字形提亮 + 两枚按下底。字形全部走填充（多边形/椭圆），不用 pen
+static HBRUSH g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr;
 static HPEN   g_penLine;                  // 格子边框（同出处）
 static int    g_cw, g_ch;
 static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
@@ -211,6 +215,7 @@ static int  PopupAt(HMENU m);
 static int  Rows(void);
 static int  DefaultGroup(void);
 static int  TargetGroup(void);
+static void UpdateBtnRects(void);
 static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
@@ -294,6 +299,7 @@ static void UpdateCell(void)
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
     if (g_cell < 8) g_cell = 8;
     g_slots = g_cols * Rows();   // 每帧命中/绘制/滚动钳制直接读缓存
+    UpdateBtnRects();            // 标题栏按钮随窗口宽度重定位
 }
 
 static int Rows(void)
@@ -442,20 +448,39 @@ static int GroupAt(POINT p)
     return -1;
 }
 
-// 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn）
+// 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn / g_pressBtn）。
+// 几何是纯布局量：缓存成矩形表，命中/绘制只读表——WM_SIZE 与 DPI 变化
+// 经 UpdateCell/ScaleMetrics 刷新，热路径上不做除法和乘法
+enum { BTN_PIN = 1, BTN_CLOSE = 2 };
+
+static RECT g_btnRect[3];     // 下标即按钮编码（0 号位不用）
+static int  g_pressBtn = 0;   // 正按下的按钮：纯视觉反馈，动作仍即时生效
+
+// 按钮集群总宽（两钮 + 间距 + 右边距）：标题文字右边界据此避让
+static int BtnZoneW(void)
+{
+    return S_(28) * 2 + S_(4) + S_(6);
+}
+
+static void UpdateBtnRects(void)
+{
+    int w = S_(28), h = S_(20);
+    int y = (g_titleH - h) / 2;
+    int x = g_cw - S_(6) - w;                 // 关闭：贴右
+    SetRect(&g_btnRect[BTN_CLOSE], x, y, x + w, y + h);
+    x -= w + S_(4);                           // 钉住：左边一位
+    SetRect(&g_btnRect[BTN_PIN], x, y, x + w, y + h);
+}
+
 static RECT BtnRect(int b)
 {
-    int w = S_(30), h = S_(22), t = (g_titleH - h) / 2;
-    int x = g_cw - 2 - w - (b == 1 ? w + 4 : 0);
-    RECT r = { x, t, x + w, t + h };
-    return r;
+    return g_btnRect[b];
 }
 
 static int BtnAt(POINT p)
 {
-    RECT r;
-    r = BtnRect(1); if (PtInRect(&r, p)) return 1;
-    r = BtnRect(2); if (PtInRect(&r, p)) return 2;
+    if (PtInRect(&g_btnRect[BTN_PIN], p)) return BTN_PIN;
+    if (PtInRect(&g_btnRect[BTN_CLOSE], p)) return BTN_CLOSE;
     return 0;
 }
 
@@ -1515,6 +1540,7 @@ static void ShowLauncher(void)
 static void BeginHide(BOOL force)
 {
     if (!force && g_pinned) return;
+    g_pressBtn = 0;         // 隐藏时按压态一并作废，重新唤回不留残影
     g_fadeDir = -1;
     SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
 }
@@ -1596,6 +1622,7 @@ static void ScaleMetrics(void)
     g_sideW  = S_(84);
     g_gap    = S_(3);
     g_grpH   = S_(34);
+    UpdateBtnRects();      // 标题栏按钮垂直居中于新标题栏高度
 }
 
 static void MakeFonts(void)
@@ -1627,20 +1654,24 @@ static void MakeBrushes(void)
     g_brPanel  = CreateSolidBrush(C_PANEL);
 }
 
-// 标题栏图形与格子边框的 GDI 对象：颜色固定、线宽随 DPI，DPI 变化时整套重建。
+// 标题栏按钮与格子边框的 GDI 对象：颜色固定，DPI 变化时整套重建。
 // 原来每画一次就 CreatePen/CreateSolidBrush 再逐个销毁，纯 churn
 static void MakeGdiObjects(void)
 {
-    if (g_penDim)    { DeleteObject(g_penDim);    g_penDim = NULL; }
-    if (g_penAccent) { DeleteObject(g_penAccent); g_penAccent = NULL; }
-    if (g_brPinOn)   { DeleteObject(g_brPinOn);   g_brPinOn = NULL; }
-    if (g_brPinOff)  { DeleteObject(g_brPinOff);  g_brPinOff = NULL; }
-    if (g_penLine)   { DeleteObject(g_penLine);   g_penLine = NULL; }
-    g_penDim    = CreatePen(PS_SOLID, S_(1), C_DIM);
-    g_penAccent = CreatePen(PS_SOLID, 1, C_ACCENT);
-    g_penLine   = CreatePen(PS_SOLID, 1, C_LINE);
-    g_brPinOn   = CreateSolidBrush(C_ACCENT);
-    g_brPinOff  = CreateSolidBrush(C_BG);
+    if (g_brPinOff)   { DeleteObject(g_brPinOff);   g_brPinOff = NULL; }
+    if (g_brPinOn)    { DeleteObject(g_brPinOn);    g_brPinOn = NULL; }
+    if (g_brGlyph)    { DeleteObject(g_brGlyph);    g_brGlyph = NULL; }
+    if (g_brBtnPress) { DeleteObject(g_brBtnPress); g_brBtnPress = NULL; }
+    if (g_brClose)    { DeleteObject(g_brClose);    g_brClose = NULL; }
+    if (g_brClosePr)  { DeleteObject(g_brClosePr);  g_brClosePr = NULL; }
+    if (g_penLine)    { DeleteObject(g_penLine);    g_penLine = NULL; }
+    g_penLine    = CreatePen(PS_SOLID, 1, C_LINE);
+    g_brPinOff   = CreateSolidBrush(C_DIM);       // 钉住·未置顶
+    g_brPinOn    = CreateSolidBrush(C_ACCENT);    // 钉住·已置顶
+    g_brGlyph    = CreateSolidBrush(C_TEXT);      // 字形·悬停提亮
+    g_brBtnPress = CreateSolidBrush(C_BTN_PR);    // 钉住·按下底
+    g_brClose    = CreateSolidBrush(C_CLOSE);     // 关闭·悬停底
+    g_brClosePr  = CreateSolidBrush(C_CLOSE_PR);  // 关闭·按下底
 }
 
 static void MakeFontsAndBrushes(void)
@@ -1696,7 +1727,9 @@ static BOOL HoverFromPoint(POINT p)
     }
     int nc = CellAt(p);
     int ng = (nc >= 0) ? -1 : GroupAt(p);
-    int nb = (nc >= 0 || ng >= 0) ? 0 : BtnAt(p);
+    // 按钮只在标题栏里：光标在标题栏以下时连 BtnAt 都不必问
+    // （格子间隙里移动也会走到这，省两次 PtInRect）
+    int nb = (nc >= 0 || ng >= 0 || p.y >= g_titleH) ? 0 : BtnAt(p);
     if (nc == g_hoverCell && ng == g_hoverGroup && nb == g_hoverBtn)
         return FALSE;
     g_hoverCell = nc; g_hoverGroup = ng; g_hoverBtn = nb;
@@ -1916,25 +1949,91 @@ static void ToggleSilent(void)
     UpdateTrayTip();      // 托盘提示里的“静默”标记跟着变
 }
 
-static void DrawPinGlyph(HDC dc, RECT r, BOOL on)
+// ---------------------------------------------------------------- 标题栏按钮图形
+// 视觉语言（全部 GDI 原生图形，无位图资源，随 S_() 缩放）：
+//   · 悬停/按下底色是胶囊形（圆角半径 = 半高）；关闭键悬停转 Windows
+//     标题栏惯例暗红，按下各深一档
+//   · × 是两段 45° 旋转矩形多边形——GDI 线帽是方的，斜线不用多边形
+//     边缘就会阶梯状，粗细也没法随 DPI 独立于长度
+//   · 钉住是地图钉剪影（圆头 + 收尖钉尾，两段填充拼成一枚），
+//     状态用色说话：暗 = 未置顶，accent = 已置顶，悬停统一提亮
+
+// 四舍五入入整数：字形坐标走浮点中间量（45° 向量），别用截断
+static LONG Rnd(double v)
 {
-    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2 - 2;
-    int rad = S_(4);
-    HPEN op = (HPEN)SelectObject(dc, on ? g_penAccent : g_penDim);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, on ? g_brPinOn : g_brPinOff);
-    Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
-    MoveToEx(dc, cx, cy + rad, NULL);
-    LineTo(dc, cx, r.bottom - 3);
-    SelectObject(dc, op); SelectObject(dc, ob);
+    return (LONG)(v < 0 ? v - 0.5 : v + 0.5);
 }
 
-static void DrawCloseGlyph(HDC dc, RECT r)
+// 45° 粗描边：以 (cx,cy) 为中心、方向 (sx,sy)（各 ∈ {-1,1}）、
+// 长 len 粗 th 的一根斜“胶囊”。th 与 len 都是 DPI 缩放后传入的
+static void Stroke45(HDC dc, int cx, int cy, int sx, int sy, int len, int th)
 {
-    HPEN op = (HPEN)SelectObject(dc, g_penDim);
-    int m = S_(8);
-    MoveToEx(dc, r.left + m, r.top + m, NULL); LineTo(dc, r.right - m, r.bottom - m);
-    MoveToEx(dc, r.right - m, r.top + m, NULL); LineTo(dc, r.left + m, r.bottom - m);
-    SelectObject(dc, op);
+    const double k = 0.7071067811865476;      // 1/√2
+    double hx = sx * k, hy = sy * k;          // 沿线单位向量
+    double px = -hy, py = hx;                 // 垂线单位向量
+    double hl = len / 2.0, ht = th / 2.0;
+    POINT q[4] = {
+        { Rnd(cx + hx * hl + px * ht), Rnd(cy + hy * hl + py * ht) },
+        { Rnd(cx + hx * hl - px * ht), Rnd(cy + hy * hl - py * ht) },
+        { Rnd(cx - hx * hl - px * ht), Rnd(cy - hy * hl - py * ht) },
+        { Rnd(cx - hx * hl + px * ht), Rnd(cy - hy * hl + py * ht) },
+    };
+    Polygon(dc, q, 4);
+}
+
+// 关闭 ×：常态暗、悬停亮（底色由 PaintTitleButtons 给）
+static void DrawCloseGlyph(HDC dc, RECT r, HBRUSH br)
+{
+    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    Stroke45(dc, cx, cy, -1, -1, S_(10), S_(2));
+    Stroke45(dc, cx, cy, +1, -1, S_(10), S_(2));
+    SelectObject(dc, ob);
+}
+
+// 钉住：地图钉剪影。钉尾三角形的底边埋进圆头里，两段填充视觉上成一整枚
+static void DrawPinGlyph(HDC dc, RECT r, HBRUSH br)
+{
+    int cx = (r.left + r.right) / 2;
+    int cy = (r.top + r.bottom) / 2 - S_(1);
+    int rad = S_(4);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
+    POINT tail[3] = {
+        { cx - rad + S_(1), cy + rad - S_(2) },
+        { cx + rad - S_(1), cy + rad - S_(2) },
+        { cx, cy + rad + S_(5) },
+    };
+    Polygon(dc, tail, 3);
+    SelectObject(dc, ob);
+}
+
+// 按钮一览：悬停/按下胶囊底 + 字形。状态判定集中在同一个循环里，
+// PaintTitle 只发一次调用；两枚钮同构，加第三枚只是往枚举里添一行
+static void PaintTitleButtons(HDC dc)
+{
+    for (int b = BTN_PIN; b <= BTN_CLOSE; b++) {
+        RECT r = BtnRect(b);
+        BOOL hov = (g_hoverBtn == b), prs = (g_pressBtn == b);
+        if (hov || prs) {
+            HBRUSH bg = prs ? (b == BTN_CLOSE ? g_brClosePr : g_brBtnPress)
+                            : (b == BTN_CLOSE ? g_brClose : g_brCellHi);
+            RECT pill = r;
+            InflateRect(&pill, -S_(1), -S_(1));
+            int rad = (pill.bottom - pill.top) / 2;   // 半高半径 = 全胶囊
+            HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+            HBRUSH ob = (HBRUSH)SelectObject(dc, bg);
+            RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, rad, rad);
+            SelectObject(dc, op); SelectObject(dc, ob);
+        }
+        HBRUSH glyph;
+        if (b == BTN_CLOSE)
+            glyph = hov ? g_brGlyph : g_brPinOff;              // × ：暗 / 亮
+        else
+            glyph = hov ? g_brGlyph : (g_pinned ? g_brPinOn : g_brPinOff);
+        if (b == BTN_CLOSE) DrawCloseGlyph(dc, r, glyph);
+        else                DrawPinGlyph(dc, r, glyph);
+    }
 }
 
 static void PaintSidebar(HDC dc, const RECT *clip)
@@ -1988,7 +2087,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
 static void PaintTitle(HDC dc)
 {
     HFONT old = (HFONT)SelectObject(dc, g_fontT);
-    RECT ttl = { g_sideW + S_(8), 0, g_cw - S_(90), g_titleH };
+    RECT ttl = { g_sideW + S_(8), 0, g_cw - BtnZoneW() - S_(8), g_titleH };
     if (FlashActive()) {
         // 启动反馈优先：刚点过启动，先让用户看到结果（悬停/搜索都让位）
         SetTextColor(dc, C_TEXT);
@@ -2007,11 +2106,7 @@ static void PaintTitle(HDC dc)
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     SelectObject(dc, old);
-    // 按钮悬停底色：悬停文字已给语义，底色给"这是个按钮"的按键感（无反馈像死区）
-    if (g_hoverBtn == 1) { RECT r = BtnRect(1); FillRect(dc, &r, g_brCellHi); }
-    if (g_hoverBtn == 2) { RECT r = BtnRect(2); FillRect(dc, &r, g_brCellHi); }
-    DrawPinGlyph(dc, BtnRect(1), g_pinned);
-    DrawCloseGlyph(dc, BtnRect(2));
+    PaintTitleButtons(dc);    // 钉住/关闭：悬停底、按下底、字形
     // 标题栏底部 1px 分隔线：与侧栏右边线连贯，把头部与内容区从视觉上分开
     RECT ln = { 0, g_titleH - 1, g_cw, g_titleH };
     FillRect(dc, &ln, g_brLine);
@@ -2928,6 +3023,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_MOUSELEAVE:
         g_tracking = FALSE;
+        g_pressBtn = 0;     // 光标离开：按压态作废（按下中移出窗口很常见）
         {
             int oc = g_hoverCell;
             g_hoverCell = g_hoverGroup = -1;
@@ -2945,6 +3041,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         HoverFromPoint(p);
         RefreshCard();      // 悬停可能瞬变（如唤醒后首次点击），卡片同步
+        // 按下即入按压态（胶囊底深一档）——动作仍即时生效，这只是触感
+        if (g_hoverBtn) { g_pressBtn = g_hoverBtn; InvalidateTitle(); }
         if (g_hoverBtn == 2) { CloseToTray(); return 0; }
         if (g_hoverBtn == 1) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
@@ -2989,6 +3087,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_LBUTTONUP: {
+        if (g_pressBtn) {                 // 按钮抬起：按压态收头
+            g_pressBtn = 0;
+            InvalidateTitle();
+        }
         if (g_pressGroup >= 0) {               // 侧栏分组重排落定（未拖动时按下已完成选中，无需处理）
             int from = g_pressGroup, to = g_dropGroup;
             BOOL wasDrag = g_dragGroup;
@@ -3306,7 +3408,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_font, g_fontT,
             g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
             g_brAccent, g_brAccel, g_brPanel,
-            g_penDim, g_penAccent, g_brPinOn, g_brPinOff, g_penLine,
+            g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr,
+            g_penLine,
         };
         for (size_t i = 0; i < _countof(objs); i++)
             if (objs[i]) DeleteObject(objs[i]);
