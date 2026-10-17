@@ -212,6 +212,16 @@ static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
 
+// 条目/分组数据变化后的统一收尾：悬停文字重算、卡片重锚、整窗重绘、落盘。
+// 六处数据变更路径（粘贴×2、槽位操作、分组重排、格子/分组改名）共用同一套收尾
+static void SyncAndSave(void)
+{
+    UpdateHoverText();
+    RefreshCard();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    SaveConfig();
+}
+
 // 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
 static void CloseToTray(void)
 {
@@ -872,10 +882,7 @@ static void MoveGroup(int from, int to)
     else if (from < to && g_curGroup > from && g_curGroup <= to) g_curGroup--;
     else if (from > to && g_curGroup >= to && g_curGroup < from) g_curGroup++;
     ViewDirty();
-    SaveConfig();
-    UpdateHoverText();       // 悬停的行号可能已指向别的组，标题/卡片同步
-    RefreshCard();
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    SyncAndSave();
 }
 
 // 把当前视图补齐到至少覆盖 slot 格：不足就在末尾补空格。
@@ -891,15 +898,12 @@ static void EnsureSlot(int slot)
 // ---------------------------------------------------------------- 槽位操作（插入/删除/清空）
 // 槽位模型：格子是固定槽位，条目住在槽位里。清空不挪其他格子；插入/删除才挪。
 
-// 三种槽位操作共用的收尾：视图重算 + 悬停/卡片同步 + 整窗重绘 + 落盘
+// 三种槽位操作共用的收尾：视图重算 + 滚动钳制 + 数据变更统一收尾
 static void SlotOpRefresh(void)
 {
     ViewDirty();
     ClampScroll();
-    UpdateHoverText();
-    RefreshCard();
-    InvalidateRect(g_hwnd, NULL, FALSE);
-    SaveConfig();
+    SyncAndSave();
 }
 
 // 在视图位 vi 前插入一个空格（其后条目整体后移）；vi 超出视图则追加到末尾
@@ -1351,10 +1355,7 @@ static void PasteItemAt(int ii, const ClipItem *ci)
     DropIcon(ii);
     EnsureIcon(ii);
     ViewDirty();                     // 名字可能变了：过滤视图要重建
-    SaveConfig();
-    UpdateHoverText();
-    RefreshCard();
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    SyncAndSave();
 }
 
 // 追加为新条目到当前组（“全部”组时落到默认组）
@@ -1363,10 +1364,7 @@ static void PasteItemNew(const ClipItem *ci)
     int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
     if (AddItemRaw(ci->name, ci->path, g, ci->args, ci->tip) >= 0) {
         ClampScroll();
-        SaveConfig();
-        UpdateHoverText();
-        RefreshCard();
-        InvalidateRect(g_hwnd, NULL, FALSE);
+        SyncAndSave();
     }
 }
 
@@ -2407,10 +2405,7 @@ static void ShowCellMenu(int vi)
                 DropIcon(ii);
                 EnsureIcon(ii);
             }
-            SaveConfig();
-            UpdateHoverText();
-            InvalidateRect(g_hwnd, NULL, FALSE);
-            RefreshCard();                   // 名称可能被改，卡片文字同步
+            SyncAndSave();
         }
         break;
     }
@@ -2432,10 +2427,7 @@ static void ShowGroupMenu(int gi)
         DlgField f[1] = { { L"名称(N):", g_groups[gi].name, 48, 0 } };
         if (RunDialog(g_hwnd, L"重命名分组", f, 1)) {
             if (!g_groups[gi].name[0]) wcsncpy_s(g_groups[gi].name, 48, L"未命名", _TRUNCATE);
-            SaveConfig();
-            UpdateHoverText();
-            InvalidateRect(g_hwnd, NULL, FALSE);
-            RefreshCard();                   // 组名可能被改，卡片文字同步
+            SyncAndSave();
         }
     } else if (cmd == IDM_GRP_DEL) {
         DeleteGroup(gi);
