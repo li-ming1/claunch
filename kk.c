@@ -347,11 +347,7 @@ static void SelectGroup(int gi)
     ClampScroll();
     EnsureGroupVisible(gi);
     UpdateHoverText();
-    InvalidateTitle();      // 标题闲时显示分组名，切组立即跟上
-    RECT sr = { 0, 0, g_sideW, g_ch };
-    InvalidateRect(g_hwnd, &sr, FALSE);
-    RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-    InvalidateRect(g_hwnd, &gr, FALSE);
+    InvalidateRect(g_hwnd, NULL, FALSE);   // 标题/侧栏/格子全区都变（原三个分区矩形的并集就是全窗）
     RefreshCard();          // 视图换了：同一悬停格对应的条目可能变了，卡片重锚
     UpdateWindow(g_hwnd);   // 滚轮连发时 WM_PAINT 会被消息饿死，立即同步重绘
 }
@@ -765,6 +761,7 @@ static void DeleteGroup(int i)
     if (g_curGroup >= g_nGroups) g_curGroup = 0;
     ViewDirty();
     ClampScroll();
+    RefreshCard();       // 视图/分组列表变了：悬停目标可能已失效，卡片重算
 }
 
 static int DefaultGroup(void)
@@ -781,6 +778,7 @@ static void NewGroup(void)
     if (ni >= 0) {
         g_curGroup = ni;
         ViewDirty();
+        RefreshCard();       // 切到空分组：悬停格可能已无对应条目，卡片收起
         g_scroll = 0;
         ClampGrpScroll();
         SaveConfig();
@@ -1253,7 +1251,7 @@ static void UpdateCard(void)
     if (g_hoverCell >= 0) {
         int ii = ItemAtView(g_hoverCell);
         if (ii >= 0 && !IsBlank(ii)) { txt = g_items[ii].name; anc = CellRect(g_hoverCell); }
-    } else if (g_hoverGroup >= 0) {
+    } else if (g_hoverGroup >= 0 && g_hoverGroup < g_nGroups) {   // 删组后下标可能已失效
         txt = g_groups[g_hoverGroup].name;
         anc = GroupRect(g_hoverGroup);
     }
@@ -1305,16 +1303,15 @@ static void RefreshCard(void)
     if (g_cardOn) InvalidateRect(g_hwnd, &g_cardRect, FALSE);
 }
 
+// 字体沿用 PaintWindow 已选好的 g_font，这里只设文字色
 static void DrawCard(HDC dc)
 {
     RECT r = g_cardRect;
     FillRect(dc, &r, g_brPanel);
     FrameRect(dc, &r, g_brLine);
-    HFONT old = (HFONT)SelectObject(dc, g_font);
     SetTextColor(dc, C_TEXT);
     DrawTextW(dc, g_cardText, -1, &r,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(dc, old);
 }
 
 // ---------------------------------------------------------------- 绘制
@@ -1840,7 +1837,7 @@ static void ShowCellMenu(int ii)
     case IDM_LAUNCH: Launch(ii, FALSE); break;
     case IDM_ADMIN:  Launch(ii, TRUE); break;
     case IDM_LOC:    OpenLocation(g_items[ii].path); break;
-    case IDM_DEL:    RemoveItemAt(ii); SaveConfig(); ClampScroll(); InvalidateRect(g_hwnd, NULL, FALSE); break;
+    case IDM_DEL:    RemoveItemAt(ii); SaveConfig(); ClampScroll(); RefreshCard(); InvalidateRect(g_hwnd, NULL, FALSE); break;
     case IDM_PROPS: {
         WCHAR oldPath[MAX_PATH];
         wcsncpy_s(oldPath, MAX_PATH, g_items[ii].path, _TRUNCATE);
@@ -1858,8 +1855,6 @@ static void ShowCellMenu(int ii)
             }
             SaveConfig();
             UpdateHoverText();
-            InvalidateCell(g_hoverCell);
-            InvalidateTitle();
             InvalidateRect(g_hwnd, NULL, FALSE);
             RefreshCard();                   // 名称可能被改，卡片文字同步
         }
@@ -2250,7 +2245,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_scroll = 0;
             ClampScroll();
             UpdateHoverText();
-            InvalidateTitle();
             InvalidateRect(h, NULL, FALSE);
             RefreshCard();       // 视图换了：同一悬停格对应的条目可能变了
             return 0;
