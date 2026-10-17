@@ -930,12 +930,9 @@ static void LoadConfig(void)
 
     WCHAR line[1200], section[32] = L"";
     WCHAR rect[64] = L"";
-    if (r.f == INVALID_HANDLE_VALUE) {                  // 无配置文件：给默认分组
-        AddGroup(L"常用");
-        ClampScroll();
-        return;
-    }
-    while (RdLine(&r, line, 1200)) {
+    // 无配置文件（或打不开）时循环条件直接为假：保持默认分组，走下面的默认矩形。
+    // 原来这里提前 return，跳过了 SetDefaultRect——首启会创建出 0x0 的不可见窗口
+    while (r.f != INVALID_HANDLE_VALUE && RdLine(&r, line, 1200)) {
         if (line[0] == L'[') {
             int n = 0;
             for (int i = 1; line[i] && line[i] != L']' && n < 31; i++) section[n++] = line[i];
@@ -976,7 +973,7 @@ static void LoadConfig(void)
                        nf >= 4 ? f[3] : NULL, nf >= 5 ? f[4] : NULL, nf >= 6 ? f[5] : NULL);
         }
     }
-    CloseHandle(r.f);
+    if (r.f != INVALID_HANDLE_VALUE) CloseHandle(r.f);
     if (g_nGroups < 2) AddGroup(L"常用");
     if (g_curGroup < 0 || g_curGroup >= g_nGroups) g_curGroup = 0;
     ViewDirty();
@@ -2592,6 +2589,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
     ShowWindow(g_hwnd, SW_SHOW);
     ForceForeground(g_hwnd);
+    g_outSince = 0;
+    g_wakeAt = GetTickCount();   // 启动等同一次唤醒：给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
     g_alpha = 0;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     g_fadeDir = 1;
