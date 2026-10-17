@@ -209,6 +209,7 @@ static void InvalidateCell(int vi);
 static int  PopupAt(HMENU m);
 static int  Rows(void);
 static int  DefaultGroup(void);
+static int  TargetGroup(void);
 static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
@@ -356,20 +357,8 @@ static int RealCount(void)
     return n;
 }
 
-static int CellAt(POINT p)
-{
-    if (p.x < g_sideW || p.y < g_titleH) return -1;
-    int c = g_cols;
-    int col = (p.x - g_sideW) / (g_cell + g_gap);
-    int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
-    if (col < 0 || row < 0 || col >= c) return -1;
-    int vi = row * c + col;
-    if (vi >= g_slots || vi >= ViewCount()) return -1;
-    RECT r = CellRect(vi);
-    return PtInRect(&r, p) ? vi : -1;    // 格子间隙里的点击不算命中（保持原语义）
-}
-
-// 原始格位：不筛已占项，空格也返回序号（拖动落点高亮用）；超出可视格返回 -1
+// 原始格位：不筛已占项，空格也返回序号（拖动落点/末尾补格用）；超出可视格返回 -1。
+// 命中测试核心——CellAt 与拖动落点判定都基于它，不各写一遍除法
 static int SlotAt(POINT p)
 {
     if (p.x < g_sideW || p.y < g_titleH) return -1;
@@ -378,6 +367,15 @@ static int SlotAt(POINT p)
     int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
     int vi = row * c + col;
     return vi < g_slots ? vi : -1;
+}
+
+// 格子命中：槽位序号再查视图范围 + 整格矩形。格子间隙里的点击不算命中（保持原语义）
+static int CellAt(POINT p)
+{
+    int vi = SlotAt(p);
+    if (vi < 0 || vi >= ViewCount()) return -1;
+    RECT r = CellRect(vi);
+    return PtInRect(&r, p) ? vi : -1;
 }
 
 static void ClampScroll(void)
@@ -475,10 +473,10 @@ static HICON IconFromImage(const WCHAR *path, int want, int idx)
 {
     HICON icons[1] = { 0 };
     int ids[1] = { 0 };
-    if (pExtractIcons && pExtractIcons(path, idx, want, want, icons, ids, 1, 0) > 0 && icons[0])
-        return icons[0];
-    // 部分程序图标只在特定尺寸档有资源：换标准档位再试（DrawIconEx 绘制时会缩放到位）
     if (pExtractIcons) {
+        if (pExtractIcons(path, idx, want, want, icons, ids, 1, 0) > 0 && icons[0])
+            return icons[0];
+        // 部分程序图标只在特定尺寸档有资源：换标准档位再试（DrawIconEx 绘制时会缩放到位）
         static const int fb[3] = { 32, 48, 16 };
         for (int k = 0; k < 3; k++) {
             icons[0] = NULL;
@@ -663,39 +661,75 @@ static BOOL ParseLnk(const WCHAR *path, LnkInfo *li)
     return ok && ParseLnkBuf(buf, n, li);
 }
 
-// 文件夹：画一个最简琥珀色文件夹。颜色位图 alpha 全 0 时 CreateIconIndirect
-// 回退按掩码渲染，掩码全 0 即全不透明，掩码位图不用画。
-static HICON MakeFolderIcon(int sz)
+// 图标画布：32bpp 自上而下 DIBSection 当颜色位图。GDI 绘制只写 RGB、
+// 不动 alpha——实测绘制还会把触碰处的 alpha 字节清 0，所以 alpha 必须在
+// 画完之后写（CanvasEnd）。掩码位图只是占位：32bpp 颜色位图下
+// CreateIconIndirect 忽略掩码内容（旧代码把颜色/掩码两张位图选进同一个 DC，
+// 绘制全部落进掩码、颜色位图留空，两个手绘图标都退化成纯黑方块）
+typedef struct { HDC dc; HBITMAP col, msk; DWORD *bits; } IconCanvas;
+
+static BOOL CanvasBegin(IconCanvas *cv, int sz)
 {
     HDC scr = GetDC(NULL);
-    HDC dc = CreateCompatibleDC(scr);
-    if (!dc) { ReleaseDC(NULL, scr); return NULL; }
-    HBITMAP col = CreateBitmap(sz, sz, 1, 32, NULL);
-    HBITMAP msk = CreateBitmap(sz, sz, 1, 1, NULL);
-    HICON ico = NULL;
-    if (col && msk) {
-        HGDIOBJ oc = SelectObject(dc, col);
-        HGDIOBJ om = SelectObject(dc, msk);
-        HBRUSH fb  = CreateSolidBrush(RGB(0xE2, 0xB2, 0x3E));
-        RECT tab   = { sz / 8, sz / 5, sz / 8 + sz / 3, sz / 5 + sz / 6 };
-        RECT body  = { sz / 8, sz / 5 + sz / 6 - 1, sz - sz / 8, sz - sz / 5 };
-        FillRect(dc, &tab, fb);
-        FillRect(dc, &body, fb);
-        DeleteObject(fb);
-        ICONINFO ii;
-        ZeroMemory(&ii, sizeof ii);
-        ii.fIcon = TRUE;
-        ii.hbmColor = col;
-        ii.hbmMask = msk;
-        ico = CreateIconIndirect(&ii);
-        SelectObject(dc, oc);
-        SelectObject(dc, om);
-    }
-    if (col) DeleteObject(col);
-    if (msk) DeleteObject(msk);
-    DeleteDC(dc);
+    if (!scr) return FALSE;
+    BITMAPINFO bi;
+    ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = sz;
+    bi.bmiHeader.biHeight = -sz;              // 自上而下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    cv->col = CreateDIBSection(scr, &bi, DIB_RGB_COLORS, (void **)&cv->bits, NULL, 0);
+    cv->msk = CreateBitmap(sz, sz, 1, 1, NULL); // 占位：须与颜色位图同尺寸
+    cv->dc = (cv->col && cv->msk) ? CreateCompatibleDC(scr) : NULL;
     ReleaseDC(NULL, scr);
+    if (!cv->col || !cv->msk || !cv->dc || !cv->bits) {
+        if (cv->col) DeleteObject(cv->col);
+        if (cv->msk) DeleteObject(cv->msk);
+        if (cv->dc) DeleteDC(cv->dc);
+        return FALSE;
+    }
+    SelectObject(cv->dc, cv->col);
+    return TRUE;
+}
+
+// 收尾出图标：alpha 整体置 255（不透明），keep 非空时区外挖空（托盘图标的圆角）。
+// 两个手绘图标只画内容，新建/写 alpha/建图标/弃画布的样板都收在这里
+static HICON CanvasEnd(IconCanvas *cv, int sz, HRGN keep)
+{
+    DWORD n = (DWORD)sz * (DWORD)sz;
+    for (DWORD i = 0; i < n; i++) cv->bits[i] |= 0xFF000000;
+    if (keep) {
+        for (int y = 0; y < sz; y++)
+            for (int x = 0; x < sz; x++)
+                if (!PtInRegion(keep, x, y))
+                    cv->bits[y * sz + x] &= 0x00FFFFFF;   // 区外透明：只清 alpha
+    }
+    ICONINFO ii;
+    ZeroMemory(&ii, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmColor = cv->col;
+    ii.hbmMask = cv->msk;                     // 占位掩码：颜色位图带 alpha，以它为准
+    HICON ico = CreateIconIndirect(&ii);      // 图标自拷贝位图，画布随后可弃
+    if (cv->dc) DeleteDC(cv->dc);
+    if (cv->col) DeleteObject(cv->col);
+    if (cv->msk) DeleteObject(cv->msk);
     return ico;
+}
+
+// 文件夹：画一个最简琥珀色文件夹。整幅不透明，无需挖孔
+static HICON MakeFolderIcon(int sz)
+{
+    IconCanvas cv;
+    if (!CanvasBegin(&cv, sz)) return NULL;
+    HBRUSH fb = CreateSolidBrush(RGB(0xE2, 0xB2, 0x3E));
+    RECT tab  = { sz / 8, sz / 5, sz / 8 + sz / 3, sz / 5 + sz / 6 };
+    RECT body = { sz / 8, sz / 5 + sz / 6 - 1, sz - sz / 8, sz - sz / 5 };
+    FillRect(cv.dc, &tab, fb);
+    FillRect(cv.dc, &body, fb);
+    DeleteObject(fb);
+    return CanvasEnd(&cv, sz, NULL);
 }
 
 // 扩展名判断：.lnk 检测等处共用（大小写不敏感）
@@ -922,7 +956,7 @@ static void MoveGroup(int from, int to)
 static void EnsureSlot(int slot)
 {
     if (slot < 0) return;
-    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    int g = TargetGroup();
     while (ViewCount() <= slot && g_nItems < MAX_ITEMS)
         AddItemRaw(L"", L"", g, NULL, NULL);
 }
@@ -944,7 +978,7 @@ static void InsertSlotAt(int vi)
     if (g_nItems >= MAX_ITEMS) return;
     int at = ItemAtView(vi);
     int pos = (at >= 0) ? at : g_nItems;
-    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    int g = TargetGroup();
     for (int i = g_nItems; i > pos; i--) g_items[i] = g_items[i - 1];
     ZeroMemory(&g_items[pos], sizeof g_items[pos]);
     g_items[pos].group = g;
@@ -1022,6 +1056,12 @@ static int DefaultGroup(void)
 {
     if (g_nGroups > 1) return 1;
     return AddGroup(L"常用");
+}
+
+// “全部”组（0）是伪分组：新增条目的落组。四处共用同一判定
+static int TargetGroup(void)
+{
+    return g_curGroup ? g_curGroup : DefaultGroup();
 }
 
 static void NewGroup(void)
@@ -1147,25 +1187,37 @@ static BOOL RdLine(RdCtx *r, WCHAR *out, int cch)
     return TRUE;
 }
 
-static BYTE g_outBuf[4096];
+// 配置写出走 8KB 暂存：行满即冲、收尾一次冲完。
+// 原来逐行一次 WriteFile：128 条目的配置要 130 次系统调用
+static HANDLE g_outFile;
+static BYTE   g_outBuf[8192];
+static int    g_outLen;
 
-static void WriteUtf8Line(HANDLE f, const WCHAR *text)
+static void OutFlush(void)
 {
-    int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, (char *)g_outBuf,
-                                (int)sizeof g_outBuf, NULL, NULL);
-    if (n <= 0) return;
+    if (!g_outLen) return;
     DWORD w = 0;
-    WriteFile(f, g_outBuf, (DWORD)(n - 1), &w, NULL);   // 不写结尾 NUL
+    WriteFile(g_outFile, g_outBuf, (DWORD)g_outLen, &w, NULL);
+    g_outLen = 0;
 }
 
-static void FmtLine(HANDLE f, const WCHAR *fmt, ...)
+static void OutLine(const WCHAR *text)
+{
+    // 单行最坏 1200 WCHAR → 3600 UTF-8 字节；余量不足先冲，别丢行
+    if (g_outLen + 3600 > (int)sizeof g_outBuf) OutFlush();
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, (char *)g_outBuf + g_outLen,
+                                (int)sizeof g_outBuf - g_outLen, NULL, NULL);
+    if (n > 0) g_outLen += n - 1;      // 不写结尾 NUL
+}
+
+static void FmtLine(const WCHAR *fmt, ...)
 {
     WCHAR line[1200];
     va_list ap;
     va_start(ap, fmt);
     vswprintf(line, 1200, fmt, ap);
     va_end(ap);
-    WriteUtf8Line(f, line);
+    OutLine(line);
 }
 
 static void SetDefaultRect(void)
@@ -1258,38 +1310,41 @@ static void SaveConfig(void)
     HANDLE f = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
+    g_outFile = f;
+    g_outLen = 0;
     static const BYTE bom[3] = { 0xEF, 0xBB, 0xBF };
     DWORD w = 0;
     WriteFile(f, bom, 3, &w, NULL);
 
     RECT r;
     GetWindowRect(g_hwnd, &r);
-    FmtLine(f, L"# kk 桌面格子配置 (UTF-8)\r\n");
-    FmtLine(f, L"[Main]\r\n");
-    FmtLine(f, L"Rect=%d %d %d %d\r\n", r.left, r.top,
+    FmtLine(L"# kk 桌面格子配置 (UTF-8)\r\n");
+    FmtLine(L"[Main]\r\n");
+    FmtLine(L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
-    FmtLine(f, L"Pinned=%d\r\n", g_pinned ? 1 : 0);
-    FmtLine(f, L"Silent=%d\r\n", g_silent ? 1 : 0);
-    FmtLine(f, L"Group=%d\r\n", g_curGroup);
-    FmtLine(f, L"Cell=%d\r\n", g_cellBase);
-    FmtLine(f, L"[Groups]\r\n");
-    FmtLine(f, L"Count=%d\r\n", g_nGroups);
+    FmtLine(L"Pinned=%d\r\n", g_pinned ? 1 : 0);
+    FmtLine(L"Silent=%d\r\n", g_silent ? 1 : 0);
+    FmtLine(L"Group=%d\r\n", g_curGroup);
+    FmtLine(L"Cell=%d\r\n", g_cellBase);
+    FmtLine(L"[Groups]\r\n");
+    FmtLine(L"Count=%d\r\n", g_nGroups);
     for (int i = 0; i < g_nGroups; i++) {
         static WCHAR gName[96];
-        FmtLine(f, L"G%d=%s\r\n", i, SafeField(gName, 96, g_groups[i].name));
+        FmtLine(L"G%d=%s\r\n", i, SafeField(gName, 96, g_groups[i].name));
     }
-    FmtLine(f, L"[Items]\r\n");
-    FmtLine(f, L"Count=%d\r\n", g_nItems);
+    FmtLine(L"[Items]\r\n");
+    FmtLine(L"Count=%d\r\n", g_nItems);
     // 注意：每个字段必须用独立的缓冲区——函数参数求值顺序不确定。
     // 条目行保留 6 个位置槽（work 槽固定为空），旧配置按位置读取不受影响
     static WCHAR sName[96], sPath[MAX_PATH + 8], sArgs[MAX_PATH + 8], sTip[128];
     for (int i = 0; i < g_nItems; i++) {
-        FmtLine(f, L"I%d=%s|%s|%d|%s||%s\r\n", i,
+        FmtLine(L"I%d=%s|%s|%d|%s||%s\r\n", i,
                 SafeField(sName, 96, g_items[i].name),
                 SafeField(sPath, MAX_PATH + 8, g_items[i].path), g_items[i].group,
                 SafeField(sArgs, MAX_PATH + 8, g_items[i].args),
                 SafeField(sTip, 128, g_items[i].tip));
     }
+    OutFlush();
     CloseHandle(f);
     g_cfgDirty = FALSE;   // 磁盘已与内存一致（早退的失败路径不清：下个心跳重试）
 }
@@ -1413,7 +1468,7 @@ static void PasteItemAt(int ii, const ClipItem *ci)
 // 追加为新条目到当前组（“全部”组时落到默认组）
 static void PasteItemNew(const ClipItem *ci)
 {
-    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    int g = TargetGroup();
     if (AddItemRaw(ci->name, ci->path, g, ci->args, ci->tip) >= 0) {
         ClampScroll();
         SyncAndSave();
@@ -1430,6 +1485,17 @@ static void ForceForeground(HWND h)
     if (fg != me && fg) AttachThreadInput(fg, me, FALSE);
 }
 
+// 淡入就位（唤醒与首启共用）：透明度从 0 起、淡入定时器启动、移出宽限清零
+static void StartFadeIn(void)
+{
+    g_outSince = 0;
+    g_wakeAt = GetTickCount();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
+    g_alpha = 0;
+    SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
+    g_fadeDir = 1;
+    SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+}
+
 static void ShowLauncher(void)
 {
     POINT pt;
@@ -1441,12 +1507,7 @@ static void ShowLauncher(void)
 
     if (!IsWindowVisible(g_hwnd)) ShowWindow(g_hwnd, SW_SHOW);
     ForceForeground(g_hwnd);
-    g_outSince = 0;
-    g_wakeAt = GetTickCount();
-    g_alpha = 0;
-    SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
-    g_fadeDir = 1;
-    SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+    StartFadeIn();
     SetTimer(g_hwnd, TIMER_HIDE, 120, NULL);   // 隐藏期间定时器是停的，这里才重启
 }
 
@@ -1485,20 +1546,29 @@ static void StepFade(void)
     }
 }
 
+// 把窗口矩形收进工作区：先缩到装得下，再四边推进去（两个定位路径共用）
+static void FitRectToWorkArea(RECT *wr, const RECT *wa)
+{
+    int w = wr->right - wr->left, h = wr->bottom - wr->top;
+    if (w > wa->right - wa->left) w = wa->right - wa->left;
+    if (h > wa->bottom - wa->top) h = wa->bottom - wa->top;
+    if (wr->left < wa->left) wr->left = wa->left;
+    if (wr->top < wa->top) wr->top = wa->top;
+    if (wr->left + w > wa->right) wr->left = wa->right - w;
+    if (wr->top + h > wa->bottom) wr->top = wa->bottom - h;
+    wr->right = wr->left + w;
+    wr->bottom = wr->top + h;
+}
+
 static void ClampToWorkArea(void)
 {
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     RECT wr;
     GetWindowRect(g_hwnd, &wr);
-    int w = wr.right - wr.left, h = wr.bottom - wr.top;
-    if (wr.left < wa.left) wr.left = wa.left;
-    if (wr.top < wa.top) wr.top = wa.top;
-    if (w > wa.right - wa.left) w = wa.right - wa.left;
-    if (h > wa.bottom - wa.top) h = wa.bottom - wa.top;
-    if (wr.left + w > wa.right) wr.left = wa.right - w;
-    if (wr.top + h > wa.bottom) wr.top = wa.bottom - h;
-    SetWindowPos(g_hwnd, NULL, wr.left, wr.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    FitRectToWorkArea(&wr, &wa);
+    SetWindowPos(g_hwnd, NULL, wr.left, wr.top,
+                 wr.right - wr.left, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void MoveToPoint(POINT pt)
@@ -1510,12 +1580,12 @@ static void MoveToPoint(POINT pt)
     RECT wr;
     GetWindowRect(g_hwnd, &wr);
     int w = wr.right - wr.left, h = wr.bottom - wr.top;
-    int x = pt.x - w / 2, y = pt.y - h / 2;
-    if (x < mi.rcWork.left) x = mi.rcWork.left;
-    if (y < mi.rcWork.top) y = mi.rcWork.top;
-    if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
-    if (y + h > mi.rcWork.bottom) y = mi.rcWork.bottom - h;
-    SetWindowPos(g_hwnd, NULL, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    wr.left = pt.x - w / 2;          // 以光标为中心，再收进该显示器工作区
+    wr.top  = pt.y - h / 2;
+    wr.right = wr.left + w;
+    wr.bottom = wr.top + h;
+    FitRectToWorkArea(&wr, &mi.rcWork);
+    SetWindowPos(g_hwnd, NULL, wr.left, wr.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // ---------------------------------------------------------------- 资源
@@ -1614,9 +1684,15 @@ static BOOL UpdateHoverText(void)
 
 // 返回悬停文字/激活态是否变化（没变就不重绘标题栏）。
 // 悬停目标没变时直接返回：鼠标在同一个格子上滑动是最高频的事件，
-// 此时连文字比较都不做
+// 此时连文字比较都不做。同格快速路径再省一级：光标还在当前悬停格的
+// 整格矩形内，CellAt/GroupAt/BtnAt 三路命中测试全部跳过
+// （悬停格越界时除外：走完整重算把陈旧悬停清掉）
 static BOOL HoverFromPoint(POINT p)
 {
+    if (g_hoverCell >= 0 && g_hoverCell < ViewCount()) {
+        RECT r = CellRect(g_hoverCell);
+        if (PtInRect(&r, p)) return FALSE;
+    }
     int nc = CellAt(p);
     int ng = (nc >= 0) ? -1 : GroupAt(p);
     int nb = (nc >= 0 || ng >= 0) ? 0 : BtnAt(p);
@@ -1741,20 +1817,38 @@ static void InvalidateCell(int vi)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
-// 重绘 [a, b] 闭区间格子（顺序无关）：多文件拖放的落点区间重绘用
+// 重绘 [a, b] 闭区间格子：多文件拖放的落点区间重绘用。
+// 区间在网格里连续——按行列算一个外接矩形一次失效，别逐格发 N 个更新区
 static void InvalidateCells(int a, int b)
 {
     if (a > b) { int t = a; a = b; b = t; }
-    for (int i = a; i <= b; i++) InvalidateCell(i);
+    if (b < 0 || a >= g_slots) return;
+    if (a < 0) a = 0;
+    int c = g_cols;
+    int ra = a / c, rb = b / c;
+    int lo = (ra == rb) ? a % c : 0;      // 同行取两端，跨行铺满宽
+    int hi = (ra == rb) ? b % c : c - 1;
+    RECT r;
+    r.left   = g_sideW + lo * (g_cell + g_gap);
+    r.right  = g_sideW + hi * (g_cell + g_gap) + g_cell;
+    r.top    = g_titleH + ra * (g_cell + g_gap) - g_scroll;
+    r.bottom = g_titleH + rb * (g_cell + g_gap) + g_cell - g_scroll;
+    InvalidateRect(g_hwnd, &r, FALSE);
 }
 
-// 拖动阈值判断（格子排序与分组重排共用）：位移超过系统拖动矩形即算拖动
+// 拖动阈值判断（格子排序与分组重排共用）：位移超过系统拖动矩形即算拖动。
+// 系统拖动矩形读一次缓存——拖动中每帧都问，而它不随 DPI 变
 static BOOL PastDragThreshold(POINT cur, POINT org)
 {
+    static int cx = -1, cy = -1;
+    if (cx < 0) {
+        cx = GetSystemMetrics(SM_CXDRAG);
+        cy = GetSystemMetrics(SM_CYDRAG);
+    }
     int dx = cur.x - org.x, dy = cur.y - org.y;
     if (dx < 0) dx = -dx;
     if (dy < 0) dy = -dy;
-    return dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG);
+    return dx > cx || dy > cy;
 }
 
 // 重绘单个分组行（侧栏重排的落点高亮擦除用）
@@ -1791,6 +1885,14 @@ static void FlashLaunch(BOOL ok, const WCHAR *name)
 static BOOL FlashActive(void)
 {
     return g_flashAt && GetTickCount() - g_flashAt < FLASH_MS;
+}
+
+// 启动视图位 vi 的格子并在标题栏闪现结果（单击抬起/回车/数字键 1-9 共用）
+static void LaunchView(int vi)
+{
+    int ii = ItemAtView(vi);
+    if (ii >= 0 && !IsBlank(ii))
+        FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
 }
 
 // 置顶开关：标题栏图钉点击与托盘菜单共用。置顶 = 常驻不自动隐藏 + HWND_TOPMOST
@@ -2291,62 +2393,30 @@ static void UpdateTrayTip(void)
 
 static HICON MakeTrayIcon(int sz)
 {
-    HDC scr = GetDC(NULL);
-    HDC dc = CreateCompatibleDC(scr);
-    if (!dc) { ReleaseDC(NULL, scr); return NULL; }
-    HBITMAP col = CreateBitmap(sz, sz, 1, 32, NULL);   // 颜色位图
-    HBITMAP msk = CreateBitmap(sz, sz, 1, 1, NULL);    // 掩码：1=透明
-    if (!col || !msk) {
-        if (col) DeleteObject(col);
-        if (msk) DeleteObject(msk);
-        DeleteDC(dc); ReleaseDC(NULL, scr);
-        return NULL;
-    }
-    HGDIOBJ oc = SelectObject(dc, col);
-    HGDIOBJ om = SelectObject(dc, msk);
+    IconCanvas cv;
+    if (!CanvasBegin(&cv, sz)) return NULL;
 
     RECT all = { 0, 0, sz, sz };
     HBRUSH bg = CreateSolidBrush(C_BG);
-    FillRect(dc, &all, bg);
+    FillRect(cv.dc, &all, bg);
     DeleteObject(bg);
 
     // 2x2 浅色格子
     int pad = sz / 6, gap = sz / 10;
     int cw = (sz - pad * 2 - gap) / 2;
-    int ch = (sz - pad * 2 - gap) / 2;
     HBRUSH fg = CreateSolidBrush(RGB(0xEC, 0xED, 0xEF));
     for (int i = 0; i < 2; i++)
         for (int j = 0; j < 2; j++) {
-            RECT r = { pad + j * (cw + gap), pad + i * (ch + gap),
-                       pad + j * (cw + gap) + cw, pad + i * (ch + gap) + ch };
-            FillRect(dc, &r, fg);
+            RECT r = { pad + j * (cw + gap), pad + i * (cw + gap),
+                       pad + j * (cw + gap) + cw, pad + i * (cw + gap) + cw };
+            FillRect(cv.dc, &r, fg);
         }
     DeleteObject(fg);
 
-    // 掩码：圆角外透明 -> 用圆角矩形区域填充黑色（不透明）
-    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
-    FillRect(dc, &all, white);
+    // 圆角外挖空：keep 区之外的像素 alpha 清 0（RGB 保留，只动 alpha 字节）
     HRGN rgn = CreateRoundRectRgn(0, 0, sz + 1, sz + 1, sz / 3, sz / 3);
-    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-    FillRgn(dc, rgn, black);
-    DeleteObject(white);
-    DeleteObject(black);
+    HICON ico = CanvasEnd(&cv, sz, rgn);
     if (rgn) DeleteObject(rgn);
-
-    HICON ico = NULL;
-    ICONINFO ii;
-    ZeroMemory(&ii, sizeof ii);
-    ii.fIcon = TRUE;
-    ii.hbmColor = col;
-    ii.hbmMask = msk;
-    ico = CreateIconIndirect(&ii);
-
-    SelectObject(dc, oc);
-    SelectObject(dc, om);
-    DeleteDC(dc);
-    ReleaseDC(NULL, scr);
-    DeleteObject(col);
-    DeleteObject(msk);
     return ico;
 }
 
@@ -2502,6 +2572,8 @@ static void ShowTitleMenu(void)
 // ---------------------------------------------------------------- 全局双击唤醒
 static DWORD s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
+static DWORD s_dblClick;      // 双击间隔/双击容差：钩子线程启动时读一次——
+static int    s_dblX, s_dblY; // 全局输入路径上每次点击都问，不值当
 
 // 桌面 ListView 的命中测试消息（不引 commctrl.h，按消息编号直接定义）
 #ifndef LVM_FIRST
@@ -2582,9 +2654,8 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
             if (dx < 0) dx = -dx;
             if (dy < 0) dy = -dy;
-            BOOL dbl = s_lastClick && (now - s_lastClick) <= (DWORD)GetDoubleClickTime()
-                       && dx <= GetSystemMetrics(SM_CXDLGFRAME)
-                       && dy <= GetSystemMetrics(SM_CYDLGFRAME);
+            BOOL dbl = s_lastClick && (now - s_lastClick) <= s_dblClick
+                       && dx <= s_dblX && dy <= s_dblY;
             // 钩子回调跑在全局输入路径上：这里只做时序判断。
             // WindowFromPoint 是跨线程窗口调用，被查窗口卡死会拖住整个系统的鼠标输入，
             // 所以“点的是不是桌面”放到 UI 线程再确认（WM_APP_WAKE_CAND）。
@@ -2623,6 +2694,9 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 static DWORD WINAPI HookThread(LPVOID arg)
 {
     UNREF(arg);
+    s_dblClick = GetDoubleClickTime();
+    s_dblX = GetSystemMetrics(SM_CXDLGFRAME);
+    s_dblY = GetSystemMetrics(SM_CYDLGFRAME);
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2779,8 +2853,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 }
             }
             if (g_dragging) {
-                int nc = CellAt(p);
-                if (nc < 0) nc = SlotAt(p);     // 空格也可作落点（抬起排到末尾）
+                // 落点即槽位序号：CellAt 的间隙拒绝会被紧随的 SlotAt 兜底抵消
+                // （原两段式等价于一次 SlotAt），这里一次算清
+                int nc = SlotAt(p);
                 BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
                 if (nc != g_dropCell || nin != g_dropIn) {
                     InvalidateCell(g_dropCell);
@@ -2845,16 +2920,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_hoverBtn == 2) { CloseToTray(); return 0; }
         if (g_hoverBtn == 1) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
-            int og = g_curGroup;
-            g_scrollMemo[og] = g_scroll;               // 记住离开时的滚动位
-            g_curGroup = g_hoverGroup;
-            ViewDirty();
-            // 点当前组 = 回到顶部（既有行为）；切到别的组 = 恢复该组上次的滚动位
-            g_scroll = (g_curGroup == og) ? 0 : g_scrollMemo[g_curGroup];
-            ClampScroll();
-            UpdateHoverText();
-            InvalidateRect(h, NULL, FALSE);
-            RefreshCard();       // 视图换了：同一悬停格对应的条目可能变了
+            if (g_hoverGroup == g_curGroup) {
+                // 点当前组 = 回到顶部（既有行为）
+                if (g_scroll) {
+                    g_scroll = 0;
+                    ClampScroll();
+                    InvalidateRect(h, NULL, FALSE);
+                    RefreshCard();
+                }
+            } else {
+                SelectGroup(g_hoverGroup);   // 切组：滚动位记忆/恢复与滚轮切组同一路径
+            }
             if (g_hoverGroup > 0) {          // 组 0（全部）不参与重排：按下即记住起点
                 g_pressGroup = g_hoverGroup;
                 g_pressPt = p;
@@ -2899,9 +2975,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
         ReleaseCapture();
         if (!wasDrag) {
-            int ii = ItemAtView(from);
-            if (ii >= 0 && !IsBlank(ii))
-                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
+            LaunchView(from);
         } else if (inGrid) {
             int n = ViewCount();
             if (to < 0) to = n - 1;            // 落点解析不出格位（拖到网格下方空白）：排到末尾
@@ -3024,15 +3098,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         if (w >= '1' && w <= '9' && !g_filter[0] &&
             !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {   // 数字键：启动当前组第 N 格（Ctrl 修饰留给复制，过滤中归搜索）
-            int ii = ItemAtView((int)(w - '1'));
-            if (ii >= 0 && !IsBlank(ii))
-                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
+            LaunchView((int)(w - '1'));
             return 0;
         }
         if (w == VK_RETURN) {                           // 回车：启动悬停格
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0 && !IsBlank(ii))
-                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
+            LaunchView(g_hoverCell);
             return 0;
         }
         int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
@@ -3106,7 +3176,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
             // 光标明明停在空格上，格子却没有任何变化。
             int slot = SlotAt(p);
-            int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+            int g = TargetGroup();
             int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
             for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
                 WCHAR path[MAX_PATH];
@@ -3203,21 +3273,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         UnregisterHotKey(h, HOTKEY_ID);
         for (int i = 0; i < g_nItems; i++) DropIcon(i);
-        if (g_font) DeleteObject(g_font);
-        if (g_fontT) DeleteObject(g_fontT);
-        if (g_brBG) DeleteObject(g_brBG);
-        if (g_brSide) DeleteObject(g_brSide);
-        if (g_brCell) DeleteObject(g_brCell);
-        if (g_brCellHi) DeleteObject(g_brCellHi);
-        if (g_brLine) DeleteObject(g_brLine);
-        if (g_brAccent) DeleteObject(g_brAccent);
-        if (g_brAccel) DeleteObject(g_brAccel);
-        if (g_brPanel) DeleteObject(g_brPanel);
-    if (g_penDim) DeleteObject(g_penDim);
-    if (g_penAccent) DeleteObject(g_penAccent);
-    if (g_brPinOn) DeleteObject(g_brPinOn);
-    if (g_brPinOff) DeleteObject(g_brPinOff);
-    if (g_penLine) DeleteObject(g_penLine);
+        // GDI 对象收尾：数组一遍过（原来 13 条逐项 if+DeleteObject，缩进还乱）
+        HGDIOBJ objs[] = {
+            g_font, g_fontT,
+            g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
+            g_brAccent, g_brAccel, g_brPanel,
+            g_penDim, g_penAccent, g_brPinOn, g_brPinOff, g_penLine,
+        };
+        for (size_t i = 0; i < _countof(objs); i++)
+            if (objs[i]) DeleteObject(objs[i]);
         if (g_memDC) DeleteDC(g_memDC);
         if (g_memBmp) DeleteObject(g_memBmp);
         PostQuitMessage(0);
@@ -3248,6 +3312,21 @@ static HWND FindLauncherWindow(void)
     return g_searchHit;
 }
 
+// 两个窗口类（主窗/对话框）注册参数完全相同，收拢一处
+static ATOM RegClass(const WCHAR *name, WNDPROC proc)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof wc);
+    wc.cbSize = sizeof wc;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = proc;
+    wc.hInstance = g_inst;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = name;
+    return RegisterClassExW(&wc);
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
 {
     UNREF(prev); UNREF(cmd); UNREF(show);
@@ -3276,27 +3355,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     InitAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）；路径过期则自愈重写
     g_clipFmt = RegisterClipboardFormatW(L"KKLauncherItem");   // 私有剪贴板格式；失败则 Ctrl+V 只认纯文本
 
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof wc);
-    wc.cbSize = sizeof wc;
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = inst;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = APP_CLASS;
-    RegisterClassExW(&wc);
-
-    // 对话框类只注册一次：原在 RunDialog 里每打开一次属性框就注册一遍，纯重复劳动
-    WNDCLASSEXW dwc;
-    ZeroMemory(&dwc, sizeof dwc);
-    dwc.cbSize = sizeof dwc;
-    dwc.lpfnWndProc = DlgProc;
-    dwc.hInstance = g_inst;
-    dwc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    dwc.hbrBackground = NULL;
-    dwc.lpszClassName = DLG_CLASS;
-    RegisterClassExW(&dwc);
+    RegClass(APP_CLASS, WndProc);
+    RegClass(DLG_CLASS, DlgProc);   // 对话框类只注册一次：原在 RunDialog 里每开一次属性框就注册一遍
 
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_LAYERED, APP_CLASS, APPNAME, WS_POPUP,
@@ -3319,12 +3379,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     } else {
         ShowWindow(g_hwnd, SW_SHOW);
         ForceForeground(g_hwnd);
-        g_outSince = 0;
-        g_wakeAt = GetTickCount();   // 启动等同一次唤醒：给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
-        g_alpha = 0;
-        SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
-        g_fadeDir = 1;
-        SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+        StartFadeIn();   // 启动等同一次唤醒（TIMER_HIDE 在 WM_CREATE 已起）
     }
 
     MSG msg;
