@@ -1,5 +1,5 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
-// 左侧自定义分组、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
+// 左侧自定义分组（行可拖拽排序，决定滚轮切换顺序）、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
@@ -157,6 +157,9 @@ static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖�
 static BOOL g_dragging;         // 已越过拖动阈值
 static int  g_dropCell = -1;    // 拖动悬停的目标格（视图序号）
 static BOOL g_dropIn;           // 目标在格子区内（区外释放=取消）
+static int  g_pressGroup = -1;  // 按下的分组行（侧栏重排用；组 0“全部”不参与）
+static BOOL g_dragGroup;        // 分组重排中（已越过拖动阈值）
+static int  g_dropGroup = -1;   // 分组重排的落点行
 static POINT g_pressPt;
 static BOOL g_hoverActive = FALSE;
 static BOOL g_tracking = FALSE;
@@ -753,6 +756,34 @@ static void MoveItem(int vfrom, int vto)
         for (int k = vfrom; k > vto; k--) g_items[pos[k]] = g_items[pos[k - 1]];
     g_items[pos[vto]] = tmp;
     ViewDirty();
+}
+
+// 侧栏分组重排：把第 from 组移到 to 位，中间顺移（与 MoveItem 同一套轮转）。
+// 组 0（“全部”）是伪分组，不参与。条目的 group 编号与被移动组跨越的区间
+// 一起平移，当前组跟着走——否则组序变了、条目还挂在旧编号上
+static void MoveGroup(int from, int to)
+{
+    if (from <= 0 || to <= 0 || from >= g_nGroups || to >= g_nGroups || from == to) return;
+    Group tmp = g_groups[from];
+    if (from < to)
+        for (int k = from; k < to; k++) g_groups[k] = g_groups[k + 1];
+    else
+        for (int k = from; k > to; k--) g_groups[k] = g_groups[k - 1];
+    g_groups[to] = tmp;
+    for (int i = 0; i < g_nItems; i++) {
+        int g = g_items[i].group;
+        if (g == from) g_items[i].group = to;
+        else if (from < to && g > from && g <= to) g_items[i].group = g - 1;
+        else if (from > to && g >= to && g < from) g_items[i].group = g + 1;
+    }
+    if (g_curGroup == from) g_curGroup = to;
+    else if (from < to && g_curGroup > from && g_curGroup <= to) g_curGroup--;
+    else if (from > to && g_curGroup >= to && g_curGroup < from) g_curGroup++;
+    ViewDirty();
+    SaveConfig();
+    UpdateHoverText();       // 悬停的行号可能已指向别的组，标题/卡片同步
+    RefreshCard();
+    InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
 // 把当前视图补齐到至少覆盖 slot 格：不足就在末尾补空格。
@@ -1422,6 +1453,23 @@ static void InvalidateCells(int a, int b)
     for (int i = a; i <= b; i++) InvalidateCell(i);
 }
 
+// 拖动阈值判断（格子排序与分组重排共用）：位移超过系统拖动矩形即算拖动
+static BOOL PastDragThreshold(POINT cur, POINT org)
+{
+    int dx = cur.x - org.x, dy = cur.y - org.y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    return dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG);
+}
+
+// 重绘单个分组行（侧栏重排的落点高亮擦除用）
+static void InvalidateGroup(int gi)
+{
+    if (gi < 0) return;
+    RECT r = GroupRect(gi);
+    InvalidateRect(g_hwnd, &r, FALSE);
+}
+
 static void InvalidateTitle(void)
 {
     RECT r = { 0, 0, g_cw, g_titleH };
@@ -1505,6 +1553,12 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         if (sel) {
             RECT bar = { r.left, r.bottom - S_(2), r.right, r.bottom };
             FillRect(dc, &bar, g_brAccel);
+        }
+        // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
+        if (g_dragGroup && i == g_dropGroup && i != g_pressGroup) {
+            RECT r2 = r;
+            InflateRect(&r2, -S_(2), -S_(2));
+            FrameRect(dc, &r2, g_brAccent);
         }
     }
 
@@ -2402,12 +2456,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (g_pressCell >= 0) {                 // 拖动排序进行中
             if (!g_dragging) {
-                int dx = p.x - g_pressPt.x, dy = p.y - g_pressPt.y;
-                if (dx < 0) dx = -dx;
-                if (dy < 0) dy = -dy;
-                if (dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG)) {
-                    // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
-                    // 先清过滤回全量再拖，落点高亮才和用户看到的一致
+                // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
+                // 先清过滤回全量再拖，落点高亮才和用户看到的一致
+                if (PastDragThreshold(p, g_pressPt)) {
                     ClearFilter();
                     g_dragging = TRUE;
                     g_dropCell = g_pressCell;
@@ -2424,6 +2475,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     InvalidateCell(nc);
                     g_dropCell = nc;
                     g_dropIn = nin;
+                }
+            }
+        }
+        if (g_pressGroup >= 0) {                 // 侧栏分组重排进行中
+            if (!g_dragGroup && PastDragThreshold(p, g_pressPt)) {
+                g_dragGroup = TRUE;
+                g_dropGroup = g_pressGroup;
+                InvalidateGroup(g_pressGroup);
+            }
+            if (g_dragGroup) {
+                int ng = GroupAt(p);
+                if (ng == 0) ng = 1;             // 组 0（全部）不参与：靠顶即落到第 1 位
+                if (ng != g_dropGroup) {
+                    InvalidateGroup(g_dropGroup);
+                    InvalidateGroup(ng);
+                    g_dropGroup = ng;
                 }
             }
         }
@@ -2473,6 +2540,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             UpdateHoverText();
             InvalidateRect(h, NULL, FALSE);
             RefreshCard();       // 视图换了：同一悬停格对应的条目可能变了
+            if (g_hoverGroup > 0) {          // 组 0（全部）不参与重排：按下即记住起点
+                g_pressGroup = g_hoverGroup;
+                g_pressPt = p;
+                g_dragGroup = FALSE;
+                g_dropGroup = -1;
+                SetCapture(h);
+            }
             return 0;
         }
         if (g_hoverCell >= 0) {
@@ -2496,6 +2570,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_LBUTTONUP: {
+        if (g_pressGroup >= 0) {               // 侧栏分组重排落定（未拖动时按下已完成选中，无需处理）
+            int from = g_pressGroup, to = g_dropGroup;
+            BOOL wasDrag = g_dragGroup;
+            g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
+            ReleaseCapture();
+            if (wasDrag && to > 0 && to != from) MoveGroup(from, to);
+            return 0;
+        }
         if (g_pressCell < 0) break;
         int from = g_pressCell, to = g_dropCell;
         BOOL inGrid = g_dropIn, wasDrag = g_dragging;
@@ -2542,6 +2624,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             int a = g_pressCell, b = g_dropCell;
             g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
             InvalidateCells(a, b >= 0 ? b : a);   // 只擦源/落点高亮
+        }
+        if (g_pressGroup >= 0) {
+            int a = g_pressGroup, b = g_dropGroup;
+            g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
+            InvalidateGroup(a);                   // 先清状态再失效：重绘时已无高亮
+            if (b >= 0 && b != a) InvalidateGroup(b);
         }
         return 0;
 
