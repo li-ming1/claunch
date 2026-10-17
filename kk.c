@@ -170,27 +170,16 @@ static PFN_SetProcDpiCtx pSetDpi = NULL;
 
 #define UNREF(x) ((void)(x))
 
-// 前向声明
-static void ScaleMetrics(void);
-static void MakeFontsAndBrushes(void);
-static void PaintWindow(HDC dc, BOOL buffered);
+// 前向声明：只保留使用点早于定义的函数
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
 static void SaveConfig(void);
-static void InvalidateCell(int vi);
 static void InvalidateTitle(void);
 static int  PopupAt(HMENU m);
-static int  Cols(void);
 static int  Rows(void);
 static int  DefaultGroup(void);
-static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
-static void ForceForeground(HWND h);
 static void UpdateHoverText(void);
-static void ShowLauncher(void);
-static void BeginHide(BOOL force);
-static void TrayAdd(void);
-static void TrayRemove(void);
 
 // 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
 static void CloseToTray(void)
@@ -218,13 +207,9 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 }
 
 // ---------------------------------------------------------------- 布局
-// 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）
-// 列数只在 UpdateCell 里算（WM_SIZE/DPI 变化时刷新），其余路径直接读缓存
-static int Cols(void)
-{
-    return g_cols;
-}
-
+// 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）。
+// g_cols/g_slots 只在 UpdateCell 里算（WM_SIZE/DPI 变化时刷新），
+// 命中/绘制/滚动钳制路径直接读缓存，不经过包装函数
 static void UpdateCell(void)
 {
     int w = g_cw - g_sideW;
@@ -244,7 +229,7 @@ static int Rows(void)
 
 static RECT CellRect(int vi)
 {
-    int c = Cols(), col = vi % c, row = vi / c;
+    int c = g_cols, col = vi % c, row = vi / c;
     RECT r;
     r.left   = g_sideW + col * (g_cell + g_gap);
     r.top    = g_titleH + row * (g_cell + g_gap) - g_scroll;
@@ -313,7 +298,7 @@ static int CellAt(POINT p)
 static int SlotAt(POINT p)
 {
     if (p.x < g_sideW || p.y < g_titleH) return -1;
-    int c = Cols();
+    int c = g_cols;
     int col = (p.x - g_sideW) / (g_cell + g_gap);
     int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
     int vi = row * c + col;
@@ -324,7 +309,7 @@ static void ClampScroll(void)
 {
     int need = ViewCount();
     int visible = g_slots;
-    int maxS = need > visible ? (need - visible + Cols() - 1) / Cols() * (g_cell + g_gap) : 0;
+    int maxS = need > visible ? (need - visible + g_cols - 1) / g_cols * (g_cell + g_gap) : 0;
     if (g_scroll > maxS) g_scroll = maxS;
     if (g_scroll < 0) g_scroll = 0;
 }
@@ -385,25 +370,20 @@ static int GroupAt(POINT p)
     return -1;
 }
 
-static RECT PinBtnRect(void)
+// 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn）
+static RECT BtnRect(int b)
 {
     int w = S_(30), h = S_(22), t = (g_titleH - h) / 2;
-    RECT r = { g_cw - 2 - w * 2 - 4, t, g_cw - 2 - w - 4, t + h };
-    return r;
-}
-
-static RECT CloseBtnRect(void)
-{
-    int w = S_(30), h = S_(22), t = (g_titleH - h) / 2;
-    RECT r = { g_cw - 2 - w, t, g_cw - 2, t + h };
+    int x = g_cw - 2 - w - (b == 1 ? w + 4 : 0);
+    RECT r = { x, t, x + w, t + h };
     return r;
 }
 
 static int BtnAt(POINT p)
 {
     RECT r;
-    r = PinBtnRect();   if (PtInRect(&r, p)) return 1;
-    r = CloseBtnRect(); if (PtInRect(&r, p)) return 2;
+    r = BtnRect(1); if (PtInRect(&r, p)) return 1;
+    r = BtnRect(2); if (PtInRect(&r, p)) return 2;
     return 0;
 }
 
@@ -1362,8 +1342,8 @@ static void PaintTitle(HDC dc)
     DrawTextW(dc, g_hoverText, -1, &ttl,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, old);
-    DrawPinGlyph(dc, PinBtnRect(), g_pinned);
-    DrawCloseGlyph(dc, CloseBtnRect());
+    DrawPinGlyph(dc, BtnRect(1), g_pinned);
+    DrawCloseGlyph(dc, BtnRect(2));
 }
 
 static void PaintGrid(HDC dc, const RECT *clip)
@@ -2098,9 +2078,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             RECT rc;
             if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
             else            rc = ps.rcPaint;
-            HRGN clip = CreateRectRgnIndirect(&rc);
-            SelectClipRgn(g_memDC, clip);
-            DeleteObject(clip);
+            // 设裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
+            // 复位成整幅位图（WM_SIZE 重建时也是全新 DC），起始裁剪即全图，
+            // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
+            // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
+            IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
             PaintWindow(g_memDC, TRUE);
             SelectClipRgn(g_memDC, NULL);
             BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
