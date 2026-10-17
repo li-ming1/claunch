@@ -1,8 +1,8 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
 // 左侧自定义分组（行可拖拽排序，决定滚轮切换顺序）、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
-// 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
-// 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
+// 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
+// 右键格子可编辑 名称/文件名/参数/工具提示。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
@@ -60,7 +60,6 @@
 #define IDM_GRP_DEL     1006
 #define IDM_GRP_NEW     1007
 #define IDM_PROPS       1008
-#define IDM_TOP         1009
 #define IDM_EXIT        1010
 
 // 托盘
@@ -92,7 +91,7 @@
 
 // ---------------------------------------------------------------- 数据
 // 字段按访问热度排列：绘制只碰 name/icon/group/ownIcon/iconTried（同一缓存行），
-// 启动才碰 path，属性对话框/悬停才碰 args/work/tip——每帧少跨缓存行。
+// 启动才碰 path，属性对话框/悬停才碰 args/tip——每帧少跨缓存行。
 typedef struct {
     WCHAR name[48];        // 热：每格绘制
     HICON icon;            // 热：每格绘制
@@ -101,7 +100,6 @@ typedef struct {
     BOOL  iconTried;       // 热：按需加载哨兵
     WCHAR path[MAX_PATH];  // 温：启动 / 失效清理
     WCHAR args[192];       // 冷：仅属性对话框
-    WCHAR work[MAX_PATH];  // 冷：仅属性对话框
     WCHAR tip[96];         // 冷：仅悬停文字
 } Item;
 
@@ -113,7 +111,6 @@ typedef struct {
     WCHAR name[48];
     WCHAR path[MAX_PATH];
     WCHAR args[192];
-    WCHAR work[MAX_PATH];
     WCHAR tip[96];
 } ClipItem;
 
@@ -147,8 +144,7 @@ static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;  
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
-static BOOL g_pinned = FALSE;
-static BOOL g_topmost = TRUE;
+static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
 static BOOL g_silent = FALSE;    // 静默启动：启动直接进托盘不淡入（配置持久化）
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
@@ -696,7 +692,7 @@ static void EnsureIcon(int i)
 
 // ---------------------------------------------------------------- 条目与分组
 static int AddItemRaw(const WCHAR *name, const WCHAR *path, int group,
-                      const WCHAR *args, const WCHAR *work, const WCHAR *tip)
+                      const WCHAR *args, const WCHAR *tip)
 {
     if (g_nItems >= MAX_ITEMS) return -1;
     Item *it = &g_items[g_nItems];
@@ -704,7 +700,6 @@ static int AddItemRaw(const WCHAR *name, const WCHAR *path, int group,
     wcsncpy_s(it->name, 48, name, _TRUNCATE);
     wcsncpy_s(it->path, MAX_PATH, path, _TRUNCATE);
     if (args) wcsncpy_s(it->args, 192, args, _TRUNCATE);
-    if (work) wcsncpy_s(it->work, MAX_PATH, work, _TRUNCATE);
     if (tip)  wcsncpy_s(it->tip, 96, tip, _TRUNCATE);
     it->group = group;
     g_nItems++;
@@ -727,10 +722,10 @@ static int AddItemByPath(const WCHAR *path, int group)
 {
     WCHAR name[48];
     NameFromPath(path, name, 48);
-    return AddItemRaw(name, path, group, NULL, NULL, NULL);
+    return AddItemRaw(name, path, group, NULL, NULL);
 }
 
-// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数/工作目录、重取图标。
+// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、重取图标。
 // 拖放替换与未来的“改目标”路径共用（ShowCellMenu 属性框保持自己的字段级逻辑）
 static void SetItemTarget(int ii, const WCHAR *path, int group)
 {
@@ -741,7 +736,6 @@ static void SetItemTarget(int ii, const WCHAR *path, int group)
     wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
     g_items[ii].group = group;
     g_items[ii].args[0] = 0;
-    g_items[ii].work[0] = 0;
     EnsureIcon(ii);
 }
 
@@ -806,7 +800,7 @@ static void EnsureSlot(int slot)
     if (slot < 0) return;
     int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
     while (ViewCount() <= slot && g_nItems < MAX_ITEMS)
-        AddItemRaw(L"", L"", g, NULL, NULL, NULL);
+        AddItemRaw(L"", L"", g, NULL, NULL);
 }
 
 // 启动时清理失效项目：路径已不存在（含 .lnk 被删）直接移除并写回配置。
@@ -909,9 +903,9 @@ static BOOL Launch(int idx, BOOL asAdmin)
             if (ParseLnk(it->path, &lnk) && lnk.target[0] &&
                 CreateRun(lnk.target,
                           it->args[0] ? it->args : lnk.args,
-                          it->work[0] ? it->work : lnk.work))
+                          lnk.work))
                 return TRUE;
-        } else if (CreateRun(it->path, it->args, it->work)) {
+        } else if (CreateRun(it->path, it->args, L"")) {
             return TRUE;
         }
         // CreateProcess 不认识的目标（文件夹/文档/协议）：退回 shell
@@ -919,7 +913,7 @@ static BOOL Launch(int idx, BOOL asAdmin)
     // ShellExecuteW 返回值 ≤32 即失败（SE_ERR_*）；调用方据此给启动反馈
     return (INT_PTR)ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", it->path,
                                   it->args[0] ? it->args : NULL,
-                                  it->work[0] ? it->work : NULL, SW_SHOWNORMAL) > 32;
+                                  NULL, SW_SHOWNORMAL) > 32;
 }
 
 static void OpenLocation(const WCHAR *path)
@@ -1016,7 +1010,6 @@ static void LoadConfig(void)
     r.f = CreateFileW(g_ini, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
     g_pinned = FALSE;
-    g_topmost = TRUE;
     wcsncpy_s(g_groups[0].name, 48, L"全部", _TRUNCATE);
     g_nGroups = 1;
 
@@ -1039,7 +1032,7 @@ static void LoadConfig(void)
 
         if (!wcscmp(section, L"Main")) {
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
-            else if (!wcscmp(key, L"Topmost")) g_topmost = _wtoi(val) ? TRUE : FALSE;
+            else if (!wcscmp(key, L"Topmost")) { if (_wtoi(val)) g_pinned = TRUE; }   // 旧字段迁移：原置顶偏好并入置顶开关
             else if (!wcscmp(key, L"Silent"))  g_silent = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
             else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
@@ -1064,7 +1057,7 @@ static void LoadConfig(void)
             if (grp < 0 || grp >= g_nGroups) grp = 0;
             if (grp == 0) grp = DefaultGroup();
             AddItemRaw(f[0], f[1], grp,
-                       nf >= 4 ? f[3] : NULL, nf >= 5 ? f[4] : NULL, nf >= 6 ? f[5] : NULL);
+                       nf >= 4 ? f[3] : NULL, nf >= 6 ? f[5] : NULL);   // f[4] 是旧格式的 work 槽：跳过
         }
     }
     if (r.f != INVALID_HANDLE_VALUE) CloseHandle(r.f);
@@ -1100,7 +1093,6 @@ static void SaveConfig(void)
     FmtLine(f, L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
     FmtLine(f, L"Pinned=%d\r\n", g_pinned ? 1 : 0);
-    FmtLine(f, L"Topmost=%d\r\n", g_topmost ? 1 : 0);
     FmtLine(f, L"Silent=%d\r\n", g_silent ? 1 : 0);
     FmtLine(f, L"Group=%d\r\n", g_curGroup);
     FmtLine(f, L"Cell=%d\r\n", g_cellBase);
@@ -1112,15 +1104,14 @@ static void SaveConfig(void)
     }
     FmtLine(f, L"[Items]\r\n");
     FmtLine(f, L"Count=%d\r\n", g_nItems);
-    // 注意：每个字段必须用独立的缓冲区——函数参数求值顺序不确定
-    static WCHAR sName[96], sPath[MAX_PATH + 8], sArgs[MAX_PATH + 8],
-                  sWork[MAX_PATH + 8], sTip[128];
+    // 注意：每个字段必须用独立的缓冲区——函数参数求值顺序不确定。
+    // 条目行保留 6 个位置槽（work 槽固定为空），旧配置按位置读取不受影响
+    static WCHAR sName[96], sPath[MAX_PATH + 8], sArgs[MAX_PATH + 8], sTip[128];
     for (int i = 0; i < g_nItems; i++) {
-        FmtLine(f, L"I%d=%s|%s|%d|%s|%s|%s\r\n", i,
+        FmtLine(f, L"I%d=%s|%s|%d|%s||%s\r\n", i,
                 SafeField(sName, 96, g_items[i].name),
                 SafeField(sPath, MAX_PATH + 8, g_items[i].path), g_items[i].group,
                 SafeField(sArgs, MAX_PATH + 8, g_items[i].args),
-                SafeField(sWork, MAX_PATH + 8, g_items[i].work),
                 SafeField(sTip, 128, g_items[i].tip));
     }
     CloseHandle(f);
@@ -1150,7 +1141,6 @@ static void ItemToClip(const Item *it, ClipItem *ci)
     wcsncpy_s(ci->name, 48, it->name, _TRUNCATE);
     wcsncpy_s(ci->path, MAX_PATH, it->path, _TRUNCATE);
     wcsncpy_s(ci->args, 192, it->args, _TRUNCATE);
-    wcsncpy_s(ci->work, MAX_PATH, it->work, _TRUNCATE);
     wcsncpy_s(ci->tip, 96, it->tip, _TRUNCATE);
 }
 
@@ -1223,7 +1213,6 @@ static void PasteItemAt(int ii, const ClipItem *ci)
     wcsncpy_s(g_items[ii].name, 48, ci->name, _TRUNCATE);
     wcsncpy_s(g_items[ii].path, MAX_PATH, ci->path, _TRUNCATE);
     wcsncpy_s(g_items[ii].args, 192, ci->args, _TRUNCATE);
-    wcsncpy_s(g_items[ii].work, MAX_PATH, ci->work, _TRUNCATE);
     wcsncpy_s(g_items[ii].tip, 96, ci->tip, _TRUNCATE);
     DropIcon(ii);
     EnsureIcon(ii);
@@ -1238,7 +1227,7 @@ static void PasteItemAt(int ii, const ClipItem *ci)
 static void PasteItemNew(const ClipItem *ci)
 {
     int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
-    if (AddItemRaw(ci->name, ci->path, g, ci->args, ci->work, ci->tip) >= 0) {
+    if (AddItemRaw(ci->name, ci->path, g, ci->args, ci->tip) >= 0) {
         ClampScroll();
         SaveConfig();
         UpdateHoverText();
@@ -1432,7 +1421,7 @@ static BOOL UpdateHoverText(void)
     }
     if (g_hoverGroup >= 0) return SetHover(g_groups[g_hoverGroup].name, TRUE);
     switch (g_hoverBtn) {
-    case 1: return SetHover(g_pinned ? L"取消定住" : L"定住窗口", TRUE);
+    case 1: return SetHover(g_pinned ? L"取消置顶" : L"置顶窗口", TRUE);
     case 2: return SetHover(L"退出", TRUE);
     }
     if (RealCount() == 0) return SetHover(L"把程序拖进格子里", FALSE);
@@ -1620,14 +1609,16 @@ static BOOL FlashActive(void)
     return g_flashAt && GetTickCount() - g_flashAt < FLASH_MS;
 }
 
-// 钉住开关：标题栏图钉点击与托盘菜单共用
+// 置顶开关：标题栏图钉点击与托盘菜单共用。置顶 = 常驻不自动隐藏 + HWND_TOPMOST
 static void TogglePin(void)
 {
     g_pinned = !g_pinned;
+    SetWindowPos(g_hwnd, g_pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SaveConfig();
     UpdateHoverText();
     InvalidateTitle();
-    UpdateTrayTip();      // 托盘提示里的“定住”标记跟着变
+    UpdateTrayTip();      // 托盘提示里的“置顶”标记跟着变
 }
 
 // 静默启动开关：只影响下次启动（当次不隐藏，正在用的窗口不动）
@@ -2091,8 +2082,7 @@ static void InitAutostart(void)
 static void BuildTrayTip(WCHAR *out, size_t cch)
 {
     WCHAR flags[40] = L"";
-    if (g_pinned)    wcscat_s(flags, 40, L"定住·");
-    if (g_topmost)   wcscat_s(flags, 40, L"置顶·");
+    if (g_pinned)    wcscat_s(flags, 40, L"置顶·");
     if (g_autostart) wcscat_s(flags, 40, L"自启·");
     if (g_silent)    wcscat_s(flags, 40, L"静默·");
     if (flags[0]) {
@@ -2207,8 +2197,7 @@ static void TrayShowMenu(void)
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN,
-                g_pinned ? L"取消定住" : L"定住窗口");
+    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
     AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
                 L"开机自启动");
     AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
@@ -2262,14 +2251,13 @@ static void ShowCellMenu(int ii)
     case IDM_PROPS: {
         WCHAR oldPath[MAX_PATH];
         wcsncpy_s(oldPath, MAX_PATH, g_items[ii].path, _TRUNCATE);
-        DlgField f[5] = {
-            { L"名称(N):",       g_items[ii].name, 48,       0 },
-            { L"文件名(F):",     g_items[ii].path, MAX_PATH, 1 },
-            { L"参数(P):",       g_items[ii].args, 192,      0 },
-            { L"工作文件夹(D):", g_items[ii].work, MAX_PATH, 0 },
-            { L"工具提示(T):",   g_items[ii].tip,  96,       0 },
+        DlgField f[4] = {
+            { L"名称(N):",     g_items[ii].name, 48,       0 },
+            { L"文件名(F):",   g_items[ii].path, MAX_PATH, 1 },
+            { L"参数(P):",     g_items[ii].args, 192,      0 },
+            { L"工具提示(T):", g_items[ii].tip,  96,       0 },
         };
-        if (RunDialog(g_hwnd, L"格子属性", f, 5)) {
+        if (RunDialog(g_hwnd, L"格子属性", f, 4)) {
             if (wcscmp(oldPath, g_items[ii].path)) {   // 目标变了，重取图标
                 DropIcon(ii);
                 EnsureIcon(ii);
@@ -2313,22 +2301,12 @@ static void ShowGroupMenu(int gi)
     }
 }
 
+// 标题栏右键菜单：置顶已并入图钉开关（按钮/托盘菜单），这里只剩退出
 static void ShowTitleMenu(void)
 {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | (g_topmost ? MF_CHECKED : 0), IDM_TOP, L"总在最前面");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
-    int cmd = PopupAt(m);
-    if (cmd == IDM_TOP) {
-        g_topmost = !g_topmost;
-        SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
-                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        SaveConfig();
-        UpdateTrayTip();      // 托盘提示里的“置顶”标记跟着变
-    } else if (cmd == IDM_EXIT) {
-        ExitApp();
-    }
+    if (PopupAt(m) == IDM_EXIT) ExitApp();
 }
 
 // ---------------------------------------------------------------- 全局双击唤醒
@@ -2433,7 +2411,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             // 用户在其他窗口的正常滚动就会被偷走，这是绝不能碰的红线。
             // 不置顶时光标底下是谁的窗口就归谁滚，绝不插手。
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
-            if (IsWindowVisible(g_hwnd) && g_topmost && !g_dlgOpen &&
+            if (IsWindowVisible(g_hwnd) && g_pinned && !g_dlgOpen &&
                 GetForegroundWindow() != g_hwnd) {
                 RECT r;
                 GetWindowRect(g_hwnd, &r);
@@ -2477,7 +2455,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CREATE: {
         g_hwnd = h;
         MakeFontsAndBrushes();
-        SetWindowPos(h, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+        SetWindowPos(h, g_pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
         DragAcceptFiles(h, TRUE);
@@ -2851,7 +2829,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             FlashMsg(t);
             return 0;
         }
-        if (w >= '1' && w <= '9' && !g_filter[0]) {    // 数字键：启动当前组第 N 格（过滤中数字归搜索）
+        if (w >= '1' && w <= '9' && !g_filter[0] &&
+            !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {   // 数字键：启动当前组第 N 格（Ctrl 修饰留给复制，过滤中归搜索）
             int ii = ItemAtView((int)(w - '1'));
             if (ii >= 0 && !IsBlank(ii))
                 FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
