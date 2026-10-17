@@ -3127,9 +3127,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     ClampToWorkArea();
     if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
     if (g_silent) {
-        // 静默启动：直接进托盘（WM_CREATE 已加托盘图标，TIMER_HIDE 对不可见窗口是空转，
-        // 之后热键/托盘/双击桌面唤醒时 ShowLauncher 会正常淡入）
+        // 静默启动：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出检测心跳——
+        // 不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零轮询"不变量；
+        // 唤醒时 ShowLauncher 会重启它
         ShowWindow(g_hwnd, SW_HIDE);
+        KillTimer(g_hwnd, TIMER_HIDE);
     } else {
         ShowWindow(g_hwnd, SW_SHOW);
         ForceForeground(g_hwnd);
