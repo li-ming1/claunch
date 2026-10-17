@@ -5,6 +5,7 @@
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
+// 托盘菜单可开/关：开机自启（写 HKCU Run 键）、静默启动（直接进托盘）。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
 // 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
@@ -33,6 +34,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "imm32.lib")
+#pragma comment(lib, "advapi32.lib")   // 开机自启的注册表操作；advapi32 本就经 shell32 间接映射，无新增 DLL
 
 // ---------------------------------------------------------------- 常量
 #define MAX_GROUPS      16
@@ -65,6 +67,8 @@
 #define WM_TRAY             (WM_APP + 2)   // 托盘回调消息
 #define IDM_TRAY_SHOW       1101
 #define IDM_TRAY_PIN        1102
+#define IDM_TRAY_AUTO       1103
+#define IDM_TRAY_SILENT     1104
 
 #define DLG_OK          1
 #define DLG_CANCEL      2
@@ -134,6 +138,8 @@ static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/�
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
+static BOOL g_silent = FALSE;    // 静默启动：启动直接进托盘不淡入（配置持久化）
+static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static int  g_curGroup = 0;
 static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
 static int  g_scroll = 0;       // 格子区滚动（像素）
@@ -986,6 +992,7 @@ static void LoadConfig(void)
         if (!wcscmp(section, L"Main")) {
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Topmost")) g_topmost = _wtoi(val) ? TRUE : FALSE;
+            else if (!wcscmp(key, L"Silent"))  g_silent = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
             else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
             else if (!wcscmp(key, L"Rect"))    wcsncpy_s(rect, 64, val, _TRUNCATE);
@@ -1046,6 +1053,7 @@ static void SaveConfig(void)
             r.right - r.left, r.bottom - r.top);
     FmtLine(f, L"Pinned=%d\r\n", g_pinned ? 1 : 0);
     FmtLine(f, L"Topmost=%d\r\n", g_topmost ? 1 : 0);
+    FmtLine(f, L"Silent=%d\r\n", g_silent ? 1 : 0);
     FmtLine(f, L"Group=%d\r\n", g_curGroup);
     FmtLine(f, L"Cell=%d\r\n", g_cellBase);
     FmtLine(f, L"[Groups]\r\n");
@@ -1424,6 +1432,13 @@ static void TogglePin(void)
     InvalidateTitle();
 }
 
+// 静默启动开关：只影响下次启动（当次不隐藏，正在用的窗口不动）
+static void ToggleSilent(void)
+{
+    g_silent = !g_silent;
+    SaveConfig();
+}
+
 static void DrawPinGlyph(HDC dc, RECT r, BOOL on)
 {
     int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2 - 2;
@@ -1786,6 +1801,49 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
     return ok;
 }
 
+// ---------------------------------------------------------------- 开机自启
+// HKCU 的 Run 键是唯一事实源：启动时读一次供菜单勾选，切换时直接写/删，
+// 不镜像进 kk.ini——避免两处状态互相不一致。HKCU 无需管理员权限
+#define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+static BOOL QueryAutostart(void)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return FALSE;
+    WCHAR path[MAX_PATH + 8] = L"";
+    DWORD cb = sizeof path;
+    LONG r = RegQueryValueExW(k, APPNAME, NULL, NULL, (BYTE *)path, &cb);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS && path[0];
+}
+
+// 返回是否切换成功（失败时菜单勾选保持不变）
+static BOOL SetAutostart(BOOL on)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &k) != ERROR_SUCCESS)
+        return FALSE;
+    LONG r;
+    if (on) {
+        WCHAR path[MAX_PATH], cmd[MAX_PATH + 4];
+        GetModuleFileNameW(NULL, path, MAX_PATH);
+        swprintf(cmd, MAX_PATH + 4, L"\"%s\"", path);   // 路径可能含空格：加引号
+        r = RegSetValueExW(k, APPNAME, 0, REG_SZ, (const BYTE *)cmd,
+                           (DWORD)(wcslen(cmd) + 1) * sizeof(WCHAR));
+    } else {
+        r = RegDeleteValueW(k, APPNAME);
+        if (r == ERROR_FILE_NOT_FOUND) r = ERROR_SUCCESS;   // 本来就没有：算成功
+    }
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
+static void ToggleAutostart(void)
+{
+    if (SetAutostart(!g_autostart)) g_autostart = !g_autostart;
+}
+
 // ---------------------------------------------------------------- 托盘
 // 运行时画一个 2x2 格子图标：不必引入 .ico 资源，保持单文件
 static HICON MakeTrayIcon(int sz)
@@ -1885,6 +1943,10 @@ static void TrayShowMenu(void)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN,
                 g_pinned ? L"取消定住" : L"定住窗口");
+    AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
+                L"开机自启动");
+    AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
+                L"静默启动（进托盘）");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
     int cmd = PopupAt(m);
@@ -1892,6 +1954,10 @@ static void TrayShowMenu(void)
     if (cmd == IDM_TRAY_SHOW) ShowLauncher();
     else if (cmd == IDM_TRAY_PIN) {
         TogglePin();
+    } else if (cmd == IDM_TRAY_AUTO) {
+        ToggleAutostart();
+    } else if (cmd == IDM_TRAY_SILENT) {
+        ToggleSilent();
     } else if (cmd == IDM_EXIT) {
         ExitApp();
     }
@@ -2702,6 +2768,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     IniPath();
     ScaleMetrics();
     LoadConfig();
+    g_autostart = QueryAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof wc);
@@ -2737,14 +2804,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
 
     ClampToWorkArea();
     if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
-    ShowWindow(g_hwnd, SW_SHOW);
-    ForceForeground(g_hwnd);
-    g_outSince = 0;
-    g_wakeAt = GetTickCount();   // 启动等同一次唤醒：给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
-    g_alpha = 0;
-    SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
-    g_fadeDir = 1;
-    SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+    if (g_silent) {
+        // 静默启动：直接进托盘（WM_CREATE 已加托盘图标，TIMER_HIDE 对不可见窗口是空转，
+        // 之后热键/托盘/双击桌面唤醒时 ShowLauncher 会正常淡入）
+        ShowWindow(g_hwnd, SW_HIDE);
+    } else {
+        ShowWindow(g_hwnd, SW_SHOW);
+        ForceForeground(g_hwnd);
+        g_outSince = 0;
+        g_wakeAt = GetTickCount();   // 启动等同一次唤醒：给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
+        g_alpha = 0;
+        SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
+        g_fadeDir = 1;
+        SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
