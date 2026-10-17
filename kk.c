@@ -3,7 +3,8 @@
 // 拖程序进格子单击启动、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
-// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）。
+// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
+// 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
 // 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
@@ -134,6 +135,7 @@ static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，�
 static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static int  g_curGroup = 0;
+static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
 static int  g_scroll = 0;       // 格子区滚动（像素）
 static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 
@@ -223,6 +225,25 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
     return dst;
 }
 
+// 大小写不敏感的子串查找（名称搜索过滤用；ASCII 折叠大小写，CJK 原样比较。
+// 不引 shlwapi 的 StrStrIW——少一个 DLL 依赖，且名称≤47 字符，O(n*m) 可忽略）
+static BOOL ContainsText(const WCHAR *hay, const WCHAR *needle)
+{
+    if (!needle[0]) return TRUE;
+    for (const WCHAR *p = hay; *p; p++) {
+        const WCHAR *a = p, *b = needle;
+        while (*b) {
+            WCHAR ca = *a, cb = *b;
+            if (ca >= L'A' && ca <= L'Z') ca += 32;
+            if (cb >= L'A' && cb <= L'Z') cb += 32;
+            if (ca != cb) break;
+            a++; b++;
+        }
+        if (!*b) return TRUE;
+    }
+    return FALSE;
+}
+
 // ---------------------------------------------------------------- 布局
 // 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）。
 // g_cols/g_slots 只在 UpdateCell 里算（WM_SIZE/DPI 变化时刷新），
@@ -264,9 +285,11 @@ static void ViewDirty(void)
 static void ViewRebuild(void)
 {
     g_viewN = 0;
-    for (int i = 0; i < g_nItems; i++)
-        if (g_curGroup == 0 || g_items[i].group == g_curGroup)
-            g_viewIdx[g_viewN++] = i;
+    for (int i = 0; i < g_nItems; i++) {
+        if (g_curGroup != 0 && g_items[i].group != g_curGroup) continue;
+        if (!ContainsText(g_items[i].name, g_filter)) continue;   // 搜索过滤：与分组条件链在同一遍扫描里
+        g_viewIdx[g_viewN++] = i;
+    }
     g_viewValid = TRUE;
 }
 
@@ -1342,6 +1365,24 @@ static void RefreshHoverSpots(int oc, int og, BOOL txtChg)
     RefreshCard();                   // 小卡片跟着悬停目标（内部含擦除旧区域）
 }
 
+// 搜索过滤词变化后：重建视图、钳制滚动、刷新悬停与整窗重绘。
+// 键入是人类速率，全窗重绘可接受；悬停格在新视图里可能已换人，卡片/文字都要重算
+static void ApplyFilter(void)
+{
+    ViewDirty();
+    ClampScroll();
+    UpdateHoverText();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    RefreshCard();
+}
+
+static void ClearFilter(void)
+{
+    if (!g_filter[0]) return;
+    g_filter[0] = 0;
+    ApplyFilter();
+}
+
 // 字体沿用 PaintWindow 已选好的 g_font，这里只设文字色
 static void DrawCard(HDC dc)
 {
@@ -1450,9 +1491,18 @@ static void PaintTitle(HDC dc)
 {
     HFONT old = (HFONT)SelectObject(dc, g_fontT);
     RECT ttl = { g_sideW + S_(8), 0, g_cw - S_(90), g_titleH };
-    SetTextColor(dc, g_hoverActive ? C_TEXT : C_DIM);
-    DrawTextW(dc, g_hoverText, -1, &ttl,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (g_filter[0]) {
+        // 搜索中：标题栏让位给过滤词（左对齐 + 命中数），悬停详情看小卡片
+        WCHAR txt[64];
+        swprintf(txt, 64, L"搜索: %s (%d)", g_filter, ViewCount());
+        SetTextColor(dc, C_TEXT);
+        DrawTextW(dc, txt, -1, &ttl,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    } else {
+        SetTextColor(dc, g_hoverActive ? C_TEXT : C_DIM);
+        DrawTextW(dc, g_hoverText, -1, &ttl,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     SelectObject(dc, old);
     DrawPinGlyph(dc, BtnRect(1), g_pinned);
     DrawCloseGlyph(dc, BtnRect(2));
@@ -2218,6 +2268,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 if (dx < 0) dx = -dx;
                 if (dy < 0) dy = -dy;
                 if (dx > GetSystemMetrics(SM_CXDRAG) || dy > GetSystemMetrics(SM_CYDRAG)) {
+                    // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
+                    // 先清过滤回全量再拖，落点高亮才和用户看到的一致
+                    ClearFilter();
                     g_dragging = TRUE;
                     g_dropCell = g_pressCell;
                     g_dropIn = TRUE;
@@ -2398,9 +2451,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_KEYDOWN: {
-        if (w == VK_ESCAPE) { BeginHide(TRUE); return 0; }
+        if (w == VK_ESCAPE) {                       // 搜索中：第一次 Esc 清过滤词，再按才隐藏
+            if (g_filter[0]) ClearFilter();
+            else BeginHide(TRUE);
+            return 0;
+        }
         if (g_dlgOpen || g_pressCell >= 0) return 0;   // 对话框/拖动排序进行中：不抢键
-        if (w >= '1' && w <= '9') {                     // 数字键：启动当前组第 N 格
+        if (w >= '1' && w <= '9' && !g_filter[0]) {    // 数字键：启动当前组第 N 格（过滤中数字归搜索）
             int ii = ItemAtView((int)(w - '1'));
             if (ii >= 0 && !IsBlank(ii)) Launch(ii, FALSE);
             return 0;
@@ -2430,6 +2487,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
 
+    // 可打印字符 → 搜索过滤（退格删字符，Esc 清空）。主窗 IME 已断开，
+    // 中文命名只能用 ASCII 搜——换输入法链的 30MB 不值
+    case WM_CHAR: {
+        if (g_dlgOpen || g_pressCell >= 0) return 0;
+        if (w == 0x08) {                              // 退格：删一个字符
+            if (!g_filter[0]) return 0;
+            int n = (int)wcslen(g_filter);
+            g_filter[n - 1] = 0;
+            ApplyFilter();
+            return 0;
+        }
+        if (w < 32) return 0;                         // 其余控制字符不管
+        if (w >= '1' && w <= '9' && !g_filter[0]) return 0;   // 空过滤时数字键归 WM_KEYDOWN 快速启动
+        int n = (int)wcslen(g_filter);
+        if (n >= 20) return 0;                        // 过滤词上限 20 字符
+        g_filter[n++] = (WCHAR)w;
+        g_filter[n] = 0;
+        ApplyFilter();
+        return 0;
+    }
+
     // 主窗不进 TSF：默认处理会激活输入上下文，把 MSCTF/textinputframework/
     // Windows.Storage（~12MB）拖进进程。属性对话框不受影响（独立窗口）。
     case WM_IME_SETCONTEXT:
@@ -2448,6 +2526,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDROP hd = (HDROP)w;
         UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
         if (nf > 0) {
+            ClearFilter();      // 落点按全量视图的格位算（EnsureSlot 补的空格不过滤）：先清过滤
             POINT p;
             // DragQueryPoint 给的是本窗客户坐标；拿不到（少数拖放路径）就退回光标位置
             if (!DragQueryPoint(hd, &p)) {
