@@ -1,6 +1,6 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
 // 左侧自定义分组、正方形密集格子（空格也画出来，可拖动排序，窗口铺满重排、边缘可拉伸）、
-// 拖程序进格子单击启动、启动时自动清理失效项目、悬停顶部居中显示名称、
+// 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、定住按钮、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
@@ -150,6 +150,8 @@ static WCHAR g_hoverText[80];
 static BOOL  g_cardOn = FALSE;  // 悬停小卡片可见（悬停格子/分组时浮在其上方）
 static RECT  g_cardRect;        // 卡片区域：悬停目标变化时重算，绘制只读
 static WCHAR g_cardText[80];    // 卡片文字：程序名/组名
+static WCHAR g_flashText[80];   // 标题栏启动反馈（"已启动/启动失败: 名"）
+static DWORD g_flashAt = 0;     // 反馈起始时刻；1.2s 后自然过期（0=无）
 
 static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
 static BOOL g_dragging;         // 已越过拖动阈值
@@ -852,11 +854,11 @@ static BOOL CreateRun(const WCHAR *exe, const WCHAR *args, const WCHAR *work)
     return ok;
 }
 
-static void Launch(int idx, BOOL asAdmin)
+static BOOL Launch(int idx, BOOL asAdmin)
 {
-    if (idx < 0 || idx >= g_nItems) return;
+    if (idx < 0 || idx >= g_nItems) return FALSE;
     const Item *it = &g_items[idx];
-    if (!it->path[0]) return;               // 空格：没有可启动的目标
+    if (!it->path[0]) return FALSE;              // 空格：没有可启动的目标
     if (!asAdmin) {
         if (HasExt(it->path, L".lnk")) {
             LnkInfo lnk;
@@ -864,15 +866,16 @@ static void Launch(int idx, BOOL asAdmin)
                 CreateRun(lnk.target,
                           it->args[0] ? it->args : lnk.args,
                           it->work[0] ? it->work : lnk.work))
-                return;
+                return TRUE;
         } else if (CreateRun(it->path, it->args, it->work)) {
-            return;
+            return TRUE;
         }
         // CreateProcess 不认识的目标（文件夹/文档/协议）：退回 shell
     }
-    ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", it->path,
-                  it->args[0] ? it->args : NULL,
-                  it->work[0] ? it->work : NULL, SW_SHOWNORMAL);
+    // ShellExecuteW 返回值 ≤32 即失败（SE_ERR_*）；调用方据此给启动反馈
+    return (INT_PTR)ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", it->path,
+                                  it->args[0] ? it->args : NULL,
+                                  it->work[0] ? it->work : NULL, SW_SHOWNORMAL) > 32;
 }
 
 static void OpenLocation(const WCHAR *path)
@@ -1148,6 +1151,7 @@ static void StepFade(void)
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
             KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
+            g_flashAt = 0;                    // 心跳停了：反馈不可能再过期重绘，直接收掉
             TrimWS();
         } else {
             SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
@@ -1424,6 +1428,21 @@ static void InvalidateTitle(void)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
+#define FLASH_MS 1200
+
+// 启动反馈：标题栏闪现 1.2s（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
+static void FlashLaunch(BOOL ok, const WCHAR *name)
+{
+    swprintf(g_flashText, 80, ok ? L"已启动: %s" : L"启动失败: %s", name);
+    g_flashAt = GetTickCount();
+    InvalidateTitle();
+}
+
+static BOOL FlashActive(void)
+{
+    return g_flashAt && GetTickCount() - g_flashAt < FLASH_MS;
+}
+
 // 钉住开关：标题栏图钉点击与托盘菜单共用
 static void TogglePin(void)
 {
@@ -1509,7 +1528,12 @@ static void PaintTitle(HDC dc)
 {
     HFONT old = (HFONT)SelectObject(dc, g_fontT);
     RECT ttl = { g_sideW + S_(8), 0, g_cw - S_(90), g_titleH };
-    if (g_filter[0]) {
+    if (FlashActive()) {
+        // 启动反馈优先：刚点过启动，先让用户看到结果（悬停/搜索都让位）
+        SetTextColor(dc, C_TEXT);
+        DrawTextW(dc, g_flashText, -1, &ttl,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    } else if (g_filter[0]) {
         // 搜索中：标题栏让位给过滤词（左对齐 + 命中数），悬停详情看小卡片
         WCHAR txt[64];
         swprintf(txt, 64, L"搜索: %s (%d)", g_filter, ViewCount());
@@ -1809,16 +1833,16 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
 // 不镜像进 kk.ini——避免两处状态互相不一致。HKCU 无需管理员权限
 #define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
-static BOOL QueryAutostart(void)
+// 读出自启项登记的路径（无该项返回 FALSE）。容量按写入上限（引号+全路径+NUL）给足
+static BOOL QueryAutostart(WCHAR *pathOut, int cch)
 {
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
         return FALSE;
-    WCHAR path[MAX_PATH + 8] = L"";
-    DWORD cb = sizeof path;
-    LONG r = RegQueryValueExW(k, APPNAME, NULL, NULL, (BYTE *)path, &cb);
+    DWORD cb = (DWORD)cch * sizeof(WCHAR);
+    LONG r = RegQueryValueExW(k, APPNAME, NULL, NULL, (BYTE *)pathOut, &cb);
     RegCloseKey(k);
-    return r == ERROR_SUCCESS && path[0];
+    return r == ERROR_SUCCESS && pathOut[0];
 }
 
 // 返回是否切换成功（失败时菜单勾选保持不变）
@@ -1848,6 +1872,20 @@ static void ToggleAutostart(void)
         g_autostart = !g_autostart;
         UpdateTrayTip();      // 托盘提示里的“自启”标记跟着变
     }
+}
+
+// 开机自启初始化：读状态供菜单勾选；登记的路径与当前 exe 不一致
+// （程序被移动/重装到别处）就地重写，免得登录时静默失效
+static void InitAutostart(void)
+{
+    WCHAR runPath[MAX_PATH + 8] = L"";
+    g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
+    if (!g_autostart) return;
+    WCHAR *q = runPath;                       // 写入时加了引号，比对前剥掉
+    if (*q == L'"') { q++; WCHAR *e = wcschr(q, L'"'); if (e) *e = 0; }
+    WCHAR self[MAX_PATH];
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (wcscmp(q, self) != 0) SetAutostart(TRUE);
 }
 
 // ---------------------------------------------------------------- 托盘
@@ -2391,8 +2429,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
         BOOL txtChg = HoverFromPoint(p);
-        if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn)
+        if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
+            g_flashAt = 0;                    // 悬停目标变了：新意图 supersede 启动反馈
             RefreshHoverSpots(oc, og, txtChg);
+        }
         if (!g_tracking) {
             TRACKMOUSEEVENT tme;
             ZeroMemory(&tme, sizeof tme);
@@ -2463,7 +2503,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         ReleaseCapture();
         if (!wasDrag) {
             int ii = ItemAtView(from);
-            if (ii >= 0) Launch(ii, FALSE);
+            if (ii >= 0 && !IsBlank(ii))
+                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
         } else if (inGrid) {
             int n = ViewCount();
             if (to < 0) to = n - 1;            // 落点解析不出格位（拖到网格下方空白）：排到末尾
@@ -2559,12 +2600,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (g_dlgOpen || g_pressCell >= 0) return 0;   // 对话框/拖动排序进行中：不抢键
         if (w >= '1' && w <= '9' && !g_filter[0]) {    // 数字键：启动当前组第 N 格（过滤中数字归搜索）
             int ii = ItemAtView((int)(w - '1'));
-            if (ii >= 0 && !IsBlank(ii)) Launch(ii, FALSE);
+            if (ii >= 0 && !IsBlank(ii))
+                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
             return 0;
         }
         if (w == VK_RETURN) {                           // 回车：启动悬停格
             int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0 && !IsBlank(ii)) Launch(ii, FALSE);
+            if (ii >= 0 && !IsBlank(ii))
+                FlashLaunch(Launch(ii, FALSE), g_items[ii].name);
             return 0;
         }
         int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
@@ -2604,6 +2647,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (n >= 20) return 0;                        // 过滤词上限 20 字符
         g_filter[n++] = (WCHAR)w;
         g_filter[n] = 0;
+        g_flashAt = 0;                                // 开始打字：搜索 supersede 启动反馈
         ApplyFilter();
         return 0;
     }
@@ -2671,6 +2715,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_TIMER:
         if (w == TIMER_HIDE) {
+            if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
             if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
                 TrimWS();
                 g_outSince = 0;
@@ -2802,7 +2847,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     IniPath();
     ScaleMetrics();
     LoadConfig();
-    g_autostart = QueryAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）
+    InitAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）；路径过期则自愈重写
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof wc);
