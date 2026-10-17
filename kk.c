@@ -5,6 +5,7 @@
 // 右键格子可编辑 名称/文件名/参数/工作文件夹/工具提示。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
+// Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
 // 托盘菜单可开/关：开机自启（写 HKCU Run 键）、静默启动（直接进托盘）。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
@@ -106,6 +107,16 @@ typedef struct {
 
 typedef struct { WCHAR name[48]; } Group;
 
+// 剪贴板条目：只含可序列化的文本字段。组号不复制——粘到哪格就入哪组；
+// icon/ownIcon/iconTried 是运行期字段，不进剪贴板
+typedef struct {
+    WCHAR name[48];
+    WCHAR path[MAX_PATH];
+    WCHAR args[192];
+    WCHAR work[MAX_PATH];
+    WCHAR tip[96];
+} ClipItem;
+
 static Item  g_items[MAX_ITEMS];
 static int   g_nItems = 0;
 static Group g_groups[MAX_GROUPS];
@@ -140,6 +151,7 @@ static BOOL g_pinned = FALSE;
 static BOOL g_topmost = TRUE;
 static BOOL g_silent = FALSE;    // 静默启动：启动直接进托盘不淡入（配置持久化）
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
+static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
 static int  g_curGroup = 0;
 static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
 static int  g_scroll = 0;       // 格子区滚动（像素）
@@ -1126,6 +1138,112 @@ static void ApplyCellBase(int v)
     SaveConfig();
 }
 
+// ---------------------------------------------------------------- 剪贴板（Ctrl+C/V 复制格子）
+// 双格式：私有格式存全字段（本程序自识别），另附一份 CF_UNICODETEXT 路径，
+// 复制出来的内容也能粘到别的程序里。粘贴目标：悬停格（空格也填），
+// 没有悬停格就追加到当前组
+static void ItemToClip(const Item *it, ClipItem *ci)
+{
+    wcsncpy_s(ci->name, 48, it->name, _TRUNCATE);
+    wcsncpy_s(ci->path, MAX_PATH, it->path, _TRUNCATE);
+    wcsncpy_s(ci->args, 192, it->args, _TRUNCATE);
+    wcsncpy_s(ci->work, MAX_PATH, it->work, _TRUNCATE);
+    wcsncpy_s(ci->tip, 96, it->tip, _TRUNCATE);
+}
+
+static BOOL ClipSet(const ClipItem *ci)
+{
+    if (!OpenClipboard(g_hwnd)) return FALSE;   // 剪贴板被别的程序占着：本次复制失败
+    EmptyClipboard();
+    if (g_clipFmt) {
+        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, sizeof(ClipItem));
+        if (h) {
+            ClipItem *dst = (ClipItem *)GlobalLock(h);
+            if (dst) {
+                *dst = *ci;
+                GlobalUnlock(h);
+                // SetClipboardData 成功后系统接管句柄，失败才由我们释放
+                if (!SetClipboardData(g_clipFmt, h)) GlobalFree(h);
+            } else {
+                GlobalFree(h);
+            }
+        }
+    }
+    size_t cb = (wcslen(ci->path) + 1) * sizeof(WCHAR);
+    HGLOBAL ht = GlobalAlloc(GMEM_MOVEABLE, cb);
+    if (ht) {
+        WCHAR *dst = (WCHAR *)GlobalLock(ht);
+        if (dst) {
+            wcscpy_s(dst, cb / sizeof(WCHAR), ci->path);
+            GlobalUnlock(ht);
+            if (!SetClipboardData(CF_UNICODETEXT, ht)) GlobalFree(ht);
+        } else {
+            GlobalFree(ht);
+        }
+    }
+    CloseClipboard();
+    return TRUE;
+}
+
+// 从剪贴板取条目：优先私有格式（全字段），退化到纯文本（只当路径，名字由路径推导）
+static BOOL ClipGet(ClipItem *ci)
+{
+    if (!OpenClipboard(g_hwnd)) return FALSE;
+    BOOL ok = FALSE;
+    if (g_clipFmt) {
+        HANDLE h = GetClipboardData(g_clipFmt);
+        if (h && GlobalSize(h) == sizeof(ClipItem)) {   // 尺寸不符当不存在（防伪造格式名）
+            ClipItem *src = (ClipItem *)GlobalLock(h);
+            if (src) { *ci = *src; GlobalUnlock(h); ok = TRUE; }
+        }
+    }
+    if (!ok) {
+        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+        if (h) {
+            WCHAR *s = (WCHAR *)GlobalLock(h);
+            if (s && s[0]) {
+                ZeroMemory(ci, sizeof *ci);
+                wcsncpy_s(ci->path, MAX_PATH, s, _TRUNCATE);
+                NameFromPath(ci->path, ci->name, 48);
+                ok = TRUE;
+            }
+            if (s) GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// 粘进指定格：替换全部文本字段并重取图标；组号不变（粘到哪格就入哪组）
+static void PasteItemAt(int ii, const ClipItem *ci)
+{
+    wcsncpy_s(g_items[ii].name, 48, ci->name, _TRUNCATE);
+    wcsncpy_s(g_items[ii].path, MAX_PATH, ci->path, _TRUNCATE);
+    wcsncpy_s(g_items[ii].args, 192, ci->args, _TRUNCATE);
+    wcsncpy_s(g_items[ii].work, MAX_PATH, ci->work, _TRUNCATE);
+    wcsncpy_s(g_items[ii].tip, 96, ci->tip, _TRUNCATE);
+    DropIcon(ii);
+    EnsureIcon(ii);
+    ViewDirty();                     // 名字可能变了：过滤视图要重建
+    SaveConfig();
+    UpdateHoverText();
+    RefreshCard();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// 追加为新条目到当前组（“全部”组时落到默认组）
+static void PasteItemNew(const ClipItem *ci)
+{
+    int g = (g_curGroup == 0) ? DefaultGroup() : g_curGroup;
+    if (AddItemRaw(ci->name, ci->path, g, ci->args, ci->work, ci->tip) >= 0) {
+        ClampScroll();
+        SaveConfig();
+        UpdateHoverText();
+        RefreshCard();
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+}
+
 // ---------------------------------------------------------------- 显示/隐藏
 static void ForceForeground(HWND h)
 {
@@ -1478,12 +1596,19 @@ static void InvalidateTitle(void)
 
 #define FLASH_MS 1200
 
-// 启动反馈：标题栏闪现 1.2s（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
-static void FlashLaunch(BOOL ok, const WCHAR *name)
+// 标题栏闪现一条消息 1.2s（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
+static void FlashMsg(const WCHAR *text)
 {
-    swprintf(g_flashText, 80, ok ? L"已启动: %s" : L"启动失败: %s", name);
+    wcsncpy_s(g_flashText, 80, text, _TRUNCATE);
     g_flashAt = GetTickCount();
     InvalidateTitle();
+}
+
+static void FlashLaunch(BOOL ok, const WCHAR *name)
+{
+    WCHAR t[80];
+    swprintf(t, 80, ok ? L"已启动: %s" : L"启动失败: %s", name);
+    FlashMsg(t);
 }
 
 static BOOL FlashActive(void)
@@ -2686,6 +2811,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_dlgOpen || g_pressCell >= 0) return 0;   // 对话框/拖动排序进行中：不抢键
+        if ((w == 'C' || w == 'V') && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+            // Ctrl+C/V：复制悬停格 / 粘贴到悬停格（空格也填），无悬停格则追加
+            ClipItem ci;
+            if (w == 'C') {
+                int ii = ItemAtView(g_hoverCell);
+                if (ii >= 0 && !IsBlank(ii)) {
+                    ItemToClip(&g_items[ii], &ci);
+                    if (ClipSet(&ci)) {              // 剪贴板被占用则不反馈（用户重试即可）
+                        WCHAR t[80];
+                        swprintf(t, 80, L"已复制: %s", g_items[ii].name);
+                        FlashMsg(t);
+                    }
+                }
+                return 0;
+            }
+            if (!ClipGet(&ci)) { FlashMsg(L"剪贴板没有可粘贴的内容"); return 0; }
+            int ii = ItemAtView(g_hoverCell);
+            if (ii >= 0) PasteItemAt(ii, &ci);
+            else PasteItemNew(&ci);
+            WCHAR t[80];
+            swprintf(t, 80, L"已粘贴: %s", ci.name);
+            FlashMsg(t);
+            return 0;
+        }
         if (w >= '1' && w <= '9' && !g_filter[0]) {    // 数字键：启动当前组第 N 格（过滤中数字归搜索）
             int ii = ItemAtView((int)(w - '1'));
             if (ii >= 0 && !IsBlank(ii))
@@ -2936,6 +3085,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     ScaleMetrics();
     LoadConfig();
     InitAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）；路径过期则自愈重写
+    g_clipFmt = RegisterClipboardFormatW(L"KKLauncherItem");   // 私有剪贴板格式；失败则 Ctrl+V 只认纯文本
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof wc);
