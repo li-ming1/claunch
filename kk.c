@@ -1729,8 +1729,14 @@ static void PaintTitle(HDC dc)
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
     SelectObject(dc, old);
+    // 按钮悬停底色：悬停文字已给语义，底色给"这是个按钮"的按键感（无反馈像死区）
+    if (g_hoverBtn == 1) { RECT r = BtnRect(1); FillRect(dc, &r, g_brCellHi); }
+    if (g_hoverBtn == 2) { RECT r = BtnRect(2); FillRect(dc, &r, g_brCellHi); }
     DrawPinGlyph(dc, BtnRect(1), g_pinned);
     DrawCloseGlyph(dc, BtnRect(2));
+    // 标题栏底部 1px 分隔线：与侧栏右边线连贯，把头部与内容区从视觉上分开
+    RECT ln = { 0, g_titleH - 1, g_cw, g_titleH };
+    FillRect(dc, &ln, g_brLine);
 }
 
 static void PaintGrid(HDC dc, const RECT *clip)
@@ -1762,6 +1768,12 @@ static void PaintGrid(HDC dc, const RECT *clip)
             if (hov) SelectObject(dc, g_brCellHi);
             Rectangle(dc, r.left, r.top, r.right, r.bottom);
             if (hov) SelectObject(dc, g_brCell);
+            if (hov) {
+                // 悬停格强调色内边框：底色变浅之外再给一圈 1px 焦点环，扫视时一眼锁定
+                RECT hr = r;
+                InflateRect(&hr, -1, -1);
+                FrameRect(dc, &hr, g_brAccent);
+            }
             if (g_dragging && (vi == g_pressCell ||
                                (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
                 RECT r2 = r;                        // 拖动源/落点高亮
