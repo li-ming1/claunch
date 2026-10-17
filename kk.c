@@ -1247,7 +1247,7 @@ static BOOL HoverFromPoint(POINT p)
 }
 
 // ---------------------------------------------------------------- 悬停小卡片
-// 悬停格子/分组时在目标上方浮一张小卡片显示程序名/组名（类工具提示）。
+// 悬停格子/分组时在目标周围自动挑合适的位置浮出卡片，显示程序名/组名（类工具提示）。
 // 位置锚定悬停目标而非光标：光标每帧都在动，锚光标意味着每帧重算+重绘；
 // 锚目标则只在悬停目标变化时算一次（GetDC + DT_CALCRECT 量宽），
 // 绘制阶段只读缓存的状态，零分配、零新 GDI 对象（复用面板刷/线刷/字体）
@@ -1275,12 +1275,27 @@ static void UpdateCard(void)
     int w = tr.right - tr.left + S_(16);
     int h = tr.bottom - tr.top + S_(8);
     if (w > g_cw - S_(8)) w = g_cw - S_(8);     // 超长名：收窄 + DT_END_ELLIPSIS
-    int x = (anc.left + anc.right) / 2 - w / 2;
-    int y = anc.top - h - S_(4);                // 默认浮在目标上方
-    if (y < g_titleH) y = anc.bottom + S_(4);   // 上方是标题栏/首行：改放下方
-    if (x < S_(4)) x = S_(4);
-    if (x + w > g_cw - S_(4)) x = g_cw - S_(4) - w;
-    if (y + h > g_ch - S_(4)) y = g_ch - S_(4) - h;
+    // 上/下/左/右四个候选位置，完全放得下的里面取剩余空间最大的；
+    // 一个都放不下（窗口被拉到极小）时也取空间最大的方向，交给钳制兜底
+    int gap  = S_(4);
+    int minX = S_(4), minY = g_titleH;              // 边界：不遮标题栏、不出窗口
+    int maxX = g_cw - S_(4), maxY = g_ch - S_(4);
+    int cx = (anc.left + anc.right) / 2, cy = (anc.top + anc.bottom) / 2;
+    int X[4] = { cx - w / 2,        cx - w / 2,        anc.right + gap, anc.left - gap - w };
+    int Y[4] = { anc.top - gap - h, anc.bottom + gap,  cy - h / 2,      cy - h / 2 };
+    int nd[4] = { h, h, w, w };                     // 上下占高 h，左右占宽 w
+    int sp[4] = { anc.top - minY, maxY - anc.bottom, maxX - anc.right, anc.left - minX };
+    int pick = 0;
+    for (int i = 1; i < 4; i++) {
+        BOOL ifit = sp[i] >= nd[i], pfit = sp[pick] >= nd[pick];
+        if (ifit && !pfit) pick = i;                         // 这个放得下、已选中的放不下
+        else if (ifit == pfit && sp[i] > sp[pick]) pick = i;  // 都放得下/都放不下：空间大的优先
+    }
+    int x = X[pick], y = Y[pick];
+    if (x < minX) x = minX;
+    if (x + w > maxX) x = maxX - w;
+    if (y < minY) y = minY;
+    if (y + h > maxY) y = maxY - h;
     wcsncpy_s(g_cardText, 80, txt, _TRUNCATE);
     g_cardRect.left = x; g_cardRect.top = y;
     g_cardRect.right = x + w; g_cardRect.bottom = y + h;
