@@ -14,9 +14,11 @@ if not exist "%VSD%" (
 )
 call "%VSD%" -arch=x64 -no_logo
 if errorlevel 1 exit /b 1
-cl /nologo /std:c11 /W4 /O1 /GL /MT /Zi /utf-8 kk.c ^
+cl /nologo /std:c11 /W4 /O1 /sdl /GL /MT /Zi /utf-8 kk.c ^
     /link /LTCG /OPT:REF /OPT:ICF /MAP /OUT:kk.exe /MANIFEST:EMBED /MANIFESTINPUT:kk.manifest ^
     /DELAYLOAD:comdlg32.dll delayimp.lib user32.lib
+rem /sdl turns on extra security hardening (stack pointer init in guarded
+rem frames, stricter warnings-as-errors); compiles clean, no measurable cost.
 rem /MAP writes kk.map (RVA -> symbol): kk_crash.txt records RVAs, and kk.map
 rem is what names them without a debugger.
 rem /O1 over /O2, and the two /OPT flags, are what keep the image small: /Zi
