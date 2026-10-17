@@ -668,20 +668,77 @@ static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
     return dot && !_wcsicmp(dot, ext);
 }
 
+// 读注册表 DefaultIcon 值并提取图标。值形如 "路径[,索引]"（负索引 = 资源 ID），
+// 引号包路径也认；REG_EXPAND_SZ 的环境变量由 RegGetValueW 自动展开
+static HICON IconFromDefaultKey(const WCHAR *subkey, int want)
+{
+    WCHAR val[600];
+    DWORD cb = sizeof val;
+    if (RegGetValueW(HKEY_CLASSES_ROOT, subkey, NULL, RRF_RT_REG_SZ,
+                     NULL, val, &cb) != ERROR_SUCCESS || !val[0])
+        return NULL;
+    int idx = 0;
+    WCHAR *icon = val;
+    if (*icon == L'"') {                       // "带引号的路径",索引
+        WCHAR *e = wcschr(icon + 1, L'"');
+        if (!e) return NULL;
+        *e = 0;
+        if (e[1] == L',') idx = _wtoi(e + 2);
+        icon = icon + 1;
+    } else {
+        WCHAR *c = wcsrchr(icon, L',');        // 从右往左找逗号（路径可能含逗号）
+        if (c && c[1]) { *c = 0; idx = _wtoi(c + 1); }
+    }
+    if (!icon[0]) return NULL;
+    return IconFromImage(icon, want, idx);
+}
+
+// 文档类型关联图标：扩展名 → ProgID → DefaultIcon（.docx→Word、.txt→txtfile…）。
+// 手工走注册表，不碰 SHGetFileInfo 的 shell 图标管线（文件头内存红线）
+static HICON AssocIcon(const WCHAR *path, int want)
+{
+    const WCHAR *ext = wcsrchr(path, L'.');
+    if (!ext || wcslen(ext) < 2 || wcslen(ext) > 30) return NULL;
+    WCHAR progid[128];
+    DWORD cb = sizeof progid;
+    if (RegGetValueW(HKEY_CLASSES_ROOT, ext, NULL, RRF_RT_REG_SZ,
+                     NULL, progid, &cb) != ERROR_SUCCESS || !progid[0])
+        return NULL;
+    WCHAR key[300];
+    if (swprintf(key, 300, L"%s\\DefaultIcon", progid) >= 300) return NULL;
+    return IconFromDefaultKey(key, want);
+}
+
+// 文件夹图标：Directory\DefaultIcon（系统真实文件夹），失败退手绘琥珀文件夹
+static HICON FolderIcon(int want)
+{
+    HICON h = IconFromDefaultKey(L"Directory\\DefaultIcon", want);
+    return h ? h : MakeFolderIcon(want);
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
     DWORD a = GetFileAttributesW(path);
     if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
-        return MakeFolderIcon(want);                        // 不进 shell 图标管线
+        return FolderIcon(want);                // 不进 shell 图标管线
+    HICON h = NULL;
     if (HasExt(path, L".lnk")) {
         LnkInfo lnk;
-        if (!ParseLnk(path, &lnk)) return NULL;             // 坏 .lnk：通用图标
-        HICON h = NULL;
-        if (lnk.iconLoc[0]) h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
-        if (!h && lnk.target[0]) h = IconFromImage(lnk.target, want, 0);
-        return h;
+        if (ParseLnk(path, &lnk)) {
+            if (lnk.iconLoc[0]) h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
+            if (!h && lnk.target[0]) {
+                DWORD ta = GetFileAttributesW(lnk.target);
+                if (ta != INVALID_FILE_ATTRIBUTES && (ta & FILE_ATTRIBUTE_DIRECTORY))
+                    h = FolderIcon(want);       // 指向文件夹的快捷方式
+                else
+                    h = IconFromImage(lnk.target, want, 0);
+            }
+        }
+    } else {
+        h = IconFromImage(path, want, 0);
     }
-    return IconFromImage(path, want, 0);
+    if (!h) h = AssocIcon(path, want);          // 文档类型：注册表关联图标兜底
+    return h;
 }
 
 static void DropIcon(int i)
