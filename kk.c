@@ -11,9 +11,9 @@
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
 // 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
 // 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
-// 常驻内存红线（实测）：不调 SHGetFileInfo、不走 ShellExecute 常规启动
-// （各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开 IME——这三条
-// 任何一条破防都会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
+// 常驻内存红线（实测）：SHGetFileInfo 只作图标轻量链路失败后的兜底、不走
+// ShellExecute 常规启动（各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开
+// IME——破防会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -449,9 +449,11 @@ static int BtnAt(POINT p)
 }
 
 // ---------------------------------------------------------------- 图标（按需加载）
-// 只用 user32 的 PrivateExtractIconsW 直接读文件资源，失败再退 ExtractIconExW /
-// 资源映射；绝不调 SHGetFileInfo——它会拖来 shell 图标管线（shell.dll、PROPSYS、
-// WindowsCodecs、Windows.Storage…约 15MB 映像），加载后常驻不卸载。
+// 首选轻量链：PrivateExtractIconsW 直接读文件资源 → 失败再 ExtractIconExW /
+// 资源映射 → 注册表关联链（扩展名→ProgID→DefaultIcon）→ 全部失败才
+// SHGetFileInfo（资源管理器同款；会拖来 shell 图标管线 shell.dll、PROPSYS、
+// WindowsCodecs、Windows.Storage…约 15MB 映像且常驻，故只做最后兜底，
+// 代价仅由轻量链确实解不出的文件类型承担，如打包应用关联）。
 typedef int (WINAPI *PFN_PrivateExtractIconsW)(LPCWSTR, int, int, int,
                                                HICON *, int *, int, int);
 static PFN_PrivateExtractIconsW pExtractIcons = NULL;
@@ -731,13 +733,26 @@ static HICON FolderIcon(const WCHAR *path, int want)
     return h ? h : MakeFolderIcon(want);
 }
 
+// 兜底：SHGetFileInfo 取资源管理器同款图标。会拉起 shell 图标管线（文件头内存
+// 红线所禁），故只在前面的轻量链路全部失败时才走到——代价仅由确实解不出的
+// 文件类型承担（如 Win11 新版记事本的打包应用关联、本机无关联的 .doc）。
+// 返回的句柄归我们所有（ownIcon=TRUE），DropIcon 时销毁
+static HICON ShellIcon(const WCHAR *path)
+{
+    SHFILEINFOW fi = { 0 };
+    if (SHGetFileInfoW(path, 0, &fi, sizeof fi, SHGFI_ICON | SHGFI_LARGEICON) && fi.hIcon)
+        return fi.hIcon;                        // 32px：绘制时 DrawIconEx 缩到格宽
+    return NULL;
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
-    DWORD a = GetFileAttributesW(path);
-    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
-        return FolderIcon(path, want);          // 不进 shell 图标管线
     HICON h = NULL;
-    if (HasExt(path, L".lnk")) {
+    DWORD a = GetFileAttributesW(path);
+    BOOL isDir = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    if (isDir) {
+        h = FolderIcon(path, want);
+    } else if (HasExt(path, L".lnk")) {
         LnkInfo lnk;
         if (ParseLnk(path, &lnk)) {
             if (lnk.iconLoc[0]) h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
@@ -745,14 +760,17 @@ static HICON IconFor(const WCHAR *path, int want)
                 DWORD ta = GetFileAttributesW(lnk.target);
                 if (ta != INVALID_FILE_ATTRIBUTES && (ta & FILE_ATTRIBUTE_DIRECTORY))
                     h = FolderIcon(lnk.target, want);   // 指向文件夹的快捷方式
-                else
+                else {
                     h = IconFromImage(lnk.target, want, 0);
+                    if (!h) h = ShellIcon(lnk.target);  // 目标：资源管理器同款
+                }
             }
         }
     } else {
         h = IconFromImage(path, want, 0);
     }
     if (!h) h = AssocIcon(path, want);          // 文档类型：注册表关联图标兜底
+    if (!h) h = ShellIcon(path);                // 最终兜底：资源管理器同款
     return h;
 }
 
