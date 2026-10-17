@@ -137,7 +137,6 @@ static int  g_scroll = 0;       // 格子区滚动（像素）
 static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 
 static int  g_hoverCell = -1, g_hoverGroup = -1, g_hoverBtn = 0; // btn: 1 钉 2 关
-static int  g_hoverItem = -1;   // 悬停格对应的全局条目下标（空格/空白为 -1），随 HoverFromPoint 刷新
 static WCHAR g_hoverText[80];
 static BOOL  g_cardOn = FALSE;  // 悬停小卡片可见（悬停格子/分组时浮在其上方）
 static RECT  g_cardRect;        // 卡片区域：悬停目标变化时重算，绘制只读
@@ -182,7 +181,7 @@ static void InvalidateTitle(void);
 static int  PopupAt(HMENU m);
 static int  Rows(void);
 static int  DefaultGroup(void);
-static void UpdateHoverText(void);
+static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 
 // 关闭按钮 / WM_CLOSE：有托盘图标时只隐藏到托盘，托盘图标不可用才真正退出
@@ -1196,41 +1195,41 @@ static void MakeFontsAndBrushes(void)
 }
 
 // ---------------------------------------------------------------- 悬停文字
-// 设置悬停文字（顺带置激活态）。原来 6 处各写一遍 wcsncpy_s，收拢到这里
-static void SetHover(const WCHAR *s, BOOL active)
+// 设置悬停文字（顺带置激活态），返回文字/激活态是否变化。
+// 原来 6 处各写一遍 wcsncpy_s，收拢到这里；比较放在写入前完成，
+// 调用方不必再拷一份旧文字来对比（80+ 字符的超长文字按显示得出的
+// 前 79 字符比较，最差情况是多重绘一次标题栏，像素不变）
+static BOOL SetHover(const WCHAR *s, BOOL active)
 {
+    BOOL chg = active != g_hoverActive || wcscmp(s, g_hoverText) != 0;
     wcsncpy_s(g_hoverText, 80, s, _TRUNCATE);
     g_hoverActive = active;
+    return chg;
 }
 
-static void UpdateHoverText(void)
+// 刷新悬停文字，返回是否变化（没变就不重绘标题栏）
+static BOOL UpdateHoverText(void)
 {
     if (g_hoverCell >= 0) {
-        g_hoverItem = ItemAtView(g_hoverCell);
-        if (g_hoverItem >= 0) {
-            if (IsBlank(g_hoverItem)) {
-                SetHover(L"空位：把程序拖进来", TRUE);
-            } else {
-                const Item *it = &g_items[g_hoverItem];
-                SetHover(it->tip[0] ? it->tip : it->name, TRUE);
-            }
-            return;
+        int ii = ItemAtView(g_hoverCell);
+        if (ii >= 0) {
+            if (IsBlank(ii)) return SetHover(L"空位：把程序拖进来", TRUE);
+            const Item *it = &g_items[ii];
+            return SetHover(it->tip[0] ? it->tip : it->name, TRUE);
         }
     }
-    g_hoverItem = -1;
-    if (g_hoverGroup >= 0) { SetHover(g_groups[g_hoverGroup].name, TRUE); return; }
+    if (g_hoverGroup >= 0) return SetHover(g_groups[g_hoverGroup].name, TRUE);
     switch (g_hoverBtn) {
-    case 1: SetHover(g_pinned ? L"取消定住" : L"定住窗口", TRUE); return;
-    case 2: SetHover(L"退出", TRUE); return;
-    default: break;
+    case 1: return SetHover(g_pinned ? L"取消定住" : L"定住窗口", TRUE);
+    case 2: return SetHover(L"退出", TRUE);
     }
-    if (RealCount() == 0) { SetHover(L"把程序拖进格子里", FALSE); return; }
-    SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
+    if (RealCount() == 0) return SetHover(L"把程序拖进格子里", FALSE);
+    return SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
 }
 
 // 返回悬停文字/激活态是否变化（没变就不重绘标题栏）。
 // 悬停目标没变时直接返回：鼠标在同一个格子上滑动是最高频的事件，
-// 此时不该再做 160 字节的文字拷贝/回写/比较
+// 此时连文字比较都不做
 static BOOL HoverFromPoint(POINT p)
 {
     int nc = CellAt(p);
@@ -1238,12 +1237,8 @@ static BOOL HoverFromPoint(POINT p)
     int nb = (nc >= 0 || ng >= 0) ? 0 : BtnAt(p);
     if (nc == g_hoverCell && ng == g_hoverGroup && nb == g_hoverBtn)
         return FALSE;
-    WCHAR oldText[80];
-    BOOL oldAct = g_hoverActive;
-    wcsncpy_s(oldText, 80, g_hoverText, _TRUNCATE);
     g_hoverCell = nc; g_hoverGroup = ng; g_hoverBtn = nb;
-    UpdateHoverText();
-    return oldAct != g_hoverActive || wcscmp(oldText, g_hoverText) != 0;
+    return UpdateHoverText();
 }
 
 // ---------------------------------------------------------------- 悬停小卡片
@@ -1477,7 +1472,9 @@ static void PaintGrid(HDC dc, const RECT *clip)
     SelectObject(dc, ob); SelectObject(dc, op);
 }
 
-static void PaintWindow(HDC dc, BOOL buffered)
+// clip = 双缓冲路径的更新区（就是 memDC 当前的裁剪区，WM_PAINT 直接传入，
+// 不必每次绘制再 GetClipBox 问一遍）；NULL = 直绘兜底，全画
+static void PaintWindow(HDC dc, const RECT *clip)
 {
     RECT rc = { 0, 0, g_cw, g_ch };
     FillRect(dc, &rc, g_brBG);           // DC 带裁剪时本条只碰脏区
@@ -1485,20 +1482,15 @@ static void PaintWindow(HDC dc, BOOL buffered)
     HFONT old = (HFONT)SelectObject(dc, g_font);
     SetBkMode(dc, TRANSPARENT);
 
-    // 双缓冲时才做段级/行级剔除（脏区没碰到的段落，缓冲里就是上一帧）；
-    // 直绘兜底路径没有可靠缓冲，必须全画
-    RECT clip, hit;
-    const RECT *cl = NULL;
-    if (buffered && GetClipBox(dc, &clip) != ERROR) cl = &clip;
-
+    RECT hit;
     RECT sr = { 0, 0, g_sideW, g_ch };
     RECT tr = { 0, 0, g_cw, g_titleH };
     RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-    if (!cl || IntersectRect(&hit, &sr, cl)) PaintSidebar(dc, cl);
-    if (!cl || IntersectRect(&hit, &tr, cl)) PaintTitle(dc);
-    if (!cl || IntersectRect(&hit, &gr, cl)) PaintGrid(dc, cl);
+    if (!clip || IntersectRect(&hit, &sr, clip)) PaintSidebar(dc, clip);
+    if (!clip || IntersectRect(&hit, &tr, clip)) PaintTitle(dc);
+    if (!clip || IntersectRect(&hit, &gr, clip)) PaintGrid(dc, clip);
     // 小卡片最后画：压在侧栏/标题/格子之上；脏区不碰卡片时整段跳过
-    if (g_cardOn && (!cl || IntersectRect(&hit, &g_cardRect, cl))) DrawCard(dc);
+    if (g_cardOn && (!clip || IntersectRect(&hit, &g_cardRect, clip))) DrawCard(dc);
     SelectObject(dc, old);
 }
 
@@ -2169,13 +2161,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
             // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
             IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
-            PaintWindow(g_memDC, TRUE);
+            PaintWindow(g_memDC, &rc);     // 裁剪区即 rc：直接传，省一次 GetClipBox
             SelectClipRgn(g_memDC, NULL);
             BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
                    g_memDC, rc.left, rc.top, SRCCOPY);
             g_memFresh = FALSE;
         } else {
-            PaintWindow(dc, FALSE);      // 缓冲不可用：直接绘制
+            PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
         }
         EndPaint(h, &ps);
         return 0;
@@ -2264,7 +2256,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (g_hoverCell >= 0) {
-            if (g_hoverItem >= 0 && !IsBlank(g_hoverItem)) {
+            int ii = ItemAtView(g_hoverCell);
+            if (ii >= 0 && !IsBlank(ii)) {
                 // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
                 g_pressCell = g_hoverCell;
                 g_pressPt = p;
@@ -2336,7 +2329,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HoverFromPoint(p);
         RefreshCard();
         if (g_hoverCell >= 0) {
-            if (g_hoverItem >= 0 && !IsBlank(g_hoverItem)) ShowCellMenu(g_hoverItem);   // 空格不给菜单（当成空白区）
+            int ii = ItemAtView(g_hoverCell);     // 空格不给菜单（当成空白区）
+            if (ii >= 0 && !IsBlank(ii)) ShowCellMenu(ii);
         } else if (g_hoverGroup >= 0) {
             ShowGroupMenu(g_hoverGroup);
         } else if (p.x < g_sideW && p.y >= g_titleH) {
