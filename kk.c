@@ -7,7 +7,7 @@
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
-// 虚拟项图标状态化（回收站空/满）：唤醒与可见期间周期重取，与桌面同步翻转。
+// 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
@@ -227,6 +227,8 @@ static DWORD g_outSince = 0;
 static DWORD g_wakeAt = 0;
 static int   g_alpha = 255, g_fadeDir = 0;
 static BOOL  g_dlgOpen = FALSE;
+static BOOL  g_menuOpen = FALSE;   // TrackPopupMenu 弹着（模态循环里 WM_TIMER 仍会派发：
+                                   // 心跳里的 shell 调用此刻一律回避，防卡 UI）
 
 static HHOOK g_hook = NULL;
 static HANDLE g_hookH;              // 钩子专用线程：回调不再与绘制抢 UI 线程
@@ -950,10 +952,14 @@ static BOOL IsVirtualPath(const WCHAR *path)
 
 // shell 虚拟项的图标随状态变化（回收站空/满——实测 SHGFI_PIDL 走 shell
 // 图标处理器，与桌面同款状态感知：桶内 17 项时与注册表 full 图标零像素差）。
-// 缓存一次就冻结，故面板可见期间定期重取：先取新再换旧，绘制无空窗。
-// 图标管线在首次加载时已驻留，重取只是热路径调用（~1ms），无新增内存账
+// 缓存一次就冻结，故在唤醒路径重取：先取新再换旧，绘制无空窗。
+// 刻意不做心跳周期刷新——SHGetFileInfo 在 shell 忙时同步阻塞 UI 线程，
+// 定时触发等于埋雷（托盘菜单打开期间卡死即此）；唤醒是用户主动动作，
+// 时机安全，且图标管线首次加载已驻留、单次 ~1ms 无新增内存账
 static void RefreshVirtualIcons(void)
 {
+    if (g_menuOpen || g_dlgOpen) return;   // 菜单/对话框模态期间回避 shell 调用：
+                                           // SHGetFileInfo 在 shell 忙时同步阻塞，会卡 UI
     for (int i = 0; i < g_nItems; i++) {
         if (!IsVirtualPath(g_items[i].path)) continue;
         HICON h = NamespaceIcon(g_items[i].path);
@@ -1680,11 +1686,20 @@ static void PasteItemNew(const ClipItem *ci)
 // ---------------------------------------------------------------- 显示/隐藏
 static void ForceForeground(HWND h)
 {
-    DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
-    DWORD me = GetCurrentThreadId();
-    if (fg != me && fg) AttachThreadInput(fg, me, TRUE);
+    HWND fg = GetForegroundWindow();
+    // 前台线程挂死时 AttachThreadInput 会无限等（输入队列同步要等对方处理）——
+    // 托盘右键由此卡死整条 UI 线程。挂死窗口绕过附加，直上 SetForegroundWindow
+    if (fg && fg != h && !IsHungAppWindow(fg)) {
+        DWORD fgTid = GetWindowThreadProcessId(fg, NULL);
+        DWORD me = GetCurrentThreadId();
+        if (fgTid != me) {
+            AttachThreadInput(fgTid, me, TRUE);
+            SetForegroundWindow(h);
+            AttachThreadInput(fgTid, me, FALSE);
+            return;
+        }
+    }
     SetForegroundWindow(h);
-    if (fg != me && fg) AttachThreadInput(fg, me, FALSE);
 }
 
 // 淡入就位（唤醒与首启共用）：透明度从 0 起、淡入定时器启动、移出宽限清零
@@ -2811,7 +2826,9 @@ static int PopupAt(HMENU m)
     POINT p;
     GetCursorPos(&p);
     ForceForeground(g_hwnd);
+    g_menuOpen = TRUE;                 // 模态循环里 WM_TIMER 照派：心跳 shell 调用回避
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, NULL);
+    g_menuOpen = FALSE;
     DestroyMenu(m);
     return cmd;
 }
@@ -3234,7 +3251,9 @@ static void OnMouseMove(HWND h, LPARAM l)
         }
         if (g_dragGroup) {
             int ng = GroupAt(p);
-            if (ng != g_dropGroup) {
+            // 行间隙/首行上方/末行下方 GroupAt=-1：保持上一个目标行（粘性）——
+            // 向上拖出首行上方是自然的“移到最顶”手势，不能把目标冲掉
+            if (ng >= 0 && ng != g_dropGroup) {
                 InvalidateGroups(g_dropGroup, ng);   // 行区间一个外接矩形
                 g_dropGroup = ng;
             }
@@ -3332,7 +3351,7 @@ static BOOL OnLButtonUp(HWND h)
         BOOL wasDrag = g_dragGroup;
         g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
         ReleaseCapture();
-        if (wasDrag && to > 0 && to != from) MoveGroup(from, to);
+        if (wasDrag && to >= 0 && to != from) MoveGroup(from, to);
         return TRUE;
     }
     if (g_pressCell < 0) return FALSE;
@@ -3887,10 +3906,6 @@ static void InitOleDrop(HWND h)
 static void OnTimer(HWND h, WPARAM w)
 {
     if (w == TIMER_HIDE) {
-        // 虚拟项图标周期对时（25 拍 ≈ 3s）：面板开着时回收站空/满也翻转。
-        // 只碰 :: 项，单次 ~1ms
-        static int s_virtTick = 0;
-        if (++s_virtTick >= 25) { s_virtTick = 0; RefreshVirtualIcons(); }
         if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
         if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
         if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
