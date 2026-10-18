@@ -280,6 +280,7 @@ static void BeginHide(BOOL force);
 static void ReleaseMemBuffer(void);   // 双缓冲释放：隐藏即放，唤醒首绘重建
 static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
 static void HotkeyName(WCHAR *out, size_t cch);   // 唤醒快捷键的可读名（定义在 OnCreate 区）
+static void ModsName(WCHAR *out, size_t cch, UINT mods);   // 仅修饰键部分（捕获框预览用）
 static BOOL ApplyHotkey(HWND h);                  // 注册/更换唤醒快捷键（原子替换语义）
 static void SaveConfig(void);
 static void InvalidateTitle(void);
@@ -1696,6 +1697,7 @@ static void SaveConfig(void)
     RECT r;
     GetWindowRect(g_hwnd, &r);
     FmtLine(L"# claunch 桌面格子配置 (UTF-8)\r\n");
+    FmtLine(L"# Hotkey=<mods> <vk>：唤醒快捷键（mods: 1=Alt 2=Ctrl 4=Shift 可相加；vk=虚拟键码）\r\n");
     FmtLine(L"[Main]\r\n");
     FmtLine(L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
@@ -3014,24 +3016,38 @@ static void TrayRemove(void)
 static UINT g_capMods, g_capVk;
 static BOOL  g_capOk;
 
+// 实时修饰键状态（捕获框预览用）
+static UINT LiveMods(void)
+{
+    UINT mods = 0;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+    if (GetAsyncKeyState(VK_MENU) & 0x8000)    mods |= MOD_ALT;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   mods |= MOD_SHIFT;
+    return mods;
+}
+
+static BOOL IsModVk(UINT vk)
+{
+    return vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
+           vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL;
+}
+
 static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_KEYDOWN: {
-        UINT mods = 0;
-        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
-        if (GetAsyncKeyState(VK_MENU) & 0x8000)    mods |= MOD_ALT;
-        if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   mods |= MOD_SHIFT;
+        UINT mods = LiveMods();
         UINT vk = (UINT)w;
         if (vk == VK_ESCAPE && !mods) { g_capOk = FALSE; DestroyWindow(h); return 0; }
-        // 修饰键/CapsLock：继续等主键（按住 Ctrl 不放再按 K 是标准手势）
-        if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
-            vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) return 0;
+        if (IsModVk(vk)) { InvalidateRect(h, NULL, FALSE); return 0; }   // 修饰键：刷新预览
         if (!(mods & (MOD_CONTROL | MOD_ALT))) return 0;   // 裸字母/功能键不收
         g_capMods = mods; g_capVk = vk; g_capOk = TRUE;
         DestroyWindow(h);
         return 0;
     }
+    case WM_KEYUP:
+        if (IsModVk((UINT)w)) InvalidateRect(h, NULL, FALSE);   // 松修饰键：预览回退
+        return 0;
     case WM_CLOSE:   DestroyWindow(h);   return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc);
@@ -3043,12 +3059,27 @@ static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
         GetClientRect(h, &rc);
         SetBkMode(dc, TRANSPARENT);
         HFONT old = (HFONT)SelectObject(dc, g_font);
+        SetTextColor(dc, C_DIM);
+        RECT tr0 = { S_(20), S_(14), rc.right - S_(20), S_(38) };
+        WCHAR cur[80];
+        HotkeyName(cur, 80);
+        WCHAR line0[96];
+        swprintf(line0, 96, L"当前唤醒快捷键：%s", cur);
+        DrawTextW(dc, line0, -1, &tr0,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        // 预览行：实时修饰键 + 省略号（主键未按）——按着修饰键就能看到
+        // 将要录用的组合，不用盲按
+        UINT mods = LiveMods();
+        WCHAR prev[48], pv[24];
+        ModsName(pv, 24, mods);
+        if (pv[0]) swprintf(prev, 48, L"%s…", pv);
+        else       wcscpy_s(prev, 48, L"（等待按键）");
         SetTextColor(dc, C_TEXT);
-        RECT tr = { S_(20), S_(26), rc.right - S_(20), S_(52) };
-        DrawTextW(dc, L"请按下新的唤醒快捷键", -1, &tr,
+        RECT tr1 = { S_(20), S_(44), rc.right - S_(20), S_(76) };
+        DrawTextW(dc, prev, -1, &tr1,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SetTextColor(dc, C_DIM);
-        RECT tr2 = { S_(20), S_(58), rc.right - S_(20), S_(88) };
+        RECT tr2 = { S_(20), S_(88), rc.right - S_(20), S_(112) };
         DrawTextW(dc, L"需要包含 Ctrl 或 Alt；按 Esc 取消", -1, &tr2,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, old);
@@ -3065,7 +3096,7 @@ static BOOL RunHotkeyCapture(HWND owner, UINT *mods, UINT *vk)
     g_capOk = FALSE;
     RECT or_;
     GetWindowRect(owner, &or_);
-    int cw = S_(380), chh = S_(112);
+    int cw = S_(380), chh = S_(132);
     HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
                              CAP_CLASS, L"设置唤醒快捷键",
                              WS_POPUP | WS_CLIPCHILDREN,
@@ -3410,13 +3441,19 @@ static DWORD WINAPI HookThread(LPVOID arg)
 // 顺序与 switch 分发表一致，便于对照
 
 // ---------------------------------------------------------------- 唤醒快捷键（可配置）
-static void HotkeyName(WCHAR *out, size_t cch)
+static void ModsName(WCHAR *out, size_t cch, UINT mods)
 {
     WCHAR t[24] = L"";
-    if (g_hotMods & MOD_CONTROL) wcscat_s(t, 24, L"Ctrl+");
-    if (g_hotMods & MOD_ALT)     wcscat_s(t, 24, L"Alt+");
-    if (g_hotMods & MOD_SHIFT)   wcscat_s(t, 24, L"Shift+");
-    WCHAR key[16];
+    if (mods & MOD_CONTROL) wcscat_s(t, 24, L"Ctrl+");
+    if (mods & MOD_ALT)     wcscat_s(t, 24, L"Alt+");
+    if (mods & MOD_SHIFT)   wcscat_s(t, 24, L"Shift+");
+    wcsncpy_s(out, cch, t, _TRUNCATE);
+}
+
+static void HotkeyName(WCHAR *out, size_t cch)
+{
+    WCHAR t[24], key[16];
+    ModsName(t, 24, g_hotMods);
     UINT vk = g_hotVk;
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
         key[0] = (WCHAR)vk; key[1] = 0;
