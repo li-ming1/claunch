@@ -55,6 +55,7 @@
 #define WM_APP_WAKE     (WM_APP + 1)
 #define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板置顶且未聚焦时也可用）
 #define WM_APP_WAKE_CAND (WM_APP + 4)  // 钩子转发的“疑似桌面双击”候选，UI 线程确认后再唤醒
+#define WM_APP_DRAGWAKE  (WM_APP + 5)  // 钩子转发的“拖动进入面板静置区”：面板就地弹回（不抢前台）
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
 #define HOTKEY_ID       1
@@ -2849,6 +2850,7 @@ static void ShowTitleMenu(void)
 // ---------------------------------------------------------------- 全局双击唤醒
 static DWORD s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
+static BOOL   s_dragInRect;     // 拖动光标是否在面板静置区内（只报“从区外进入”的沿口）
 static DWORD s_dblClick;      // 双击间隔/双击容差：钩子线程启动时读一次——
 static int    s_dblX, s_dblY; // 全局输入路径上每次点击都问，不值当
 
@@ -2941,6 +2943,24 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                              MAKELPARAM((WORD)p->pt.x, (WORD)p->pt.y));
             s_lastClick = now;
             s_lastPt = p->pt;
+        } else if (wParam == WM_MOUSEMOVE) {
+            // 拖放唤醒：按住左键拖动、光标从区外进入面板静置区（面板隐藏时）——
+            // 就地弹回面板（WM_APP_DRAGWAKE → SW_SHOWNA 不抢拖放源的前台），
+            // 让落点重新可投递。只在进入沿口发一次；普通移动/悬停零打扰。
+            // GetWindowRect 是窗口管理器查询不发消息，UI 线程卡死也不拖累钩子
+            MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+            BOOL armed = !g_dlgOpen && !IsWindowVisible(g_hwnd) &&
+                         (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+            if (armed) {
+                RECT r;
+                GetWindowRect(g_hwnd, &r);
+                BOOL inside = PtInRect(&r, p->pt) != 0;
+                if (inside && !s_dragInRect)
+                    PostMessageW(g_hwnd, WM_APP_DRAGWAKE, 0, 0);
+                s_dragInRect = inside;
+            } else {
+                s_dragInRect = FALSE;
+            }
         } else if (wParam == WM_MOUSEWHEEL) {
             // 接管条件收到最窄，缺一不可：
             //   面板可见（否则没有转发的意义）、面板置顶（这一像素确实属于面板，
@@ -3714,12 +3734,30 @@ static HRESULT __stdcall DtQueryInterface(IDropTarget *self, REFIID riid, void *
 static ULONG __stdcall DtAddRef(IDropTarget *self)  { UNREF(self); return 2; }
 static ULONG __stdcall DtRelease(IDropTarget *self) { UNREF(self); return 2; }
 
+// 拖放悬停期间面板必须稳住：拖放光标进入时若正淡出（移出检测在拖放开始
+// 前就动了手），立即就地回满——SW_SHOWNA 不抢拖放源的焦点（前台一抢拖放
+// 就断）。完全隐藏的情况走钩子的 WM_APP_DRAGWAKE 唤醒，这里是兜底
+static void DragSteadyShow(void)
+{
+    if (!IsWindowVisible(g_hwnd)) {
+        ShowWindow(g_hwnd, SW_SHOWNA);
+        StartFadeIn();                             // 从 0 起淡入并重置 3s 宽限
+        SetTimer(g_hwnd, TIMER_HIDE, 120, NULL);   // StartFadeIn 不重启心跳：这里补上
+    } else if (g_fadeDir < 0) {                    // 淡出中：就地回满，不再眨眼
+        g_fadeDir = 0;
+        KillTimer(g_hwnd, TIMER_FADE);
+        g_alpha = 255;
+        SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
+    }
+}
+
 static HRESULT __stdcall DtDragEnter(IDropTarget *self, IDataObject *d, DWORD keys,
                                      POINTL pt, DWORD *ef)
 {
     UNREF(self); UNREF(keys);
+    g_extDrag = TRUE;                  // 先冻结心跳隐藏，再稳住可见性
+    DragSteadyShow();
     g_oleOk = OleAccepts(d);
-    g_extDrag = TRUE;
     *ef = g_oleOk ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     if (g_oleOk) OleUpdateOver(pt);
     return S_OK;
@@ -3738,6 +3776,7 @@ static HRESULT __stdcall DtDragLeave(IDropTarget *self)
     UNREF(self);
     g_extDrag = FALSE;
     OleClearOver();
+    DropTrace(L"leave");
     return S_OK;
 }
 
@@ -3800,6 +3839,10 @@ static void OnTimer(HWND h, WPARAM w)
         if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
         if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
             TrimWS();
+            g_outSince = 0;
+            return;
+        }
+        if (g_extDrag) {          // 外部拖放悬停中：绝不自动隐藏（进入时已就地稳住）
             g_outSince = 0;
             return;
         }
@@ -3902,6 +3945,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_APP_WAKE_CAND:   { POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
                                if (!IsWindowVisible(h) && IsDesktopPoint(p)) ShowLauncher();
                                                                         return 0; }
+    // 拖放唤醒：面板隐藏时拖动光标进入其静置区——就地显示但不抢前台
+    //（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动（落点就在原地）
+    case WM_APP_DRAGWAKE:      if (!IsWindowVisible(h) && !g_dlgOpen) {
+                                   ShowWindow(h, SW_SHOWNA);
+                                   StartFadeIn();
+                                   SetTimer(h, TIMER_HIDE, 120, NULL);
+                               }                                     return 0;
     case WM_DESTROY:           OnDestroy(h);                             return 0;
     default:                                                             break;
     }
