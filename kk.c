@@ -567,10 +567,16 @@ static HICON IconFromImage(const WCHAR *path, int want, int idx)
     // 注意：变量名不能叫 small —— Windows 头里有 #define small char
     HICON big = NULL, sml = NULL;
     if (ExtractIconExW(path, idx, &big, &sml, 1) && (big || sml)) {
-        if (big) return big;
-        HICON scaled = (HICON)CopyImage(sml, IMAGE_ICON, want, want, LR_DEFAULTCOLOR);
-        DestroyIcon(sml);
-        return scaled;
+        // 两个尺寸可能同时提取成功：大的直接用，小的要么缩放成大尺寸
+        // 要么销毁——只 return big 会把 sml 泄漏掉（每次加载一枚）
+        HICON out;
+        if (big) {
+            out = big;
+        } else {
+            out = (HICON)CopyImage(sml, IMAGE_ICON, want, want, LR_DEFAULTCOLOR);
+        }
+        if (sml) DestroyIcon(sml);
+        return out;
     }
     return NULL;
 }
