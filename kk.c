@@ -53,6 +53,22 @@
 #define TIMER_FADE      2
 #define HOTKEY_ID       1
 
+// 时间与容差（毫秒 / 像素）：唤醒行为的一组参数，集中在这里调
+#define WAKE_GRACE_MS   3000   // 唤醒后光标不在窗口上的宽限：误唤醒不会立刻隐去
+#define HIDE_DELAY_MS   150    // 光标移出多久开始淡出
+#define FLASH_MS        1200   // 标题栏反馈消息的停留时间
+#define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
+
+// 标题栏按钮编码（同 g_hoverBtn / g_pressBtn）：1=钉住 2=关闭
+#define BTN_PIN         1
+#define BTN_CLOSE       2
+
+// 格子缩放与图标尺寸的边界（Ctrl+滚轮的配置记忆值 40~160）
+#define CELL_BASE_MIN   40
+#define CELL_BASE_MAX   160
+#define ICON_SIZE_MIN   12
+#define ICON_SIZE_MAX   64
+
 #define IDM_LAUNCH      1001
 #define IDM_ADMIN       1002
 #define IDM_LOC         1003
@@ -210,6 +226,7 @@ static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
 static void SaveConfig(void);
 static void InvalidateTitle(void);
+static void InvalidateSidebar(void);
 static void InvalidateCell(int vi);
 static int  PopupAt(HMENU m);
 static int  Rows(void);
@@ -248,7 +265,10 @@ static void ExitApp(void)
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
 
 // 格子缩放基准的合法区间（配置与 Ctrl+滚轮共用同一处钳制）
-static int ClampCellBase(int v) { return v < 40 ? 40 : v > 160 ? 160 : v; }
+static int ClampCellBase(int v)
+{
+    return v < CELL_BASE_MIN ? CELL_BASE_MIN : v > CELL_BASE_MAX ? CELL_BASE_MAX : v;
+}
 
 // 图标尺寸随缩放等级走：加载（EnsureIcon）与绘制（PaintGrid）共用同一公式，
 // 保证拿到的图标就是绘制尺寸，不重采样；只跟 g_cellBase 走而不跟 g_cell 走，
@@ -256,7 +276,7 @@ static int ClampCellBase(int v) { return v < 40 ? 40 : v > 160 ? 160 : v; }
 static int IconSize(void)
 {
     int v = S_(g_cellBase) * 3 / 7;
-    return v < 12 ? 12 : v > 64 ? 64 : v;
+    return v < ICON_SIZE_MIN ? ICON_SIZE_MIN : v > ICON_SIZE_MAX ? ICON_SIZE_MAX : v;
 }
 
 // 把 '|' 换成 '_'，避免破坏配置格式
@@ -394,9 +414,16 @@ static void ClampScroll(void)
     if (g_scroll < 0) g_scroll = 0;
 }
 
+// 侧栏分组列表的虚拟内容高度（行高 + 上下留白）：滚动钳制与滚动条
+// 几何共用同一算式——两处各算一遍正是 thumb 与钳制曾经对不上的根源
+static int SidebarContentH(void)
+{
+    return g_nGroups * g_grpH + S_(12);
+}
+
 static void ClampGrpScroll(void)
 {
-    int content = g_nGroups * g_grpH + 12;
+    int content = SidebarContentH();
     int view = g_ch - g_titleH;
     int maxS = content > view ? content - view : 0;
     if (g_grpScroll > maxS) g_grpScroll = maxS;
@@ -451,8 +478,6 @@ static int GroupAt(POINT p)
 // 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn / g_pressBtn）。
 // 几何是纯布局量：缓存成矩形表，命中/绘制只读表——WM_SIZE 与 DPI 变化
 // 经 UpdateCell/ScaleMetrics 刷新，热路径上不做除法和乘法
-enum { BTN_PIN = 1, BTN_CLOSE = 2 };
-
 static RECT g_btnRect[3];     // 下标即按钮编码（0 号位不用）
 static int  g_pressBtn = 0;   // 正按下的按钮：纯视觉反馈，动作仍即时生效
 
@@ -1806,10 +1831,7 @@ static void RefreshHoverSpots(int oc, int og, BOOL txtChg)
 {
     InvalidateCell(oc);
     InvalidateCell(g_hoverCell);
-    if (og != g_hoverGroup) {
-        RECT sr = { 0, 0, g_sideW, g_ch };
-        InvalidateRect(g_hwnd, &sr, FALSE);
-    }
+    if (og != g_hoverGroup) InvalidateSidebar();   // 悬停行换了才擦侧栏
     if (txtChg) InvalidateTitle();   // 文字没变的悬停切换不碰标题栏
     RefreshCard();                   // 小卡片跟着悬停目标（内部含擦除旧区域）
 }
@@ -1832,6 +1854,7 @@ static void ClearFilter(void)
     ApplyFilter();
 }
 
+// ---------------------------------------------------------------- 绘制
 // 字体沿用 PaintWindow 已选好的 g_font，这里只设文字色
 static void DrawCard(HDC dc)
 {
@@ -1843,7 +1866,13 @@ static void DrawCard(HDC dc)
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
-// ---------------------------------------------------------------- 绘制
+// 内缩 inset 的 1px 焦点框：格子拖动源/落点与分组重排落点共用同一强调色
+static void FrameInset(HDC dc, RECT r, int inset, HBRUSH br)
+{
+    InflateRect(&r, -inset, -inset);
+    FrameRect(dc, &r, br);
+}
+
 static void InvalidateCell(int vi)
 {
     if (vi < 0) return;
@@ -1899,9 +1928,14 @@ static void InvalidateTitle(void)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
-#define FLASH_MS 1200
+// 侧栏整段失效（悬停行/选中行变化）：InvalidateTitle/InvalidateCell/InvalidateGroup 同族
+static void InvalidateSidebar(void)
+{
+    RECT r = { 0, 0, g_sideW, g_ch };
+    InvalidateRect(g_hwnd, &r, FALSE);
+}
 
-// 标题栏闪现一条消息 1.2s（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
+// 标题栏闪现一条消息 FLASH_MS（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
 static void FlashMsg(const WCHAR *text)
 {
     wcsncpy_s(g_flashText, 80, text, _TRUNCATE);
@@ -1909,11 +1943,20 @@ static void FlashMsg(const WCHAR *text)
     InvalidateTitle();
 }
 
+// 闪现一条格式化消息：启动结果、剪贴板反馈等“文字里带变量”的场景共用
+static void FlashFmt(const WCHAR *fmt, ...)
+{
+    WCHAR t[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf(t, 128, fmt, ap);
+    va_end(ap);
+    FlashMsg(t);
+}
+
 static void FlashLaunch(BOOL ok, const WCHAR *name)
 {
-    WCHAR t[80];
-    swprintf(t, 80, ok ? L"已启动: %s" : L"启动失败: %s", name);
-    FlashMsg(t);
+    FlashFmt(ok ? L"已启动: %s" : L"启动失败: %s", name);
 }
 
 static BOOL FlashActive(void)
@@ -2061,15 +2104,12 @@ static void PaintSidebar(HDC dc, const RECT *clip)
             FillRect(dc, &bar, g_brAccel);
         }
         // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
-        if (g_dragGroup && i == g_dropGroup && i != g_pressGroup) {
-            RECT r2 = r;
-            InflateRect(&r2, -S_(2), -S_(2));
-            FrameRect(dc, &r2, g_brAccent);
-        }
+        if (g_dragGroup && i == g_dropGroup && i != g_pressGroup)
+            FrameInset(dc, r, S_(2), g_brAccent);
     }
 
     // 分组超出可视高度时，右侧画一个细滚动条，让“可以滚”看得见
-    int content = g_nGroups * g_grpH + 12;
+    int content = SidebarContentH();
     int view = g_ch - g_titleH;
     if (content > view) {
         int trackTop = g_titleH + S_(4);
@@ -2148,11 +2188,8 @@ static void PaintGrid(HDC dc, const RECT *clip)
                 FrameRect(dc, &hr, g_brAccent);
             }
             if (g_dragging && (vi == g_pressCell ||
-                               (g_dropIn && vi == g_dropCell && vi != g_pressCell))) {
-                RECT r2 = r;                        // 拖动源/落点高亮
-                InflateRect(&r2, -S_(2), -S_(2));
-                FrameRect(dc, &r2, g_brAccent);
-            }
+                               (g_dropIn && vi == g_dropCell && vi != g_pressCell)))
+                FrameInset(dc, r, S_(2), g_brAccent);   // 拖动源/落点高亮
             if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
             EnsureIcon(ii);
             if (g_items[ii].icon) {
@@ -3030,8 +3067,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_hoverBtn = 0;
             UpdateHoverText();
             InvalidateCell(oc);
-            RECT sr = { 0, 0, g_sideW, g_ch };
-            InvalidateRect(h, &sr, FALSE);
+            InvalidateSidebar();
             InvalidateTitle();
             RefreshCard();                   // 鼠标离开：收起小卡片
         }
@@ -3043,8 +3079,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         RefreshCard();      // 悬停可能瞬变（如唤醒后首次点击），卡片同步
         // 按下即入按压态（胶囊底深一档）——动作仍即时生效，这只是触感
         if (g_hoverBtn) { g_pressBtn = g_hoverBtn; InvalidateTitle(); }
-        if (g_hoverBtn == 2) { CloseToTray(); return 0; }
-        if (g_hoverBtn == 1) { TogglePin(); return 0; }
+        if (g_hoverBtn == BTN_CLOSE) { CloseToTray(); return 0; }
+        if (g_hoverBtn == BTN_PIN) { TogglePin(); return 0; }
         if (g_hoverGroup >= 0) {
             if (g_hoverGroup == g_curGroup) {
                 // 点当前组 = 回到顶部（既有行为）
@@ -3209,11 +3245,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 int ii = ItemAtView(g_hoverCell);
                 if (ii >= 0 && !IsBlank(ii)) {
                     ItemToClip(&g_items[ii], &ci);
-                    if (ClipSet(&ci)) {              // 剪贴板被占用则不反馈（用户重试即可）
-                        WCHAR t[80];
-                        swprintf(t, 80, L"已复制: %s", g_items[ii].name);
-                        FlashMsg(t);
-                    }
+                    if (ClipSet(&ci))              // 剪贴板被占用则不反馈（用户重试即可）
+                        FlashFmt(L"已复制: %s", g_items[ii].name);
                 }
                 return 0;
             }
@@ -3221,9 +3254,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             int ii = ItemAtView(g_hoverCell);
             if (ii >= 0) PasteItemAt(ii, &ci);
             else PasteItemNew(&ci);
-            WCHAR t[80];
-            swprintf(t, 80, L"已粘贴: %s", ci.name);
-            FlashMsg(t);
+            FlashFmt(L"已粘贴: %s", ci.name);
             return 0;
         }
         if (w >= '1' && w <= '9' && !g_filter[0] &&
@@ -3348,20 +3379,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 break;
             }
             if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; break; }
-            if (GetTickCount() - g_wakeAt < 3000) { g_outSince = 0; break; }
+            if (GetTickCount() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; break; }
             if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; break; }
             POINT p;
             GetCursorPos(&p);
             RECT r;
             GetWindowRect(h, &r);
-            InflateRect(&r, 2, 2);
+            InflateRect(&r, CURSOR_SLOP, CURSOR_SLOP);
             if (PtInRect(&r, p)) {
                 g_outSince = 0;
                 if (g_fadeDir < 0) g_fadeDir = 1;
             } else {
                 DWORD now = GetTickCount();
                 if (!g_outSince) g_outSince = now;
-                else if (now - g_outSince > 150) BeginHide(FALSE);   // 移出 150ms 即开始消失
+                else if (now - g_outSince > HIDE_DELAY_MS) BeginHide(FALSE);   // 移出即开始消失
             }
         } else if (w == TIMER_FADE) {
             StepFade();
