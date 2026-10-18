@@ -306,6 +306,8 @@ static void ExitApp(void)
     DestroyWindow(g_hwnd);
 }
 
+static HANDLE g_once;              // 单实例互斥体：进程生命周期持有，OnDestroy 收
+
 // ---------------------------------------------------------------- 工具
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
 
@@ -2937,7 +2939,10 @@ static void TrayAdd(void)
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
     BuildTrayTip(g_nid.szTip, 64);
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    // NIM_ADD 失败=图标已存在（Explorer 没重启但 TaskbarCreated 误报、
+    // 或重复添加）：静默失败会让托盘里什么都没有，回落 NIM_MODIFY 刷内容
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
@@ -4181,6 +4186,7 @@ static void OnDestroy(HWND h)
     if (g_memDC) DeleteDC(g_memDC);
     if (g_memBmp) DeleteObject(g_memBmp);
     if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
+    if (g_once) { CloseHandle(g_once); g_once = NULL; }   // 释放单实例互斥体
     PostQuitMessage(0);
 }
 
@@ -4317,6 +4323,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
 {
     UNREF(prev); UNREF(cmd); UNREF(show);
     g_inst = inst;
+
+    // 单实例权威判定：命名互斥体。窗口类检查有 race——两个实例同时启动时
+    // 互相都查不到对方的窗，会双开成两个托盘图标。互斥体由内核保证原子，
+    // 且进程退出（含被任务管理器杀）时自动释放，无残留锁。
+    // Local\ 命名空间=每会话一个，快速用户切换各会话独立（正确语义）
+    g_once = CreateMutexW(NULL, TRUE, L"claunch_single_instance");
+    if (g_once && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND exist = FindLauncherWindow();
+        if (exist) PostMessageW(exist, WM_APP_WAKE, 0, 0);   // 已有实例：转唤醒
+        CloseHandle(g_once);
+        g_once = NULL;
+        return 0;
+    }
 
     HWND exist = FindLauncherWindow();
     if (exist) {
