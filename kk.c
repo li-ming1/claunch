@@ -2882,613 +2882,620 @@ static DWORD WINAPI HookThread(LPVOID arg)
     return 0;
 }
 
+// ---------------------------------------------------------------- 窗口过程：消息处理
+// 每条消息一个小函数——过程只做状态读取与转发，副作用集中在这里；
+// WndProc 本体只做分发（分发器一屏读完，逻辑都在下面的处理函数里）。
+// 顺序与 switch 分发表一致，便于对照
+
+static void OnCreate(HWND h)
+{
+    g_hwnd = h;
+    MakeFontsAndBrushes();
+    SetWindowPos(h, g_pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    DragAcceptFiles(h, TRUE);
+    g_hookH = CreateThread(NULL, 0, HookThread, NULL, 0, &g_hookTid);
+    RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
+    SetTimer(h, TIMER_HIDE, 120, NULL);
+    // 托盘图标
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    TrayAdd();
+}
+
+static void OnSize(HWND h, LPARAM l)
+{
+    g_cw = LOWORD(l);
+    g_ch = HIWORD(l);
+    UpdateCell();       // 横向铺满的正方格宽随窗口变化
+    // 重建离屏缓冲（失败则退回直接绘制）
+    HDC scr = GetDC(h);
+    HDC dc = CreateCompatibleDC(scr);
+    HBITMAP bmp = CreateCompatibleBitmap(scr, g_cw, g_ch);
+    ReleaseDC(h, scr);
+    if (dc && bmp) {
+        SelectObject(dc, bmp);
+        if (g_memDC) { DeleteDC(g_memDC); DeleteObject(g_memBmp); }
+        g_memDC = dc;
+        g_memBmp = bmp;
+        g_memFresh = TRUE;
+    } else {
+        if (dc) DeleteDC(dc);
+        if (bmp) DeleteObject(bmp);
+    }
+    int rad = S_(10);
+    HRGN rgn = CreateRoundRectRgn(0, 0, g_cw + 1, g_ch + 1, rad, rad);
+    if (rgn) SetWindowRgn(h, rgn, TRUE);
+    ClampScroll();
+    ClampGrpScroll();
+    RefreshCard();      // 尺寸变了：卡片按新布局重新锚定/钳制
+    InvalidateRect(h, NULL, FALSE);
+}
+
+// WS_POPUP 无边框：手动给边缘 6px 命中区，窗口才能拉伸。
+// 不在边缘返回 0（HTNOWHERE），调用方转交 DefWindowProc
+static LRESULT OnNcHitTest(HWND h, LPARAM l)
+{
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    ScreenToClient(h, &p);
+    int mg = S_(6);
+    BOOL lft = p.x < mg, rgt = p.x >= g_cw - mg, top = p.y < mg, bot = p.y >= g_ch - mg;
+    if (top && lft) return HTTOPLEFT;
+    if (top && rgt) return HTTOPRIGHT;
+    if (bot && lft) return HTBOTTOMLEFT;
+    if (bot && rgt) return HTBOTTOMRIGHT;
+    if (lft) return HTLEFT;
+    if (rgt) return HTRIGHT;
+    if (top) return HTTOP;
+    if (bot) return HTBOTTOM;
+    return 0;
+}
+
+static void OnDpiChanged(HWND h, WPARAM w, LPARAM l)
+{
+    g_dpi = LOWORD(w);
+    ScaleMetrics();
+    MakeFontsAndBrushes();
+    // 图标尺寸 = S_(格基)×3/7 随 DPI 变：缓存图标不丢就会被拉伸到新尺寸（发虚），
+    // 与 ApplyCellBase 同一处理——丢掉，随后那次绘制按新 DPI 重载
+    for (int i = 0; i < g_nItems; i++) DropIcon(i);
+    // 托盘图标同理：shell 按任务栏所在显示器的 DPI 要图标，尺寸变了不重建
+    // 就被拉伸发虚（多显示器跨屏场景）
+    if (g_trayIcon) {
+        int tsz = GetSystemMetrics(SM_CYSMICON);
+        if (tsz != g_traySz) {
+            DestroyIcon(g_trayIcon);
+            g_trayIcon = MakeTrayIcon(tsz);
+            if (g_trayIcon) {
+                g_traySz = tsz;
+                g_nid.hIcon = g_trayIcon;
+                g_nid.uFlags = NIF_ICON;
+                Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            }
+        }
+    }
+    RECT r;
+    if (g_applySavedRect) {
+        // 首次 DPI 切换：配置里记的是物理像素，必须以它为准，
+        // 否则采纳系统建议矩形会让窗口每次启动都缩小（1/1.25）。
+        g_applySavedRect = FALSE;
+        r.left = g_savedX;
+        r.top = g_savedY;
+        r.right = g_savedX + g_savedW;
+        r.bottom = g_savedY + g_savedH;
+    } else {
+        r = *(RECT *)l;
+    }
+    SetWindowPos(h, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void OnPaint(HWND h)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    if (g_memDC) {
+        // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
+        // 其余缓冲内容保持上一帧，与屏幕一致。
+        RECT rc;
+        if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
+        else            rc = ps.rcPaint;
+        // 设裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
+        // 复位成整幅位图（WM_SIZE 重建时也是全新 DC），起始裁剪即全图，
+        // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
+        // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
+        IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
+        PaintWindow(g_memDC, &rc);     // 裁剪区即 rc：直接传，省一次 GetClipBox
+        SelectClipRgn(g_memDC, NULL);
+        BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+               g_memDC, rc.left, rc.top, SRCCOPY);
+        g_memFresh = FALSE;
+    } else {
+        PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
+    }
+    EndPaint(h, &ps);
+}
+
+// 格子/分组的按下-拖动-抬起状态机：两套拖动各三拍（按下记起点、
+// 过阈值进拖动、抬起落定），外加焦点环跟随。悬停检测兜底收尾
+static void OnMouseMove(HWND h, LPARAM l)
+{
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    if (g_pressCell >= 0) {                 // 拖动排序进行中
+        if (!g_dragging) {
+            // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
+            // 先清过滤回全量再拖，落点高亮才和用户看到的一致
+            if (PastDragThreshold(p, g_pressPt)) {
+                ClearFilter();
+                g_dragging = TRUE;
+                g_dropCell = g_pressCell;
+                g_dropIn = TRUE;
+                InvalidateCell(g_pressCell);
+            }
+        }
+        if (g_dragging) {
+            // 落点即槽位序号：CellAt 的间隙拒绝会被紧随的 SlotAt 兜底抵消
+            // （原两段式等价于一次 SlotAt），这里一次算清
+            int nc = SlotAt(p);
+            BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
+            if (nc != g_dropCell || nin != g_dropIn) {
+                // 新旧落点都有效时合成一个外接矩形：相邻格拖动每次移动
+                // 少发一个更新区（-1 表示窗外/网格外，各自单发即可）
+                if (g_dropCell >= 0 && nc >= 0) InvalidateCells(g_dropCell, nc);
+                else {
+                    InvalidateCell(g_dropCell);
+                    InvalidateCell(nc);
+                }
+                g_dropCell = nc;
+                g_dropIn = nin;
+            }
+        }
+    }
+    if (g_pressGroup >= 0) {                 // 侧栏分组重排进行中
+        if (!g_dragGroup && PastDragThreshold(p, g_pressPt)) {
+            g_dragGroup = TRUE;
+            g_dropGroup = g_pressGroup;
+            InvalidateGroup(g_pressGroup);
+        }
+        if (g_dragGroup) {
+            int ng = GroupAt(p);
+            if (ng == 0) ng = 1;             // 组 0（全部）不参与：靠顶即落到第 1 位
+            if (ng != g_dropGroup) {
+                InvalidateGroups(g_dropGroup, ng);   // 行区间一个外接矩形
+                g_dropGroup = ng;
+            }
+        }
+    }
+    int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
+    BOOL txtChg = HoverFromPoint(p);
+    if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
+        g_flashAt = 0;                    // 悬停目标变了：新意图 supersede 启动反馈
+        RefreshHoverSpots(oc, og, txtChg);
+    }
+    if (!g_tracking) {
+        TRACKMOUSEEVENT tme;
+        ZeroMemory(&tme, sizeof tme);
+        tme.cbSize = sizeof tme;
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = h;
+        g_tracking = TrackMouseEvent(&tme);
+    }
+}
+
+static void OnMouseLeave(void)
+{
+    g_tracking = FALSE;
+    g_pressBtn = 0;     // 光标离开：按压态作废（按下中移出窗口很常见）
+    int oc = g_hoverCell;
+    g_hoverCell = g_hoverGroup = -1;
+    g_hoverBtn = 0;
+    UpdateHoverText();
+    InvalidateCell(oc);
+    InvalidateSidebar();
+    InvalidateTitle();
+    RefreshCard();                   // 鼠标离开：收起小卡片
+}
+
+static void OnLButtonDown(HWND h, LPARAM l)
+{
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    HoverFromPoint(p);
+    RefreshCard();      // 悬停可能瞬变（如唤醒后首次点击），卡片同步
+    // 按下即入按压态（胶囊底深一档）——动作仍即时生效，这只是触感
+    if (g_hoverBtn) { g_pressBtn = g_hoverBtn; InvalidateTitle(); }
+    if (g_hoverBtn == BTN_CLOSE) { CloseToTray(); return; }
+    if (g_hoverBtn == BTN_PIN) { TogglePin(); return; }
+    if (g_hoverGroup >= 0) {
+        if (g_hoverGroup == g_curGroup) {
+            // 点当前组 = 回到顶部（既有行为）
+            if (g_scroll) {
+                g_scroll = 0;
+                ClampScroll();
+                InvalidateRect(h, NULL, FALSE);
+                RefreshCard();
+            }
+        } else {
+            SelectGroup(g_hoverGroup);   // 切组：滚动位记忆/恢复与滚轮切组同一路径
+        }
+        if (g_hoverGroup > 0) {          // 组 0（全部）不参与重排：按下即记住起点
+            g_pressGroup = g_hoverGroup;
+            g_pressPt = p;
+            g_dragGroup = FALSE;
+            g_dropGroup = -1;
+            SetCapture(h);
+        }
+        return;
+    }
+    if (g_hoverCell >= 0) {
+        int ii = ItemAtView(g_hoverCell);
+        if (ii >= 0 && !IsBlank(ii)) {
+            // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见抬起落定）
+            g_pressCell = g_hoverCell;
+            g_pressPt = p;
+            g_dragging = FALSE;
+            g_dropCell = -1;
+            g_dropIn = FALSE;
+            SetCapture(h);
+            return;
+        }
+    }
+    ReleaseCapture();
+    POINT sp = p;                           // NC 消息要屏幕坐标，否则拖动瞬移
+    ClientToScreen(h, &sp);
+    SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(sp.x, sp.y));
+}
+
+// 返回是否消费（TRUE=有按下态在管）；都不在管时转交 DefWindowProc
+static BOOL OnLButtonUp(HWND h)
+{
+    UNREF(h);                         // 捕获释放不需要句柄
+    if (g_pressBtn) {                 // 按钮抬起：按压态收头
+        g_pressBtn = 0;
+        InvalidateTitle();
+    }
+    if (g_pressGroup >= 0) {               // 侧栏分组重排落定（未拖动时按下已完成选中，无需处理）
+        int from = g_pressGroup, to = g_dropGroup;
+        BOOL wasDrag = g_dragGroup;
+        g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
+        ReleaseCapture();
+        if (wasDrag && to > 0 && to != from) MoveGroup(from, to);
+        return TRUE;
+    }
+    if (g_pressCell < 0) return FALSE;
+    int from = g_pressCell, to = g_dropCell;
+    BOOL inGrid = g_dropIn, wasDrag = g_dragging;
+    g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
+    ReleaseCapture();
+    if (!wasDrag) {
+        LaunchView(from);
+    } else if (inGrid) {
+        int n = ViewCount();
+        if (to < 0) to = n - 1;            // 落点解析不出格位（拖到网格下方空白）：排到末尾
+        if (to >= n) {                     // 落点在末尾之外的空格：补齐空格再落
+            EnsureSlot(to);
+            n = ViewCount();
+            if (to >= n) to = n - 1;
+        }
+        if (to != from && to >= 0) {
+            int fi = ItemAtView(from), ti = ItemAtView(to);
+            if (fi >= 0 && ti >= 0) {
+                // 槽位模型：落点（空格或程序）与源互换——拖谁跟谁换，其余格子原位不动
+                Item tmp = g_items[fi];
+                g_items[fi] = g_items[ti];
+                g_items[ti] = tmp;
+                SaveConfig();
+            }
+            ClampScroll();
+            ViewDirty();
+        }
+        InvalidateCell(from);
+        InvalidateCell(to);
+        RefreshCard();       // 互换后同一悬停格对应的条目变了
+    } else {
+        InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
+        if (to >= 0 && to != from) InvalidateCell(to);
+    }
+    return TRUE;
+}
+
+static void OnCaptureLost(void)
+{
+    if (g_pressCell >= 0) {
+        int a = g_pressCell, b = g_dropCell;
+        g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
+        InvalidateCell(a);                    // 互换模型下高亮只有源/落点两格，逐格擦
+        if (b >= 0 && b != a) InvalidateCell(b);
+    }
+    if (g_pressGroup >= 0) {
+        int a = g_pressGroup, b = g_dropGroup;
+        g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
+        InvalidateGroup(a);                   // 先清状态再失效：重绘时已无高亮
+        if (b >= 0 && b != a) InvalidateGroup(b);
+    }
+}
+
+static void OnRButtonUp(HWND h, LPARAM l)
+{
+    UNREF(h);                         // 菜单定位全靠悬停状态，不需要句柄
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    HoverFromPoint(p);
+    RefreshCard();
+    if (g_hoverCell >= 0) ShowCellMenu(g_hoverCell);   // 空格也给槽位菜单（插入/删除）
+    else if (g_hoverGroup >= 0) {
+        ShowGroupMenu(g_hoverGroup);
+    } else if (p.x < g_sideW && p.y >= g_titleH) {
+        ShowGroupMenu(-1);            // 侧边栏空白处（列表下方）：只给“新建分组”
+    } else if (g_hoverBtn || p.y < g_titleH) {
+        ShowTitleMenu();
+    }
+}
+
+// 滚轮：Ctrl+滚轮缩放格子（光标在左右区域都响应）；侧栏滚轮切分组
+//（等同于点击相邻分组，到头循环）；格子区滚动一格并让卡片跟随
+static void OnWheel(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    if (m == WM_MOUSEWHEEL) ScreenToClient(h, &p);
+    int d = (m == WM_APP_WHEEL) ? (int)(short)w : (int)GET_WHEEL_DELTA_WPARAM(w);
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
+        ApplyCellBase(g_cellBase + (d > 0 ? 4 : -4));
+        return;
+    }
+    if (p.x < g_sideW) {
+        int gi = g_curGroup + (d > 0 ? -1 : 1);
+        if (gi < 0) gi = g_nGroups - 1;
+        if (gi >= g_nGroups) gi = 0;
+        SelectGroup(gi);
+    } else {
+        int before = g_scroll;
+        g_scroll += (d > 0 ? -1 : 1) * (g_cell + g_gap);
+        ClampScroll();
+        if (g_scroll != before) {
+            RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
+            InvalidateRect(h, &gr, FALSE);
+            RefreshCard();       // 格子滚动了：卡片跟着锚点走
+        }
+    }
+}
+
+static void OnKeyDown(WPARAM w)
+{
+    if (w == VK_ESCAPE) {                       // 搜索中：第一次 Esc 清过滤词，再按才隐藏
+        if (g_filter[0]) ClearFilter();
+        else BeginHide(TRUE);
+        return;
+    }
+    if (g_dlgOpen || g_pressCell >= 0) return;   // 对话框/拖动排序进行中：不抢键
+    if ((w == 'C' || w == 'V') && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+        // Ctrl+C/V：复制悬停格 / 粘贴到悬停格（空格也填），无悬停格则追加
+        ClipItem ci;
+        if (w == 'C') {
+            int ii = ItemAtView(g_hoverCell);
+            if (ii >= 0 && !IsBlank(ii)) {
+                ItemToClip(&g_items[ii], &ci);
+                if (ClipSet(&ci))              // 剪贴板被占用则不反馈（用户重试即可）
+                    FlashFmt(L"已复制: %s", g_items[ii].name);
+            }
+            return;
+        }
+        if (!ClipGet(&ci)) { FlashMsg(L"剪贴板没有可粘贴的内容"); return; }
+        int ii = ItemAtView(g_hoverCell);
+        if (ii >= 0) PasteItemAt(ii, &ci);
+        else PasteItemNew(&ci);
+        FlashFmt(L"已粘贴: %s", ci.name);
+        return;
+    }
+    if (w >= '1' && w <= '9' && !g_filter[0] &&
+        !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {   // 数字键：启动当前组第 N 格（Ctrl 修饰留给复制，过滤中归搜索）
+        LaunchView((int)(w - '1'));
+        return;
+    }
+    if (w == VK_RETURN) {                           // 回车：启动悬停格
+        LaunchView(g_hoverCell);
+        return;
+    }
+    int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
+    if (n <= 0) return;
+    int c = g_hoverCell;
+    if (c < 0 || c >= n) c = 0;                     // 悬停失效时从第一格起
+    int nc = c;
+    switch (w) {
+    case VK_LEFT:  nc = c - 1;      break;
+    case VK_RIGHT: nc = c + 1;      break;
+    case VK_UP:    nc = c - g_cols; break;
+    case VK_DOWN:  nc = c + g_cols; break;
+    default: return;
+    }
+    if (nc < 0 || nc >= n) return;
+    int og = g_hoverGroup;
+    g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
+    UpdateHoverText();
+    RefreshHoverSpots(c, og, TRUE);
+}
+
+// 可打印字符 → 搜索过滤（退格删字符，Esc 清空）。主窗 IME 已断开，
+// 中文命名只能用 ASCII 搜——换输入法链的 30MB 不值
+static void OnChar(WPARAM w)
+{
+    if (g_dlgOpen || g_pressCell >= 0) return;
+    if (w == 0x08) {                              // 退格：删一个字符
+        if (!g_filter[0]) return;
+        int n = (int)wcslen(g_filter);
+        g_filter[n - 1] = 0;
+        ApplyFilter();
+        return;
+    }
+    if (w < 32) return;                         // 其余控制字符不管
+    if (w >= '1' && w <= '9' && !g_filter[0]) return;   // 空过滤时数字键归 WM_KEYDOWN 快速启动
+    int n = (int)wcslen(g_filter);
+    if (n >= 20) return;                        // 过滤词上限 20 字符
+    g_filter[n++] = (WCHAR)w;
+    g_filter[n] = 0;
+    g_flashAt = 0;                                // 开始打字：搜索 supersede 启动反馈
+    ApplyFilter();
+}
+
+static void OnDropFiles(HWND h, WPARAM w)
+{
+    HDROP hd = (HDROP)w;
+    UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+    if (nf > 0) {
+        ClearFilter();      // 落点按全量视图的格位算（EnsureSlot 补的空格不过滤）：先清过滤
+        POINT p;
+        // DragQueryPoint 给的是本窗客户坐标；拿不到（少数拖放路径）就退回光标位置
+        if (!DragQueryPoint(hd, &p)) {
+            GetCursorPos(&p);
+            ScreenToClient(h, &p);
+        }
+        // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
+        // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
+        // 光标明明停在空格上，格子却没有任何变化。
+        int slot = SlotAt(p);
+        int g = TargetGroup();
+        int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
+        for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
+            WCHAR path[MAX_PATH];
+            if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
+            if (slot < 0) { AddItemByPath(path, g); continue; }   // 网格外：追加末尾
+            int s = slot + (int)k;          // 多文件自落点依次排开
+            if (lo < 0) lo = hi = s;        // 记下受影响的格子范围
+            else { if (s < lo) lo = s; if (s > hi) hi = s; }
+            EnsureSlot(s);                  // 落点在末尾之外：先补空格，前面的格子不动
+            int ii = ItemAtView(s);
+            if (ii >= 0) {
+                // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
+                SetItemTarget(ii, path, g);
+            } else {
+                AddItemByPath(path, g);    // 条目数爆满兜底
+            }
+        }
+        ViewDirty();                       // 替换可能改了条目分组
+        SaveConfig();
+        ClampScroll();
+        RefreshCard();                     // 视图/名称可能变了，卡片同步
+        if (lo < 0) {
+            InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
+        } else {
+            InvalidateCells(lo, hi);                 // 只重绘落点区间
+        }
+    }
+    DragFinish(hd);
+}
+
+// TIMER_HIDE 心跳（120ms）：反馈过期收起、配置防抖落盘、自动隐藏判定。
+// TIMER_FADE：淡入淡出步进
+static void OnTimer(HWND h, WPARAM w)
+{
+    if (w == TIMER_HIDE) {
+        if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
+        if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
+        if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
+            TrimWS();
+            g_outSince = 0;
+            return;
+        }
+        if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; return; }
+        if (GetTickCount() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; return; }
+        if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; return; }
+        POINT p;
+        GetCursorPos(&p);
+        RECT r;
+        GetWindowRect(h, &r);
+        InflateRect(&r, CURSOR_SLOP, CURSOR_SLOP);
+        if (PtInRect(&r, p)) {
+            g_outSince = 0;
+            if (g_fadeDir < 0) g_fadeDir = 1;
+        } else {
+            DWORD now = GetTickCount();
+            if (!g_outSince) g_outSince = now;
+            else if (now - g_outSince > HIDE_DELAY_MS) BeginHide(FALSE);   // 移出即开始消失
+        }
+    } else if (w == TIMER_FADE) {
+        StepFade();
+    }
+}
+
+static void OnDestroy(HWND h)
+{
+    SaveConfig();
+    TrayRemove();
+    if (g_hookH) {
+        PostThreadMessageW(g_hookTid, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_hookH, 1000);
+        CloseHandle(g_hookH);
+        g_hookH = NULL;
+    }
+    UnregisterHotKey(h, HOTKEY_ID);
+    for (int i = 0; i < g_nItems; i++) DropIcon(i);
+    // GDI 对象收尾：数组一遍过（原来 13 条逐项 if+DeleteObject，缩进还乱）
+    HGDIOBJ objs[] = {
+        g_font, g_fontT,
+        g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
+        g_brAccent, g_brAccel, g_brPanel,
+        g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr,
+        g_penLine, g_penAccent,
+    };
+    for (size_t i = 0; i < _countof(objs); i++)
+        if (objs[i]) DeleteObject(objs[i]);
+    if (g_memDC) DeleteDC(g_memDC);
+    if (g_memBmp) DeleteObject(g_memBmp);
+    PostQuitMessage(0);
+}
+
 // ---------------------------------------------------------------- 窗口过程
+// 分发器：一屏读完，逻辑都在上面的处理函数里
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    // 资源管理器（explorer.exe）重启后会广播 TaskbarCreated，此时托盘图标已丢失，需要重建
+    // 资源管理器重启会广播 TaskbarCreated：托盘图标已丢失，重建
     if (g_msgTaskbarCreated && (UINT)m == g_msgTaskbarCreated) {
         TrayAdd();
         return 0;
     }
     switch (m) {
-    case WM_CREATE: {
-        g_hwnd = h;
-        MakeFontsAndBrushes();
-        SetWindowPos(h, g_pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
-                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
-        DragAcceptFiles(h, TRUE);
-        g_hookH = CreateThread(NULL, 0, HookThread, NULL, 0, &g_hookTid);
-        RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
-        SetTimer(h, TIMER_HIDE, 120, NULL);
-        // 托盘图标
-        g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-        TrayAdd();
-        return 0;
-    }
-
-    case WM_SIZE: {
-        g_cw = LOWORD(l);
-        g_ch = HIWORD(l);
-        UpdateCell();       // 横向铺满的正方格宽随窗口变化
-        // 重建离屏缓冲（失败则退回直接绘制）
-        HDC scr = GetDC(h);
-        HDC dc = CreateCompatibleDC(scr);
-        HBITMAP bmp = CreateCompatibleBitmap(scr, g_cw, g_ch);
-        ReleaseDC(h, scr);
-        if (dc && bmp) {
-            SelectObject(dc, bmp);
-            if (g_memDC) { DeleteDC(g_memDC); DeleteObject(g_memBmp); }
-            g_memDC = dc;
-            g_memBmp = bmp;
-            g_memFresh = TRUE;
-        } else {
-            if (dc) DeleteDC(dc);
-            if (bmp) DeleteObject(bmp);
-        }
-        int rad = S_(10);
-        HRGN rgn = CreateRoundRectRgn(0, 0, g_cw + 1, g_ch + 1, rad, rad);
-        if (rgn) SetWindowRgn(h, rgn, TRUE);
-        ClampScroll();
-        ClampGrpScroll();
-        RefreshCard();      // 尺寸变了：卡片按新布局重新锚定/钳制
-        InvalidateRect(h, NULL, FALSE);
-        return 0;
-    }
-
-    case WM_GETMINMAXINFO: {
-        MINMAXINFO *mm = (MINMAXINFO *)l;
-        mm->ptMinTrackSize.x = S_(260);
-        mm->ptMinTrackSize.y = S_(200);
-        return 0;
-    }
-
-    // WS_POPUP 无边框：手动给边缘 6px 命中区，窗口才能拉伸
-    case WM_NCHITTEST: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        ScreenToClient(h, &p);
-        int mg = S_(6);
-        BOOL lft = p.x < mg, rgt = p.x >= g_cw - mg, top = p.y < mg, bot = p.y >= g_ch - mg;
-        if (top && lft) return HTTOPLEFT;
-        if (top && rgt) return HTTOPRIGHT;
-        if (bot && lft) return HTBOTTOMLEFT;
-        if (bot && rgt) return HTBOTTOMRIGHT;
-        if (lft) return HTLEFT;
-        if (rgt) return HTRIGHT;
-        if (top) return HTTOP;
-        if (bot) return HTBOTTOM;
-        break;
-    }
-
-    case WM_DPICHANGED: {
-        g_dpi = LOWORD(w);
-        ScaleMetrics();
-        MakeFontsAndBrushes();
-        // 图标尺寸 = S_(格基)×3/7 随 DPI 变：缓存图标不丢就会被拉伸到新尺寸（发虚），
-        // 与 ApplyCellBase 同一处理——丢掉，随后那次绘制按新 DPI 重载
-        for (int i = 0; i < g_nItems; i++) DropIcon(i);
-        // 托盘图标同理：shell 按任务栏所在显示器的 DPI 要图标，尺寸变了不重建
-        // 就被拉伸发虚（多显示器跨屏场景）
-        if (g_trayIcon) {
-            int tsz = GetSystemMetrics(SM_CYSMICON);
-            if (tsz != g_traySz) {
-                DestroyIcon(g_trayIcon);
-                g_trayIcon = MakeTrayIcon(tsz);
-                if (g_trayIcon) {
-                    g_traySz = tsz;
-                    g_nid.hIcon = g_trayIcon;
-                    g_nid.uFlags = NIF_ICON;
-                    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-                }
-            }
-        }
-        RECT r;
-        if (g_applySavedRect) {
-            // 首次 DPI 切换：配置里记的是物理像素，必须以它为准，
-            // 否则采纳系统建议矩形会让窗口每次启动都缩小（1/1.25）。
-            g_applySavedRect = FALSE;
-            r.left = g_savedX;
-            r.top = g_savedY;
-            r.right = g_savedX + g_savedW;
-            r.bottom = g_savedY + g_savedH;
-        } else {
-            r = *(RECT *)l;
-        }
-        SetWindowPos(h, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        return 0;
-    }
-
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        if (g_memDC) {
-            // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
-            // 其余缓冲内容保持上一帧，与屏幕一致。
-            RECT rc;
-            if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
-            else            rc = ps.rcPaint;
-            // 设裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
-            // 复位成整幅位图（WM_SIZE 重建时也是全新 DC），起始裁剪即全图，
-            // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
-            // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
-            IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
-            PaintWindow(g_memDC, &rc);     // 裁剪区即 rc：直接传，省一次 GetClipBox
-            SelectClipRgn(g_memDC, NULL);
-            BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-                   g_memDC, rc.left, rc.top, SRCCOPY);
-            g_memFresh = FALSE;
-        } else {
-            PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
-        }
-        EndPaint(h, &ps);
-        return 0;
-    }
-
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_MOUSEMOVE: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        if (g_pressCell >= 0) {                 // 拖动排序进行中
-            if (!g_dragging) {
-                // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
-                // 先清过滤回全量再拖，落点高亮才和用户看到的一致
-                if (PastDragThreshold(p, g_pressPt)) {
-                    ClearFilter();
-                    g_dragging = TRUE;
-                    g_dropCell = g_pressCell;
-                    g_dropIn = TRUE;
-                    InvalidateCell(g_pressCell);
-                }
-            }
-            if (g_dragging) {
-                // 落点即槽位序号：CellAt 的间隙拒绝会被紧随的 SlotAt 兜底抵消
-                // （原两段式等价于一次 SlotAt），这里一次算清
-                int nc = SlotAt(p);
-                BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
-                if (nc != g_dropCell || nin != g_dropIn) {
-                    // 新旧落点都有效时合成一个外接矩形：相邻格拖动每次移动
-                    // 少发一个更新区（-1 表示窗外/网格外，各自单发即可）
-                    if (g_dropCell >= 0 && nc >= 0) InvalidateCells(g_dropCell, nc);
-                    else {
-                        InvalidateCell(g_dropCell);
-                        InvalidateCell(nc);
-                    }
-                    g_dropCell = nc;
-                    g_dropIn = nin;
-                }
-            }
-        }
-        if (g_pressGroup >= 0) {                 // 侧栏分组重排进行中
-            if (!g_dragGroup && PastDragThreshold(p, g_pressPt)) {
-                g_dragGroup = TRUE;
-                g_dropGroup = g_pressGroup;
-                InvalidateGroup(g_pressGroup);
-            }
-            if (g_dragGroup) {
-                int ng = GroupAt(p);
-                if (ng == 0) ng = 1;             // 组 0（全部）不参与：靠顶即落到第 1 位
-                if (ng != g_dropGroup) {
-                    InvalidateGroups(g_dropGroup, ng);   // 行区间一个外接矩形
-                    g_dropGroup = ng;
-                }
-            }
-        }
-        int oc = g_hoverCell, og = g_hoverGroup, ob = g_hoverBtn;
-        BOOL txtChg = HoverFromPoint(p);
-        if (oc != g_hoverCell || og != g_hoverGroup || ob != g_hoverBtn) {
-            g_flashAt = 0;                    // 悬停目标变了：新意图 supersede 启动反馈
-            RefreshHoverSpots(oc, og, txtChg);
-        }
-        if (!g_tracking) {
-            TRACKMOUSEEVENT tme;
-            ZeroMemory(&tme, sizeof tme);
-            tme.cbSize = sizeof tme;
-            tme.dwFlags = TME_LEAVE;
-            tme.hwndTrack = h;
-            g_tracking = TrackMouseEvent(&tme);
-        }
-        return 0;
-    }
-
-    case WM_MOUSELEAVE:
-        g_tracking = FALSE;
-        g_pressBtn = 0;     // 光标离开：按压态作废（按下中移出窗口很常见）
-        {
-            int oc = g_hoverCell;
-            g_hoverCell = g_hoverGroup = -1;
-            g_hoverBtn = 0;
-            UpdateHoverText();
-            InvalidateCell(oc);
-            InvalidateSidebar();
-            InvalidateTitle();
-            RefreshCard();                   // 鼠标离开：收起小卡片
-        }
-        return 0;
-
-    case WM_LBUTTONDOWN: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        HoverFromPoint(p);
-        RefreshCard();      // 悬停可能瞬变（如唤醒后首次点击），卡片同步
-        // 按下即入按压态（胶囊底深一档）——动作仍即时生效，这只是触感
-        if (g_hoverBtn) { g_pressBtn = g_hoverBtn; InvalidateTitle(); }
-        if (g_hoverBtn == BTN_CLOSE) { CloseToTray(); return 0; }
-        if (g_hoverBtn == BTN_PIN) { TogglePin(); return 0; }
-        if (g_hoverGroup >= 0) {
-            if (g_hoverGroup == g_curGroup) {
-                // 点当前组 = 回到顶部（既有行为）
-                if (g_scroll) {
-                    g_scroll = 0;
-                    ClampScroll();
-                    InvalidateRect(h, NULL, FALSE);
-                    RefreshCard();
-                }
-            } else {
-                SelectGroup(g_hoverGroup);   // 切组：滚动位记忆/恢复与滚轮切组同一路径
-            }
-            if (g_hoverGroup > 0) {          // 组 0（全部）不参与重排：按下即记住起点
-                g_pressGroup = g_hoverGroup;
-                g_pressPt = p;
-                g_dragGroup = FALSE;
-                g_dropGroup = -1;
-                SetCapture(h);
-            }
-            return 0;
-        }
-        if (g_hoverCell >= 0) {
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0 && !IsBlank(ii)) {
-                // 按下先不启动：原地抬起才是启动，拖过阈值是排序（见 WM_LBUTTONUP）
-                g_pressCell = g_hoverCell;
-                g_pressPt = p;
-                g_dragging = FALSE;
-                g_dropCell = -1;
-                g_dropIn = FALSE;
-                SetCapture(h);
-                return 0;
-            }
-        }
-        ReleaseCapture();
-        POINT sp = p;                           // NC 消息要屏幕坐标，否则拖动瞬移
-        ClientToScreen(h, &sp);
-        SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(sp.x, sp.y));
-        return 0;
-    }
-
-    case WM_LBUTTONUP: {
-        if (g_pressBtn) {                 // 按钮抬起：按压态收头
-            g_pressBtn = 0;
-            InvalidateTitle();
-        }
-        if (g_pressGroup >= 0) {               // 侧栏分组重排落定（未拖动时按下已完成选中，无需处理）
-            int from = g_pressGroup, to = g_dropGroup;
-            BOOL wasDrag = g_dragGroup;
-            g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
-            ReleaseCapture();
-            if (wasDrag && to > 0 && to != from) MoveGroup(from, to);
-            return 0;
-        }
-        if (g_pressCell < 0) break;
-        int from = g_pressCell, to = g_dropCell;
-        BOOL inGrid = g_dropIn, wasDrag = g_dragging;
-        g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
-        ReleaseCapture();
-        if (!wasDrag) {
-            LaunchView(from);
-        } else if (inGrid) {
-            int n = ViewCount();
-            if (to < 0) to = n - 1;            // 落点解析不出格位（拖到网格下方空白）：排到末尾
-            if (to >= n) {                     // 落点在末尾之外的空格：补齐空格再落
-                EnsureSlot(to);
-                n = ViewCount();
-                if (to >= n) to = n - 1;
-            }
-            if (to != from && to >= 0) {
-                int fi = ItemAtView(from), ti = ItemAtView(to);
-                if (fi >= 0 && ti >= 0) {
-                    // 槽位模型：落点（空格或程序）与源互换——拖谁跟谁换，其余格子原位不动
-                    Item tmp = g_items[fi];
-                    g_items[fi] = g_items[ti];
-                    g_items[ti] = tmp;
-                    SaveConfig();
-                }
-                ClampScroll();
-                ViewDirty();
-            }
-            InvalidateCell(from);
-            InvalidateCell(to);
-            RefreshCard();       // 互换后同一悬停格对应的条目变了
-        } else {
-            InvalidateCell(from);            // 拖出格子区：取消，抹掉源/落点高亮
-            if (to >= 0 && to != from) InvalidateCell(to);
-        }
-        return 0;
-    }
-
-    case WM_CAPTURECHANGED:                     // 捕获被抢：作废未完成的按下/拖动
-        if (g_pressCell >= 0) {
-            int a = g_pressCell, b = g_dropCell;
-            g_pressCell = -1; g_dragging = FALSE; g_dropCell = -1; g_dropIn = FALSE;
-            InvalidateCell(a);                    // 互换模型下高亮只有源/落点两格，逐格擦
-            if (b >= 0 && b != a) InvalidateCell(b);
-        }
-        if (g_pressGroup >= 0) {
-            int a = g_pressGroup, b = g_dropGroup;
-            g_pressGroup = -1; g_dragGroup = FALSE; g_dropGroup = -1;
-            InvalidateGroup(a);                   // 先清状态再失效：重绘时已无高亮
-            if (b >= 0 && b != a) InvalidateGroup(b);
-        }
-        return 0;
-
-    case WM_RBUTTONUP: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        HoverFromPoint(p);
-        RefreshCard();
-        if (g_hoverCell >= 0) ShowCellMenu(g_hoverCell);   // 空格也给槽位菜单（插入/删除）
-        else if (g_hoverGroup >= 0) {
-            ShowGroupMenu(g_hoverGroup);
-        } else if (p.x < g_sideW && p.y >= g_titleH) {
-            ShowGroupMenu(-1);            // 侧边栏空白处（列表下方）：只给“新建分组”
-        } else if (g_hoverBtn || p.y < g_titleH) {
-            ShowTitleMenu();
-        }
-        return 0;
-    }
-
-    // 滚轮：WM_APP_WHEEL 来自低级钩子（lParam 已是客户坐标），无焦点也可用
+    case WM_CREATE:            OnCreate(h);                              return 0;
+    case WM_SIZE:              OnSize(h, l);                             return 0;
+    case WM_GETMINMAXINFO: {   MINMAXINFO *mm = (MINMAXINFO *)l;
+                               mm->ptMinTrackSize.x = S_(260);
+                               mm->ptMinTrackSize.y = S_(200);          return 0; }
+    case WM_NCHITTEST:       { LRESULT ht = OnNcHitTest(h, l);
+                               if (ht) return ht; }                    break;
+    case WM_DPICHANGED:        OnDpiChanged(h, w, l);                    return 0;
+    case WM_PAINT:             OnPaint(h);                               return 0;
+    case WM_ERASEBKGND:                                                  return 1;
+    case WM_MOUSEMOVE:         OnMouseMove(h, l);                        return 0;
+    case WM_MOUSELEAVE:        OnMouseLeave();                           return 0;
+    case WM_LBUTTONDOWN:       OnLButtonDown(h, l);                      return 0;
+    case WM_LBUTTONUP:         if (OnLButtonUp(h))                       return 0;
+                               break;
+    case WM_CAPTURECHANGED:    OnCaptureLost();                          return 0;
+    case WM_RBUTTONUP:         OnRButtonUp(h, l);                        return 0;
     case WM_APP_WHEEL:
-    case WM_MOUSEWHEEL: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        if (m == WM_MOUSEWHEEL) ScreenToClient(h, &p);
-        int d = (m == WM_APP_WHEEL) ? (int)(short)w : (int)GET_WHEEL_DELTA_WPARAM(w);
-        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {   // Ctrl+滚轮：缩放格子（光标在左右区域都响应）
-            ApplyCellBase(g_cellBase + (d > 0 ? 4 : -4));
-            return 0;
-        }
-        if (p.x < g_sideW) {
-            // 侧栏：滚轮上下切换分组（等同于点击相邻分组），到头后循环
-            int gi = g_curGroup + (d > 0 ? -1 : 1);
-            if (gi < 0) gi = g_nGroups - 1;
-            if (gi >= g_nGroups) gi = 0;
-            SelectGroup(gi);
-        } else {
-            int before = g_scroll;
-            g_scroll += (d > 0 ? -1 : 1) * (g_cell + g_gap);
-            ClampScroll();
-            if (g_scroll != before) {
-                RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-                InvalidateRect(h, &gr, FALSE);
-                RefreshCard();       // 格子滚动了：卡片跟着锚点走
-            }
-        }
-        return 0;
-    }
-
-    case WM_KEYDOWN: {
-        if (w == VK_ESCAPE) {                       // 搜索中：第一次 Esc 清过滤词，再按才隐藏
-            if (g_filter[0]) ClearFilter();
-            else BeginHide(TRUE);
-            return 0;
-        }
-        if (g_dlgOpen || g_pressCell >= 0) return 0;   // 对话框/拖动排序进行中：不抢键
-        if ((w == 'C' || w == 'V') && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
-            // Ctrl+C/V：复制悬停格 / 粘贴到悬停格（空格也填），无悬停格则追加
-            ClipItem ci;
-            if (w == 'C') {
-                int ii = ItemAtView(g_hoverCell);
-                if (ii >= 0 && !IsBlank(ii)) {
-                    ItemToClip(&g_items[ii], &ci);
-                    if (ClipSet(&ci))              // 剪贴板被占用则不反馈（用户重试即可）
-                        FlashFmt(L"已复制: %s", g_items[ii].name);
-                }
-                return 0;
-            }
-            if (!ClipGet(&ci)) { FlashMsg(L"剪贴板没有可粘贴的内容"); return 0; }
-            int ii = ItemAtView(g_hoverCell);
-            if (ii >= 0) PasteItemAt(ii, &ci);
-            else PasteItemNew(&ci);
-            FlashFmt(L"已粘贴: %s", ci.name);
-            return 0;
-        }
-        if (w >= '1' && w <= '9' && !g_filter[0] &&
-            !(GetAsyncKeyState(VK_CONTROL) & 0x8000)) {   // 数字键：启动当前组第 N 格（Ctrl 修饰留给复制，过滤中归搜索）
-            LaunchView((int)(w - '1'));
-            return 0;
-        }
-        if (w == VK_RETURN) {                           // 回车：启动悬停格
-            LaunchView(g_hoverCell);
-            return 0;
-        }
-        int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
-        if (n <= 0) return 0;
-        int c = g_hoverCell;
-        if (c < 0 || c >= n) c = 0;                     // 悬停失效时从第一格起
-        int nc = c;
-        switch (w) {
-        case VK_LEFT:  nc = c - 1;      break;
-        case VK_RIGHT: nc = c + 1;      break;
-        case VK_UP:    nc = c - g_cols; break;
-        case VK_DOWN:  nc = c + g_cols; break;
-        default: return 0;
-        }
-        if (nc < 0 || nc >= n) return 0;
-        int og = g_hoverGroup;
-        g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
-        UpdateHoverText();
-        RefreshHoverSpots(c, og, TRUE);
-        return 0;
-    }
-
-    // 可打印字符 → 搜索过滤（退格删字符，Esc 清空）。主窗 IME 已断开，
-    // 中文命名只能用 ASCII 搜——换输入法链的 30MB 不值
-    case WM_CHAR: {
-        if (g_dlgOpen || g_pressCell >= 0) return 0;
-        if (w == 0x08) {                              // 退格：删一个字符
-            if (!g_filter[0]) return 0;
-            int n = (int)wcslen(g_filter);
-            g_filter[n - 1] = 0;
-            ApplyFilter();
-            return 0;
-        }
-        if (w < 32) return 0;                         // 其余控制字符不管
-        if (w >= '1' && w <= '9' && !g_filter[0]) return 0;   // 空过滤时数字键归 WM_KEYDOWN 快速启动
-        int n = (int)wcslen(g_filter);
-        if (n >= 20) return 0;                        // 过滤词上限 20 字符
-        g_filter[n++] = (WCHAR)w;
-        g_filter[n] = 0;
-        g_flashAt = 0;                                // 开始打字：搜索 supersede 启动反馈
-        ApplyFilter();
-        return 0;
-    }
-
-    // 主窗不进 TSF：默认处理会激活输入上下文，把 MSCTF/textinputframework/
-    // Windows.Storage（~12MB）拖进进程。属性对话框不受影响（独立窗口）。
-    case WM_IME_SETCONTEXT:
-        return 0;
-
-    // 标题栏 ✕、Alt+F4、任务栏关闭：都只是隐藏到托盘，托盘菜单才能真正退出
-    case WM_CLOSE:
-        CloseToTray();
-        return 0;
-
-    case WM_COMMAND:
-        if (LOWORD(w) == IDM_EXIT) { ExitApp(); return 0; }
-        break;
-
-    case WM_DROPFILES: {
-        HDROP hd = (HDROP)w;
-        UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
-        if (nf > 0) {
-            ClearFilter();      // 落点按全量视图的格位算（EnsureSlot 补的空格不过滤）：先清过滤
-            POINT p;
-            // DragQueryPoint 给的是本窗客户坐标；拿不到（少数拖放路径）就退回光标位置
-            if (!DragQueryPoint(hd, &p)) {
-                GetCursorPos(&p);
-                ScreenToClient(h, &p);
-            }
-            // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
-            // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
-            // 光标明明停在空格上，格子却没有任何变化。
-            int slot = SlotAt(p);
-            int g = TargetGroup();
-            int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
-            for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
-                WCHAR path[MAX_PATH];
-                if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
-                if (slot < 0) { AddItemByPath(path, g); continue; }   // 网格外：追加末尾
-                int s = slot + (int)k;          // 多文件自落点依次排开
-                if (lo < 0) lo = hi = s;        // 记下受影响的格子范围
-                else { if (s < lo) lo = s; if (s > hi) hi = s; }
-                EnsureSlot(s);                  // 落点在末尾之外：先补空格，前面的格子不动
-                int ii = ItemAtView(s);
-                if (ii >= 0) {
-                    // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
-                    SetItemTarget(ii, path, g);
-                } else {
-                    AddItemByPath(path, g);    // 条目数爆满兜底
-                }
-            }
-            ViewDirty();                       // 替换可能改了条目分组
-            SaveConfig();
-            ClampScroll();
-            RefreshCard();                     // 视图/名称可能变了，卡片同步
-            if (lo < 0) {
-                InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
-            } else {
-                InvalidateCells(lo, hi);                 // 只重绘落点区间
-            }
-        }
-        DragFinish(hd);
-        return 0;
-    }
-
-    case WM_TIMER:
-        if (w == TIMER_HIDE) {
-            if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
-            if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
-            if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
-                TrimWS();
-                g_outSince = 0;
-                break;
-            }
-            if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; break; }
-            if (GetTickCount() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; break; }
-            if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; break; }
-            POINT p;
-            GetCursorPos(&p);
-            RECT r;
-            GetWindowRect(h, &r);
-            InflateRect(&r, CURSOR_SLOP, CURSOR_SLOP);
-            if (PtInRect(&r, p)) {
-                g_outSince = 0;
-                if (g_fadeDir < 0) g_fadeDir = 1;
-            } else {
-                DWORD now = GetTickCount();
-                if (!g_outSince) g_outSince = now;
-                else if (now - g_outSince > HIDE_DELAY_MS) BeginHide(FALSE);   // 移出即开始消失
-            }
-        } else if (w == TIMER_FADE) {
-            StepFade();
-        }
-        return 0;
-
-    case WM_HOTKEY:
-        if (IsWindowVisible(h)) BeginHide(TRUE);
-        else ShowLauncher();
-        return 0;
-
+    case WM_MOUSEWHEEL:        OnWheel(h, m, w, l);                      return 0;
+    case WM_KEYDOWN:           OnKeyDown(w);                             return 0;
+    case WM_CHAR:              OnChar(w);                                return 0;
+    case WM_IME_SETCONTEXT:                                              return 0;
+    case WM_CLOSE:             CloseToTray();                            return 0;
+    case WM_COMMAND:           if (LOWORD(w) == IDM_EXIT) { ExitApp(); return 0; }
+                               break;
+    case WM_DROPFILES:         OnDropFiles(h, w);                        return 0;
+    case WM_TIMER:             OnTimer(h, w);                            return 0;
+    case WM_HOTKEY:            if (IsWindowVisible(h)) BeginHide(TRUE);
+                               else ShowLauncher();                      return 0;
     // 托盘图标：左键单击显示面板，右键弹菜单
-    case WM_TRAY: {
-        UINT ev = LOWORD(l);           // NOTIFYICON_VERSION_4：事件在 lParam 低字
-        if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) ShowLauncher();
-        else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) TrayShowMenu();
-        return 0;
-    }
-
-    case WM_APP_WAKE:
-        ShowLauncher();
-        return 0;
-
+    case WM_TRAY:            { UINT ev = LOWORD(l);   // NOTIFYICON_VERSION_4：事件在 lParam 低字
+                               if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) ShowLauncher();
+                               else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) TrayShowMenu();
+                                                                        return 0; }
+    case WM_APP_WAKE:          ShowLauncher();                           return 0;
     // 桌面双击唤醒候选：钩子只报时序，这里在 UI 线程确认落点确实是桌面再唤醒
-    case WM_APP_WAKE_CAND: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        if (!IsWindowVisible(h) && IsDesktopPoint(p)) ShowLauncher();
-        return 0;
-    }
-
-    case WM_DESTROY:
-        SaveConfig();
-        TrayRemove();
-        if (g_hookH) {
-            PostThreadMessageW(g_hookTid, WM_QUIT, 0, 0);
-            WaitForSingleObject(g_hookH, 1000);
-            CloseHandle(g_hookH);
-            g_hookH = NULL;
-        }
-        UnregisterHotKey(h, HOTKEY_ID);
-        for (int i = 0; i < g_nItems; i++) DropIcon(i);
-        // GDI 对象收尾：数组一遍过（原来 13 条逐项 if+DeleteObject，缩进还乱）
-        HGDIOBJ objs[] = {
-            g_font, g_fontT,
-            g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
-            g_brAccent, g_brAccel, g_brPanel,
-            g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr,
-            g_penLine, g_penAccent,
-        };
-        for (size_t i = 0; i < _countof(objs); i++)
-            if (objs[i]) DeleteObject(objs[i]);
-        if (g_memDC) DeleteDC(g_memDC);
-        if (g_memBmp) DeleteObject(g_memBmp);
-        PostQuitMessage(0);
-        return 0;
-
-    default:
-        break;
+    case WM_APP_WAKE_CAND:   { POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+                               if (!IsWindowVisible(h) && IsDesktopPoint(p)) ShowLauncher();
+                                                                        return 0; }
+    case WM_DESTROY:           OnDestroy(h);                             return 0;
+    default:                                                             break;
     }
     return DefWindowProcW(h, m, w, l);
 }
-
 // ---------------------------------------------------------------- 入口
 static HWND g_searchHit = NULL;
 
