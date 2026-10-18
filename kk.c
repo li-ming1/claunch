@@ -265,7 +265,6 @@ static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
-static void DropTrace(const WCHAR *fmt, ...);
 
 // 条目/分组数据变化后的统一收尾：悬停文字重算、卡片重锚、整窗重绘、落盘。
 // 六处数据变更路径（粘贴×2、槽位操作、分组重排、格子/分组改名）共用同一套收尾
@@ -3507,7 +3506,6 @@ static void DropFinish(HWND h, const DropCtx *c)
     SaveConfig();
     ClampScroll();
     RefreshCard();                         // 视图/名称可能变了，卡片同步
-    DropTrace(L"finish: slot=%d grp=%d lo=%d hi=%d items=%d", c->slot, c->g, c->lo, c->hi, g_nItems);
     if (c->lo < 0) {
         InvalidateRect(h, NULL, FALSE);    // 拖到网格外：追加到末尾，整窗重绘
     } else {
@@ -3572,46 +3570,14 @@ static LPITEMIDLIST PidlJoin(LPCITEMIDLIST a, LPCITEMIDLIST b)
     return p;
 }
 
-// 拖放取证（临时诊断）：每次拖放追加一行到 exe 同目录 kk_droplog.txt，
-// 根因定位后整体移除。拖放是低频操作，每次几百字节，开销可忽略
-static void DropTrace(const WCHAR *fmt, ...)
-{
-    WCHAR path[MAX_PATH];
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    WCHAR *s = wcsrchr(path, L'\\');
-    if (s) s[1] = 0;
-    wcscat_s(path, MAX_PATH, L"kk_droplog.txt");
-    HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    WCHAR line[400];
-    va_list ap;
-    va_start(ap, fmt);
-    vswprintf(line, 400, fmt, ap);
-    va_end(ap);
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    WCHAR out[460];
-    swprintf(out, 460, L"[%02u:%02u:%02u.%03u] %s\r\n",
-             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
-    char utf8[920];
-    int cb = WideCharToMultiByte(CP_UTF8, 0, out, -1, utf8, sizeof utf8, NULL, NULL);
-    DWORD w = 0;
-    if (cb > 1) WriteFile(f, utf8, (DWORD)(cb - 1), &w, NULL);
-    CloseHandle(f);
-}
-
 // CFSTR_SHELLIDLIST 落放：文件系统项取路径；取不到的是虚拟项（回收站…），
 // 存桌面绝对解析名（"::{CLSID}"，ShellExecuteW 认它可直接启动），显示名
-// 另取（"回收站"）——解析名推不出可读名。返回落位的条目数（取证日志用）
+// 另取（"回收站"）——解析名推不出可读名。返回落位的条目数
 static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
 {
     FORMATETC ft = { (CLIPFORMAT)g_cfShellIdList, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM med;
-    if (FAILED(IDataObject_GetData(d, &ft, &med))) {
-        DropTrace(L"idlist: getdata FAIL");
-        return 0;
-    }
+    if (FAILED(IDataObject_GetData(d, &ft, &med))) return 0;
     int applied = 0;
     CIDA *cid = (CIDA *)GlobalLock(med.hGlobal);
     SIZE_T gsz = cid ? GlobalSize(med.hGlobal) : 0;
@@ -3628,7 +3594,6 @@ static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
             if (!full) continue;
             WCHAR path[MAX_PATH];
             if (SHGetPathFromIDListW(full, path) && path[0]) {
-                DropTrace(L"idlist item%u: fs='%s'", k, path);
                 DropApply(&c, (int)k - 1, path, NULL);
                 applied++;
             } else {
@@ -3639,22 +3604,17 @@ static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
                         wcsncpy_s(name, 48, disp, _TRUNCATE);
                         CoTaskMemFree(disp);
                     }
-                    DropTrace(L"idlist item%u: virtual parse='%s' disp='%s'", k, parse, name);
                     DropApply(&c, (int)k - 1, parse, name);   // 空名回落 NameFromPath
                     applied++;
                     CoTaskMemFree(parse);
-                } else {
-                    DropTrace(L"idlist item%u: no fs-path, no parse-name", k);
                 }
             }
             CoTaskMemFree(full);
         }
         DropFinish(h, &c);
         GlobalUnlock(med.hGlobal);
-    } else {
-        DropTrace(L"idlist: global %s size=%u cidl=%u",
-                  cid ? L"bounds" : L"lock", (UINT)gsz, cid ? cid->cidl : 0);
     }
+    // 尺寸/锁定防御分支：不合法数据静默丢弃（applied 保持 0），无收尾副作用
     ReleaseStgMedium(&med);
     return applied;
 }
@@ -3721,9 +3681,6 @@ static BOOL OleAccepts(IDataObject *d)
             ReleaseStgMedium(&med);
         }
     }
-    DropTrace(L"enter: qd(HDROP)=%s qd(IDLIST)=%s gd(HDROP)=%d gd(IDLIST)=%d",
-              S_OK == q1 ? L"S_OK" : L"no", g_cfShellIdList ? (S_OK == q2 ? L"S_OK" : L"no") : L"-",
-              g1, g2);
     return ok || g1 || g2;
 }
 
@@ -3771,7 +3728,6 @@ static HRESULT __stdcall DtDragEnter(IDropTarget *self, IDataObject *d, DWORD ke
     DragSteadyShow();
     g_oleOk = OleAccepts(d);
     g_oleAllow = *ef;                  // 源允许集：返回值必须落在它的子集里
-    DropTrace(L"enter: allow=%u (1=COPY 2=MOVE 4=LINK)", g_oleAllow);
     *ef = g_oleOk ? PickEffect(g_oleAllow) : DROPEFFECT_NONE;
     if (g_oleOk) OleUpdateOver(pt);
     return S_OK;
@@ -3790,7 +3746,6 @@ static HRESULT __stdcall DtDragLeave(IDropTarget *self)
     UNREF(self);
     g_extDrag = FALSE;
     OleClearOver();
-    DropTrace(L"leave");
     return S_OK;
 }
 
@@ -3807,7 +3762,6 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
     STGMEDIUM med;
     if (SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
         UINT nf = DragQueryFileW((HDROP)med.hGlobal, 0xFFFFFFFF, NULL, 0);
-        DropTrace(L"drop: HDROP ok, nf=%u", nf);
         if (nf > 0) {
             HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
             ReleaseStgMedium(&med);
@@ -3817,12 +3771,9 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
         // 关键：虚拟项（回收站等）的数据对象可能挂一个"零文件"的合法
         // HDROP——不能当成功收场，必须落到 SHELLIDLIST 路线拿 PIDL
         ReleaseStgMedium(&med);
-    } else {
-        DropTrace(L"drop: HDROP getdata fail");
     }
     if (g_cfShellIdList) {
-        int n = HandleShellIdList(g_hwnd, d, p);
-        DropTrace(L"drop: idlist applied=%d", n);
+        HandleShellIdList(g_hwnd, d, p);
         *ef = PickEffect(g_oleAllow);
     }
     return S_OK;
