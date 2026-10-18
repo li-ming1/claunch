@@ -268,6 +268,7 @@ typedef struct {
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
+static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
 static void SaveConfig(void);
 static void InvalidateTitle(void);
 static void InvalidateSidebar(void);
@@ -300,6 +301,7 @@ static void CloseToTray(void)
     else DestroyWindow(g_hwnd);
 }
 
+
 static void ExitApp(void)
 {
     SaveConfig();
@@ -307,6 +309,7 @@ static void ExitApp(void)
 }
 
 static HANDLE g_once;              // 单实例互斥体：进程生命周期持有，OnDestroy 收
+
 
 // ---------------------------------------------------------------- 工具
 static int S_(int v) { return MulDiv(v, g_dpi, 96); }
@@ -1862,6 +1865,7 @@ static void WakePrune(void)
 static void ShowLauncher(void)
 {
     WakePrune();
+    InitOleDrop(g_hwnd);    // 唤醒即注册拖放目标（延迟初始化，见 InitOleDrop）
     POINT pt;
     GetCursorPos(&pt);
     RECT wr;
@@ -3374,7 +3378,13 @@ static void OnPaint(HWND h)
 {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
-    if (g_memDC) {
+    // 隐藏窗没有可画的内容：启动期实测 Windows 会给不可见的层面板发
+    // WM_PAINT（创建期消息序列/强制绘制路径）——整段跳过，图标加载、
+    // shell 图标管线、离屏缓冲全部不碰。一次跳过省 ~16MB 工作集 +
+    // ~50 GDI（trace 实测：OnPaint 后 0.8M→18M/GDI 26→79）。
+    // 唤醒后窗口可见，照常全量绘制
+    if (IsWindowVisible(h)) {
+        if (g_memDC) {
         // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
         // 其余缓冲内容保持上一帧，与屏幕一致。
         RECT rc;
@@ -3392,6 +3402,7 @@ static void OnPaint(HWND h)
         g_memFresh = FALSE;
     } else {
         PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
+    }
     }
     EndPaint(h, &ps);
 }
@@ -4092,6 +4103,7 @@ static IDropTargetVtbl g_dtVtbl = {
 // OleInitialize 失败（COM 不可用）就留在 DragAcceptFiles 老路，功能不倒退
 static void InitOleDrop(HWND h)
 {
+    if (g_oleInit) return;            // 幂等：延迟初始化下每次唤醒都会走到这
     if (FAILED(OleInitialize(NULL))) return;
     g_oleInit = TRUE;
     g_drop.lpVtbl = &g_dtVtbl;
@@ -4247,7 +4259,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     // 拖放唤醒：面板隐藏时拖动光标进入其静置区——就地显示但不抢前台
     //（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动（落点就在原地）
     case WM_APP_DRAGWAKE:      if (!IsWindowVisible(h) && !g_dlgOpen) {
-                                   WakePrune();
+                                   InitOleDrop(h);      // 先注册拖放目标再显示：
+                                   WakePrune();        // 可被命中时目标必已就位
                                    ShowWindow(h, SW_SHOWNA);
                                    StartFadeIn();
                                    SetTimer(h, TIMER_HIDE, 120, NULL);
@@ -4380,7 +4393,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     // 属性对话框是独立窗口，保持默认 IME，中文输入不受影响。
     ImmAssociateContext(g_hwnd, NULL);
 
-    InitOleDrop(g_hwnd);   // OLE 拖放：回收站等虚拟项拖入（失败则 DragAcceptFiles 兜底照旧）
+    // OLE 拖放（回收站等虚拟项）刻意不在此初始化——见 InitOleDrop 注释：
+    // 静默驻托盘是默认态，面板不可见时注册拖放目标毫无意义，而
+    // OleInitialize 一次性烫入 ~16MB COM 基础设施（trace 实测）。唤醒
+    // 路径先初始化再显示；失败则 DragAcceptFiles 兜底照旧
 
     ClampToWorkArea();
     if (g_silent) {
@@ -4391,6 +4407,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         g_needPrune = TRUE;
         ShowWindow(g_hwnd, SW_HIDE);
         KillTimer(g_hwnd, TIMER_HIDE);
+        // 静默启动同样裁剪：托盘就绪即回落到低位工作集（与淡出隐藏路径
+        // 同一"零轮询+裁剪"不变量）。实测省 ~7MB 启动瞬时工作集——
+        // 裁剪页按需软调入，首次唤醒多几微秒故障，无感
+        TrimWS();
     } else {
         if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
         ShowWindow(g_hwnd, SW_SHOW);
@@ -4404,4 +4424,4 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         DispatchMessageW(&msg);
     }
     return (int)msg.wParam;
-}
+}
