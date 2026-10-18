@@ -957,7 +957,7 @@ static int AddItemByPath(const WCHAR *path, int group)
     return AddItemRaw(name, path, group, NULL, NULL);
 }
 
-// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、丢掉旧图标。
+// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、清提示、丢旧图标。
 // 不在这里 EnsureIcon：图标一律由 PaintGrid 按格按需加载（绘制时才对可见格
 // 解析）。批量拖入时拖放处理器对每个落点调本函数——若就地加载，拖 50 个
 // 文档到列表末尾（屏幕外）要同步付 50 次图标链解析（每次约 0.4~1ms），
@@ -971,6 +971,7 @@ static void SetItemTarget(int ii, const WCHAR *path, int group)
     wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
     g_items[ii].group = group;
     g_items[ii].args[0] = 0;
+    g_items[ii].tip[0] = 0;   // 旧程序的提示描述的是旧目标：不清会顶掉新名字
 }
 
 static void RemoveItemAt(int k)
@@ -1013,8 +1014,14 @@ static void EnsureSlot(int slot)
 {
     if (slot < 0) return;
     int g = TargetGroup();
-    while (ViewCount() <= slot && g_nItems < MAX_ITEMS)
+    // 视图计数只读一次：AddItemRaw 每补一格就把视图标脏，循环里再问
+    // ViewCount 会触发整表重建——补 n 格是 O(n²)，批量拖放逐文件调用
+    // 还要再乘一层。脏标记是懒的：循环里本地计数，收尾一次重建即可
+    int have = ViewCount();
+    while (have <= slot && g_nItems < MAX_ITEMS) {
         AddItemRaw(L"", L"", g, NULL, NULL);
+        have++;
+    }
 }
 
 // ---------------------------------------------------------------- 槽位操作（插入/删除/清空）
