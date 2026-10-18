@@ -154,10 +154,11 @@ static int       g_dpi = 96;
 
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
+static HPEN   g_penLine;              // 格子/卡片边框（1px C_LINE）
+static HPEN   g_penAccent;            // 格子悬停/拖动焦点环（1px C_ACCENT）
 // 标题栏按钮的图形对象（缓存，见 MakeGdiObjects）：钉住三态填色 +
 // 字形提亮 + 两枚按下底。字形全部走填充（多边形/椭圆），不用 pen
 static HBRUSH g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr;
-static HPEN   g_penLine;                  // 格子边框（同出处）
 static int    g_cw, g_ch;
 static HDC    g_memDC;          // 离屏缓冲：WM_SIZE 重建，WM_PAINT 画进去再整体上屏
 static HBITMAP g_memBmp;
@@ -1694,7 +1695,9 @@ static void MakeGdiObjects(void)
     if (g_brClose)    { DeleteObject(g_brClose);    g_brClose = NULL; }
     if (g_brClosePr)  { DeleteObject(g_brClosePr);  g_brClosePr = NULL; }
     if (g_penLine)    { DeleteObject(g_penLine);    g_penLine = NULL; }
+    if (g_penAccent)  { DeleteObject(g_penAccent);  g_penAccent = NULL; }
     g_penLine    = CreatePen(PS_SOLID, 1, C_LINE);
+    g_penAccent  = CreatePen(PS_SOLID, 1, C_ACCENT);   // 格子悬停/拖动焦点环
     g_brPinOff   = CreateSolidBrush(C_DIM);       // 钉住·未置顶
     g_brPinOn    = CreateSolidBrush(C_ACCENT);    // 钉住·已置顶
     g_brGlyph    = CreateSolidBrush(C_TEXT);      // 字形·悬停提亮
@@ -1863,8 +1866,11 @@ static void ClearFilter(void)
 static void DrawCard(HDC dc)
 {
     RECT r = g_cardRect;
-    FillRect(dc, &r, g_brPanel);
-    FrameRect(dc, &r, g_brLine);
+    int rad = S_(8);
+    HPEN op = (HPEN)SelectObject(dc, g_penLine);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, g_brPanel);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);   // 圆角面板：填充+边框一枚调用
+    SelectObject(dc, op); SelectObject(dc, ob);
     SetTextColor(dc, C_TEXT);
     DrawTextW(dc, g_cardText, -1, &r,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -2109,8 +2115,9 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         if (r.bottom < g_titleH || r.top > g_ch) continue;
         if (clip && !IntersectRect(&hit, &r, clip)) continue;   // 行不在脏区：整行跳过
         BOOL sel = (i == g_curGroup), hov = (i == g_hoverGroup);
-        // 只用“选中高亮”，不再叠加悬停灰底，避免两种高亮重复
-        if (sel) FillRect(dc, &r, g_brCell);
+        // 选中行常亮底 + 下方指示条；未选中行悬停时给同一层浅底，让
+        // “这一行有反应”可感知（两者互斥取同一刷子，不会叠加）
+        if (sel || hov) FillRect(dc, &r, g_brCell);
         SetTextColor(dc, sel ? C_ACCEL : (hov ? C_TEXT : C_DIM));
         RECT tr = { r.left + S_(4), r.top, r.right - S_(4), r.bottom };
         DrawTextW(dc, g_groups[i].name, -1, &tr,
@@ -2179,8 +2186,11 @@ static void PaintGrid(HDC dc, const RECT *clip)
     // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
     // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
     RECT hit;
-    // 边框 pen / 底色 brush 循环外只选一次；一个 Rectangle 同时完成填充+1px
-    // 边框（原来 FillRect+FrameRect 两次调用），悬停格才换一次底色画刷
+    // 边框 pen / 底色 brush 循环外只选一次（普通态）；一枚 RoundRect 同时
+    // 完成填充+边框+圆角。悬停/拖动格换 accent 边——焦点环贴着圆角走
+    // （替代旧的内缩 FrameRect），悬停重绘反而少一次 GDI 调用
+    int rad = g_cell / 2 - 1;
+    if (rad > S_(6)) rad = S_(6);        // 大格子封顶：小圆角才耐看
     HPEN   op = (HPEN)SelectObject(dc, g_penLine);
     HBRUSH ob = (HBRUSH)SelectObject(dc, g_brCell);
     SetTextColor(dc, C_TEXT);            // 所有格子的标签同色：循环外设一次
@@ -2195,18 +2205,17 @@ static void PaintGrid(HDC dc, const RECT *clip)
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
             int ii = ItemAtView(vi);
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
-            if (hov) SelectObject(dc, g_brCellHi);
-            Rectangle(dc, r.left, r.top, r.right, r.bottom);
-            if (hov) SelectObject(dc, g_brCell);
-            if (hov) {
-                // 悬停格强调色内边框：底色变浅之外再给一圈 1px 焦点环，扫视时一眼锁定
-                RECT hr = r;
-                InflateRect(&hr, -1, -1);
-                FrameRect(dc, &hr, g_brAccent);
+            BOOL drag = g_dragging && (vi == g_pressCell ||
+                                       (g_dropIn && vi == g_dropCell && vi != g_pressCell));
+            if (hov || drag) {          // 焦点态：accent 边 + 提亮底（悬停）/常规底（拖动标示）
+                SelectObject(dc, g_penAccent);
+                SelectObject(dc, hov ? g_brCellHi : g_brCell);
             }
-            if (g_dragging && (vi == g_pressCell ||
-                               (g_dropIn && vi == g_dropCell && vi != g_pressCell)))
-                FrameInset(dc, r, S_(2), g_brAccent);   // 拖动源/落点高亮
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+            if (hov || drag) {          // 恢复普通态对象，后续格子不必重选
+                SelectObject(dc, g_penLine);
+                SelectObject(dc, g_brCell);
+            }
             if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
             EnsureIcon(ii);
             if (g_items[ii].icon) {
@@ -3465,7 +3474,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
             g_brAccent, g_brAccel, g_brPanel,
             g_brPinOff, g_brPinOn, g_brGlyph, g_brBtnPress, g_brClose, g_brClosePr,
-            g_penLine,
+            g_penLine, g_penAccent,
         };
         for (size_t i = 0; i < _countof(objs); i++)
             if (objs[i]) DeleteObject(objs[i]);
