@@ -9,7 +9,8 @@
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
 // 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
-// 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
+// 直接键入即跨全部分组极速搜索：前缀>词首>子串>路径的相关度排序，
+// 回车启动最优匹配（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
 // 托盘菜单可开/关：开机自启（写 HKCU Run 键）、静默启动（直接进托盘）。
 // 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
@@ -325,11 +326,12 @@ static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
     return dst;
 }
 
-// 大小写不敏感的子串查找（名称搜索过滤用；ASCII 折叠大小写，CJK 原样比较。
-// 不引 shlwapi 的 StrStrIW——少一个 DLL 依赖，且名称≤47 字符，O(n*m) 可忽略）
-static BOOL ContainsText(const WCHAR *hay, const WCHAR *needle)
+// 大小写不敏感子串查找（ASCII 折叠大小写，CJK 原样比较。不引 shlwapi 的
+// StrStrIW——少一个 DLL 依赖，且名称≤47 字符，O(n*m) 可忽略）。返回命中
+// 位置，-1 未中
+static int FindTextI(const WCHAR *hay, const WCHAR *needle)
 {
-    if (!needle[0]) return TRUE;
+    if (!needle[0]) return 0;
     for (const WCHAR *p = hay; *p; p++) {
         const WCHAR *a = p, *b = needle;
         while (*b) {
@@ -339,9 +341,32 @@ static BOOL ContainsText(const WCHAR *hay, const WCHAR *needle)
             if (ca != cb) break;
             a++; b++;
         }
-        if (!*b) return TRUE;
+        if (!*b) return (int)(p - hay);
     }
-    return FALSE;
+    return -1;
+}
+
+static BOOL IsSepW(WCHAR c)
+{
+    return c == L' ' || c == L'\t' || c == L'(' || c == L')' || c == L'-' ||
+           c == L'_' || c == L'.' || c == L'[' || c == L']' || c == L'（' ||
+           c == L'）' || c == L'【' || c == L'】' || c == L'·' || c == L'—' ||
+           c == L',' || c == L'，';
+}
+
+// 搜索打分：前缀 4 > 词首 3 > 名内子串 2 > 路径子串 1 > 0 不匹配。
+// 词首 = 名字中任意词的开头（空格/括号/点/横线/下划线/中点等之后）——
+// “HP Support Assistant” 输 hp、sa 均为词首命中，排在普通子串前；
+// CJK 名字无词边界概念，按子串计分，天然不误伤
+static int MatchScore(const WCHAR *name, const WCHAR *path, const WCHAR *q)
+{
+    int pos = FindTextI(name, q);
+    if (pos >= 0) {
+        if (pos == 0) return 4;
+        if (IsSepW(name[pos - 1])) return 3;
+        return 2;
+    }
+    return (path[0] && FindTextI(path, q) >= 0) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------- 布局
@@ -386,10 +411,27 @@ static void ViewDirty(void)
 static void ViewRebuild(void)
 {
     g_viewN = 0;
-    for (int i = 0; i < g_nItems; i++) {
-        if (g_items[i].group != g_curGroup) continue;
-        if (!ContainsText(g_items[i].name, g_filter)) continue;   // 搜索过滤：与分组条件链在同一遍扫描里
-        g_viewIdx[g_viewN++] = i;
+    if (g_filter[0]) {
+        // 搜索模式：跨全部分组的极速匹配，按相关度排序（前缀>词首>子串>路径，
+        // 同分保持配置顺序）。≤128 条插入排序，键入速率下零感知
+        struct { int idx, score; } hits[MAX_ITEMS];
+        int n = 0;
+        for (int i = 0; i < g_nItems; i++) {
+            int s = MatchScore(g_items[i].name, g_items[i].path, g_filter);
+            if (s > 0) { hits[n].idx = i; hits[n].score = s; n++; }
+        }
+        for (int i = 1; i < n; i++) {
+            int idx = hits[i].idx, sc = hits[i].score;
+            int j = i - 1;
+            while (j >= 0 && hits[j].score < sc) { hits[j + 1] = hits[j]; j--; }
+            hits[j + 1].idx = idx; hits[j + 1].score = sc;
+        }
+        for (int i = 0; i < n; i++) g_viewIdx[g_viewN++] = hits[i].idx;
+    } else {
+        for (int i = 0; i < g_nItems; i++) {
+            if (g_items[i].group != g_curGroup) continue;
+            g_viewIdx[g_viewN++] = i;
+        }
     }
     g_viewValid = TRUE;
 }
@@ -1901,6 +1943,12 @@ static BOOL UpdateHoverText(void)
         if (ii >= 0) {
             if (IsBlank(ii)) return SetHover(L"空位：把程序拖进来", TRUE);
             const Item *it = &g_items[ii];
+            if (g_filter[0]) {
+                // 搜索中卡片：名字 + 所属分组——跨组搜索时用户需要知道条目住哪组
+                WCHAR txt[96];
+                swprintf(txt, 96, L"%s · %s", it->name, g_groups[it->group].name);
+                return SetHover(txt, TRUE);
+            }
             return SetHover(it->tip[0] ? it->tip : it->name, TRUE);
         }
     }
@@ -2330,7 +2378,7 @@ static void PaintTitle(HDC dc)
     } else if (g_filter[0]) {
         // 搜索中：标题栏让位给过滤词（左对齐 + 命中数），悬停详情看小卡片
         WCHAR txt[64];
-        swprintf(txt, 64, L"搜索: %s (%d)", g_filter, ViewCount());
+        swprintf(txt, 64, L"搜索: %s (%d·全部分组)", g_filter, ViewCount());
         SetTextColor(dc, C_TEXT);
         DrawTextW(dc, txt, -1, &ttl,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -3483,8 +3531,10 @@ static void OnKeyDown(WPARAM w)
         LaunchView((int)(w - '1'));
         return;
     }
-    if (w == VK_RETURN) {                           // 回车：启动悬停格
-        LaunchView(g_hoverCell);
+    if (w == VK_RETURN) {                           // 回车：启动悬停格；搜索中悬停失效=最优匹配
+        int v = g_hoverCell;
+        if (g_filter[0] && (v < 0 || v >= ViewCount())) v = 0;
+        LaunchView(v);
         return;
     }
     int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
