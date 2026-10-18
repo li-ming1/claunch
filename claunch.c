@@ -5,7 +5,8 @@
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
-// 默认静默启动：开机/双击直接进托盘不弹面板（托盘可改）；失效清理延到首次唤醒，
+// 默认静默启动：开机/双击直接进托盘不弹面板（唯一行为；配置 Silent=0
+// 可手工改回启动显示），失效清理延到首次唤醒，
 // 托盘就绪不等磁盘。
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
@@ -107,7 +108,6 @@
 #define IDM_TRAY_SHOW       1101
 #define IDM_TRAY_PIN        1102
 #define IDM_TRAY_AUTO       1103
-#define IDM_TRAY_SILENT     1104
 #define IDM_TRAY_HOTKEY     1105
 
 #define DLG_OK          1
@@ -2377,15 +2377,6 @@ static void TogglePin(void)
     UpdateTrayTip();      // 托盘提示里的“置顶”标记跟着变
 }
 
-// 静默启动开关：只影响下次启动（当次不隐藏，正在用的窗口不动）
-static void ToggleSilent(void)
-{
-    g_silent = !g_silent;
-    SaveConfig();
-    UpdateTrayTip();      // 托盘提示里的“静默”标记跟着变
-    FlashFmt(L"静默启动已%s：下次启动直接进托盘", g_silent ? L"开启" : L"关闭");
-}
-
 // ---------------------------------------------------------------- 标题栏按钮图形
 // 视觉语言（全部 GDI 原生图形，无位图资源，随 S_() 缩放）：
 //   · 悬停/按下底色是胶囊形（圆角半径 = 半高）；关闭键悬停转 Windows
@@ -2898,13 +2889,13 @@ static void InitAutostart(void)
 // 运行时画一个 2x2 格子图标：不必引入 .ico 资源，保持单文件
 
 // 组装托盘提示：当前分组 + 激活的开关（全关时退化）。开关状态一目了然，
-// 不用每次都右键开菜单看勾选；分组名让悬停一眼知道面板停在哪组
+// 不用每次都右键开菜单看勾选；分组名让悬停一眼知道面板停在哪组。
+// 静默启动已是唯一行为（配置可手工改），不再是“开关”所以不进提示
 static void BuildTrayTip(WCHAR *out, size_t cch)
 {
     WCHAR flags[40] = L"";
     if (g_pinned)    wcscat_s(flags, 40, L"置顶·");
     if (g_autostart) wcscat_s(flags, 40, L"自启·");
-    if (g_silent)    wcscat_s(flags, 40, L"静默·");
     if (flags[0]) flags[wcslen(flags) - 1] = 0;   // 去掉末尾分隔符
     const WCHAR *grp = (g_curGroup >= 0 && g_curGroup < g_nGroups)
                      ? g_groups[g_curGroup].name : L"";
@@ -3134,19 +3125,17 @@ static void TrayShowMenu(void)
         AppendMenuW(m, MF_STRING, IDM_TRAY_HOTKEY, L"设置唤醒快捷键(&H)...");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
-        // 两项是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
-        // 效果，文本里注明生效时机，免得看着像打钩没反应
+        // 自启是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
+        // 效果，文本里注明生效时机，免得看着像打钩没反应。
+        // 静默启动已是唯一行为（配置 Silent=0 可手工改回，无菜单项）
         AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
                     L"开机自启动（重启生效）");
-        AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
-                    L"静默启动（重启生效）");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
         int cmd = PopupAt(m);
 
         if (cmd == IDM_TRAY_PIN)    { TogglePin();       continue; }
         if (cmd == IDM_TRAY_AUTO)   { ToggleAutostart(); continue; }
-        if (cmd == IDM_TRAY_SILENT) { ToggleSilent();    continue; }
         if (cmd == IDM_TRAY_HOTKEY) {
             UINT nm = g_hotMods, nv = g_hotVk;
             if (RunHotkeyCapture(g_hwnd, &nm, &nv)) {
