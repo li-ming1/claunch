@@ -1,5 +1,6 @@
 // kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
-// 左侧自定义分组（行可拖拽排序，决定滚轮切换顺序）、正方形密集格子（槽位模型：
+// 左侧分组完全用户自治（默认“常用”，可删可改名、行可拖拽排序决定滚轮切换
+// 顺序，无内置“全部”聚合视图）、正方形密集格子（槽位模型：
 // 拖放即与落点互换、清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
@@ -149,7 +150,7 @@ typedef struct {
 static Item  g_items[MAX_ITEMS];
 static int   g_nItems = 0;
 static Group g_groups[MAX_GROUPS];
-static int   g_nGroups = 1;
+static int  g_nGroups = 0;
 
 // 当前视图：当前分组条目的全局下标（按序）。条目增删移/换组/切组才失效重建，
 // 之后 ViewCount/ItemAtView 都是 O(1) 读表——绘制、悬停、滚轮每帧都走这条路。
@@ -215,7 +216,7 @@ static POINT g_oleAutoPt;       // 自动滚动期间复算落点的最后光标
 static BOOL g_dropOn;           // IDropTarget 已注册主窗（销毁时 Revoke）
 static BOOL g_oleInit;          // OleInitialize 已成功（销毁时配对 Uninitialize）
 static UINT g_cfShellIdList;    // CFSTR_SHELLIDLIST 格式原子（0=注册失败：虚拟项不可收）
-static int  g_pressGroup = -1;  // 按下的分组行（侧栏重排用；组 0“全部”不参与）
+static int  g_pressGroup = -1;  // 按下的分组行（侧栏重排用）
 static BOOL g_dragGroup;        // 分组重排中（已越过拖动阈值）
 static int  g_dropGroup = -1;   // 分组重排的落点行
 static POINT g_pressPt;
@@ -384,7 +385,7 @@ static void ViewRebuild(void)
 {
     g_viewN = 0;
     for (int i = 0; i < g_nItems; i++) {
-        if (g_curGroup != 0 && g_items[i].group != g_curGroup) continue;
+        if (g_items[i].group != g_curGroup) continue;
         if (!ContainsText(g_items[i].name, g_filter)) continue;   // 搜索过滤：与分组条件链在同一遍扫描里
         g_viewIdx[g_viewN++] = i;
     }
@@ -1106,11 +1107,11 @@ static void RemoveItemAt(int k)
 }
 
 // 侧栏分组重排：把第 from 组移到 to 位，中间顺移。
-// 组 0（“全部”）是伪分组，不参与。条目的 group 编号与被移动组跨越的区间
-// 一起平移，当前组跟着走——否则组序变了、条目还挂在旧编号上
+// 条目的 group 编号与被移动组跨越的区间一起平移，当前组跟着走——
+// 否则组序变了、条目还挂在旧编号上
 static void MoveGroup(int from, int to)
 {
-    if (from <= 0 || to <= 0 || from >= g_nGroups || to >= g_nGroups || from == to) return;
+    if (from < 0 || to < 0 || from >= g_nGroups || to >= g_nGroups || from == to) return;
     Group tmp = g_groups[from];
     if (from < to)
         for (int k = from; k < to; k++) g_groups[k] = g_groups[k + 1];
@@ -1222,7 +1223,7 @@ static int AddGroup(const WCHAR *name)
 
 static void DeleteGroup(int i)
 {
-    if (i <= 0 || i >= g_nGroups) return;
+    if (i < 0 || i >= g_nGroups) return;    // 分组完全用户自治：首组也可删（连同其条目）
     for (int k = 0; k < g_nItems; ) {
         if (g_items[k].group == i) RemoveItemAt(k);
         else k++;
@@ -1237,16 +1238,18 @@ static void DeleteGroup(int i)
     RefreshCard();       // 视图/分组列表变了：悬停目标可能已失效，卡片重算
 }
 
+// 默认落组：第一分组；一个分组都没有时兜底建“常用”（删光后拖入仍可落）
 static int DefaultGroup(void)
 {
-    if (g_nGroups > 1) return 1;
-    return AddGroup(L"常用");
+    if (g_nGroups <= 0) AddGroup(L"常用");
+    return 0;
 }
 
-// “全部”组（0）是伪分组：新增条目的落组。四处共用同一判定
+// 新增条目的落组：当前分组（当前组失效——如删空——则回落首组）
 static int TargetGroup(void)
 {
-    return g_curGroup ? g_curGroup : DefaultGroup();
+    if (g_curGroup >= g_nGroups) return DefaultGroup();
+    return g_curGroup;
 }
 
 // 新建分组：先弹命名框（预填默认名），取消=不建；清空=回落默认名。
@@ -1255,10 +1258,10 @@ static void NewGroup(void)
 {
     if (g_nGroups >= MAX_GROUPS) return;       // 预检：别弹了框再静默失败
     WCHAR name[48];
-    swprintf(name, 48, L"新分组%d", g_nGroups);
+    swprintf(name, 48, L"新分组%d", g_nGroups + 1);
     DlgField f[1] = { { L"名称(N):", name, 48, 0 } };
     if (!RunDialog(g_hwnd, L"新建分组", f, 1)) return;
-    if (!name[0]) swprintf(name, 48, L"新分组%d", g_nGroups);
+    if (!name[0]) swprintf(name, 48, L"新分组%d", g_nGroups + 1);
     int ni = AddGroup(name);
     if (ni < 0) return;
     SelectGroup(ni);      // 切过去：滚动位/侧栏可见性/悬停/卡片全套收尾
@@ -1427,8 +1430,7 @@ static void LoadConfig(void)
     r.f = CreateFileW(g_ini, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 
     g_pinned = FALSE;
-    wcsncpy_s(g_groups[0].name, 48, L"全部", _TRUNCATE);
-    g_nGroups = 1;
+    g_nGroups = 0;               // 分组完全用户自治：无内置“全部”，空配置兜底建“常用”
 
     WCHAR line[1200], section[32] = L"";
     WCHAR rect[64] = L"";
@@ -1471,14 +1473,25 @@ static void LoadConfig(void)
             }
             if (nf < 2) continue;
             int grp = (nf >= 3 && f[2][0]) ? _wtoi(f[2]) : 0;
-            if (grp < 0 || grp >= g_nGroups) grp = 0;
-            if (grp == 0) grp = DefaultGroup();
+            if (grp < 0 || grp >= g_nGroups) grp = DefaultGroup();
             AddItemRaw(f[0], f[1], grp,
                        nf >= 4 ? f[3] : NULL, nf >= 6 ? f[5] : NULL);   // f[4] 是旧格式的 work 槽：跳过
         }
     }
     if (r.f != INVALID_HANDLE_VALUE) CloseHandle(r.f);
-    if (g_nGroups < 2) AddGroup(L"常用");
+    // 旧格式迁移：老配置的 G0 恒为“全部”伪分组（条目从不在它名下）——
+    // 新模型里它只是个空组，剥掉，后续组前移一位、条目组号与当前组跟着平移
+    if (g_nGroups > 1 && !wcscmp(g_groups[0].name, L"全部")) {
+        BOOL used = FALSE;
+        for (int i = 0; i < g_nItems && !used; i++) used = g_items[i].group == 0;
+        if (!used) {
+            for (int k = 0; k < g_nGroups - 1; k++) g_groups[k] = g_groups[k + 1];
+            g_nGroups--;
+            for (int i = 0; i < g_nItems; i++) if (g_items[i].group > 0) g_items[i].group--;
+            if (g_curGroup > 0) g_curGroup--;
+        }
+    }
+    if (g_nGroups < 1) AddGroup(L"常用");   // 空配置/全删光：兜底建首组
     if (g_curGroup < 0 || g_curGroup >= g_nGroups) g_curGroup = 0;
     ViewDirty();
 
@@ -1654,7 +1667,7 @@ static void PasteItemAt(int ii, const ClipItem *ci)
     SyncAndSave();
 }
 
-// 追加为新条目到当前组（“全部”组时落到默认组）
+// 追加为新条目到当前组（分组被删光时兜底建“常用”）
 static void PasteItemNew(const ClipItem *ci)
 {
     int g = TargetGroup();
@@ -2858,7 +2871,7 @@ static void ShowCellMenu(int vi)
 static void ShowGroupMenu(int gi)
 {
     HMENU m = CreatePopupMenu();
-    if (gi > 0) {
+    if (gi >= 0) {               // 分组完全用户自治：任意行都可改名/删除（首组同理）
         AppendMenuW(m, MF_STRING, IDM_GRP_RENAME, L"重命名分组");
         AppendMenuW(m, MF_STRING, IDM_GRP_DEL, L"删除该分组");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -3221,7 +3234,6 @@ static void OnMouseMove(HWND h, LPARAM l)
         }
         if (g_dragGroup) {
             int ng = GroupAt(p);
-            if (ng == 0) ng = 1;             // 组 0（全部）不参与：靠顶即落到第 1 位
             if (ng != g_dropGroup) {
                 InvalidateGroups(g_dropGroup, ng);   // 行区间一个外接矩形
                 g_dropGroup = ng;
@@ -3279,7 +3291,7 @@ static void OnLButtonDown(HWND h, LPARAM l)
         } else {
             SelectGroup(g_hoverGroup);   // 切组：滚动位记忆/恢复与滚轮切组同一路径
         }
-        if (g_hoverGroup > 0) {          // 组 0（全部）不参与重排：按下即记住起点
+        if (g_hoverGroup >= 0) {         // 任意分组行按下即记住起点（重排）
             g_pressGroup = g_hoverGroup;
             g_pressPt = p;
             g_dragGroup = FALSE;
@@ -3509,9 +3521,9 @@ static void DropBegin(DropCtx *c, POINT p, int nf)
 {
     c->lo = c->hi = -1;                // 受影响的格子区间（局部重绘用）
     ClearFilter();
-    // 拖到侧栏分组行=直接追加进该组（组 0“全部”是伪分组，视同区外）
+    // 拖到侧栏分组行=直接追加进该组（含首组）
     int gi = GroupAt(p);
-    if (gi > 0) {
+    if (gi >= 0) {
         c->slot = -1;
         c->g = gi;
         return;
@@ -3547,9 +3559,8 @@ static void DropApply(DropCtx *c, int k, const WCHAR *path, const WCHAR *name)
 static void DropFinish(HWND h, const DropCtx *c)
 {
     ViewDirty();                           // 替换可能改了条目分组
-    // 落点分组必须对用户可见：落到“全部”视图的目标组、或拖到别的分组行
-    // 上时，视图跟过去——否则用户看到的就是“拖了没反应”（回收站拖入
-    // 无感即此）。落到当前组时 SelectGroup 内部早退
+    // 落点分组必须对用户可见：拖到别的分组行上落下时，视图跟过去——
+    // 否则用户看到的就是“拖了没反应”。落到当前组时 SelectGroup 内部早退
     if (c->g > 0 && c->g != g_curGroup) SelectGroup(c->g);
     SaveConfig();
     ClampScroll();
@@ -3676,7 +3687,7 @@ static void OleUpdateOver(POINTL ptl)
     ScreenToClient(g_hwnd, &p);
     // 侧栏分组行 = 落组目标（与 DropBegin 的 GroupAt 判定同一把尺）
     int ng = (p.x < g_sideW && p.y >= g_titleH) ? GroupAt(p) : -1;
-    if (ng <= 0) ng = -1;              // 组 0“全部”是伪分组，不作为落组目标
+    if (ng < 0) ng = -1;
     if (ng != g_oleGrp) {
         InvalidateGroup(g_oleGrp);     // vi<0 内部早退
         InvalidateGroup(ng);
