@@ -4,7 +4,8 @@
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
-// 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）。
+// 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
+// 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
@@ -58,6 +59,7 @@
 #define WM_APP_DRAGWAKE  (WM_APP + 5)  // 钩子转发的“拖动进入面板静置区”：面板就地弹回（不抢前台）
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
+#define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
 #define HOTKEY_ID       1
 
 // 时间与容差（毫秒 / 像素）：唤醒行为的一组参数，集中在这里调
@@ -206,6 +208,9 @@ static BOOL g_extDrag;          // 外部 OLE 拖放悬停中：落点高亮与�
                                 // 与内部拖动互斥（OLE 拖动时光标捕获在拖放源）
 static BOOL g_oleOk;            // 当前 OLE 拖放的数据有可收格式（DragEnter 定，整场有效）
 static DWORD g_oleAllow;        // 拖放源允许的效果集合（DragEnter 入参 *ef，整场有效）
+static int  g_oleGrp = -1;      // 外部拖放悬停的侧栏分组行（落组目标；-1=不在分组上）
+static int  g_oleAutoDir;       // 拖放自动滚动方向（-1 上 +1 下，0 停）
+static POINT g_oleAutoPt;       // 自动滚动期间复算落点的最后光标（屏幕坐标）
 static BOOL g_dropOn;           // IDropTarget 已注册主窗（销毁时 Revoke）
 static BOOL g_oleInit;          // OleInitialize 已成功（销毁时配对 Uninitialize）
 static UINT g_cfShellIdList;    // CFSTR_SHELLIDLIST 格式原子（0=注册失败：虚拟项不可收）
@@ -2237,6 +2242,9 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
         if (g_dragGroup && i == g_dropGroup && i != g_pressGroup)
             FrameInset(dc, r, S_(2), g_brAccent);
+        // 外部拖放悬停的落组高亮：与重排落点同一视觉语言（accent 内框）
+        if (g_extDrag && i == g_oleGrp)
+            FrameInset(dc, r, S_(2), g_brAccent);
     }
 
     // 分组超出可视高度时，右侧画一个细滚动条，让“可以滚”看得见
@@ -2774,11 +2782,16 @@ static void ShowCellMenu(int vi)
 {
     int ii = ItemAtView(vi);
     BOOL hasItem = ii >= 0 && !IsBlank(ii);
+    // shell 虚拟项（回收站/此电脑 = "::{CLSID}"）没有文件位置可去，
+    // 提权打开也无意义：这两个菜单项对它不诚实，直接不出现
+    BOOL virt = hasItem && g_items[ii].path[0] == L':' && g_items[ii].path[1] == L':';
     HMENU m = CreatePopupMenu();
     if (hasItem) {
         AppendMenuW(m, MF_STRING, IDM_LAUNCH, L"打开");
-        AppendMenuW(m, MF_STRING, IDM_ADMIN, L"以管理员身份运行");
-        AppendMenuW(m, MF_STRING, IDM_LOC, L"打开文件位置");
+        if (!virt) {
+            AppendMenuW(m, MF_STRING, IDM_ADMIN, L"以管理员身份运行");
+            AppendMenuW(m, MF_STRING, IDM_LOC, L"打开文件位置");
+        }
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
     AppendMenuW(m, MF_STRING, IDM_INS_SLOT, L"在此插入格子");
@@ -3469,6 +3482,13 @@ static void DropBegin(DropCtx *c, POINT p, int nf)
 {
     c->lo = c->hi = -1;                // 受影响的格子区间（局部重绘用）
     ClearFilter();
+    // 拖到侧栏分组行=直接追加进该组（组 0“全部”是伪分组，视同区外）
+    int gi = GroupAt(p);
+    if (gi > 0) {
+        c->slot = -1;
+        c->g = gi;
+        return;
+    }
     // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
     // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
     // 光标明明停在空格上，格子却没有任何变化。
@@ -3500,9 +3520,10 @@ static void DropApply(DropCtx *c, int k, const WCHAR *path, const WCHAR *name)
 static void DropFinish(HWND h, const DropCtx *c)
 {
     ViewDirty();                           // 替换可能改了条目分组
-    // 落点分组必须对用户可见：在“全部”视图落下时条目进了具体组，视图若
-    // 不跟过去，用户看到的就是“拖了没反应”（回收站拖入无感即此）
-    if (g_curGroup == 0 && c->g > 0) SelectGroup(c->g);
+    // 落点分组必须对用户可见：落到“全部”视图的目标组、或拖到别的分组行
+    // 上时，视图跟过去——否则用户看到的就是“拖了没反应”（回收站拖入
+    // 无感即此）。落到当前组时 SelectGroup 内部早退
+    if (c->g > 0 && c->g != g_curGroup) SelectGroup(c->g);
     SaveConfig();
     ClampScroll();
     RefreshCard();                         // 视图/名称可能变了，卡片同步
@@ -3620,11 +3641,20 @@ static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
 }
 
 // 外部拖放悬停：落点格高亮与内部排序拖动同源（g_dropCell/g_dropIn 同款
-// 更新与失效）。光标捕获在拖放源，本窗只收 DragOver 的屏幕坐标
+// 更新与失效）；光标在侧栏则高亮分组行（落组目标）。光标捕获在拖放源，
+// 本窗只收 DragOver 的屏幕坐标
 static void OleUpdateOver(POINTL ptl)
 {
     POINT p = { ptl.x, ptl.y };
     ScreenToClient(g_hwnd, &p);
+    // 侧栏分组行 = 落组目标（与 DropBegin 的 GroupAt 判定同一把尺）
+    int ng = (p.x < g_sideW && p.y >= g_titleH) ? GroupAt(p) : -1;
+    if (ng <= 0) ng = -1;              // 组 0“全部”是伪分组，不作为落组目标
+    if (ng != g_oleGrp) {
+        InvalidateGroup(g_oleGrp);     // vi<0 内部早退
+        InvalidateGroup(ng);
+        g_oleGrp = ng;
+    }
     int nc = SlotAt(p);
     BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
     if (nc != g_dropCell || nin != g_dropIn) {
@@ -3636,14 +3666,33 @@ static void OleUpdateOver(POINTL ptl)
         g_dropCell = nc;
         g_dropIn = nin;
     }
+    // 网格上/下边缘 24px：自动滚动。拖放循环只在光标移动时来拍——
+    // 光标停在边缘也要持续滚，靠 TIMER_DRAGSCROLL 自驱；滚动后按最后
+    // 光标位置复算落点，高亮才跟得上内容位移
+    int dir = 0;
+    if (p.x >= g_sideW && p.y >= g_titleH && p.y < g_ch) {
+        if (p.y < g_titleH + S_(24)) dir = -1;
+        else if (p.y >= g_ch - S_(24)) dir = 1;
+    }
+    g_oleAutoPt.x = ptl.x;
+    g_oleAutoPt.y = ptl.y;
+    if (dir != g_oleAutoDir) {
+        g_oleAutoDir = dir;
+        if (dir) SetTimer(g_hwnd, TIMER_DRAGSCROLL, 30, NULL);
+        else KillTimer(g_hwnd, TIMER_DRAGSCROLL);
+    }
 }
 
 static void OleClearOver(void)
 {
-    int oc = g_dropCell;
+    int oc = g_dropCell, og = g_oleGrp;
     g_dropCell = -1;
     g_dropIn = FALSE;
-    InvalidateCell(oc);        // vi<0 内部早退，无需判
+    g_oleGrp = -1;
+    g_oleAutoDir = 0;                  // 拖放结束：自动滚动一并停
+    KillTimer(g_hwnd, TIMER_DRAGSCROLL);
+    InvalidateCell(oc);                // vi<0 内部早退，无需判
+    InvalidateGroup(og);
 }
 
 // 源允许集与目标偏好的交集：回收站这类虚拟项的拖放源可能只允许
@@ -3829,6 +3878,25 @@ static void OnTimer(HWND h, WPARAM w)
         }
     } else if (w == TIMER_FADE) {
         StepFade();
+    } else if (w == TIMER_DRAGSCROLL) {
+        // 拖放自动滚动：光标停在网格边缘也持续滚；滚不动（到顶/到底）即停表。
+        // 滚动后按最后光标位置复算落点高亮，跟上内容位移
+        if (!g_extDrag || !g_oleAutoDir) {
+            KillTimer(h, TIMER_DRAGSCROLL);
+            g_oleAutoDir = 0;
+            return;
+        }
+        int old = g_scroll;
+        g_scroll += g_oleAutoDir * S_(28);
+        ClampScroll();
+        if (g_scroll == old) {         // 到顶/到底：内容不再位移，停表省空转
+            g_oleAutoDir = 0;
+            KillTimer(h, TIMER_DRAGSCROLL);
+            return;
+        }
+        RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
+        InvalidateRect(h, &gr, FALSE);
+        OleUpdateOver((POINTL){ g_oleAutoPt.x, g_oleAutoPt.y });
     }
 }
 
