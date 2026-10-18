@@ -191,6 +191,7 @@ static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，�
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
 static BOOL g_silent = TRUE;     // 静默启动（默认）：启动直接进托盘不淡入（配置持久化）
 static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
+static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（静默默验下的可发现性）
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
 static BOOL g_cfgDirty = FALSE;  // 配置有待落盘：缩放等连续操作防抖，避免每格滚轮都写文件
@@ -1563,6 +1564,7 @@ static void LoadConfig(void)
     ZeroMemory(&r, sizeof r);
     r.first = TRUE;
     r.f = CreateFileW(g_ini, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    g_firstRun = (r.f == INVALID_HANDLE_VALUE);   // 无配置=首跑：托盘就绪后给引导气球
 
     g_pinned = FALSE;
     g_nGroups = 0;               // 分组完全用户自治：无内置“全部”，空配置兜底建“常用”
@@ -1923,11 +1925,17 @@ static void FitRectToWorkArea(RECT *wr, const RECT *wa)
 
 static void ClampToWorkArea(void)
 {
-    RECT wa;
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     RECT wr;
     GetWindowRect(g_hwnd, &wr);
-    FitRectToWorkArea(&wr, &wa);
+    // 收进"窗口中心所在显示器"的工作区（多显示器：副屏上的面板不该被
+    // 钳回主屏——SPI_GETWORKAREA 只报主屏）。中心点不在任何显示器上
+    // （窗口被拖到屏外）时 MONITOR_DEFAULTTONEAREST 取最近的那个
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof mi);
+    mi.cbSize = sizeof mi;
+    POINT c = { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+    if (!GetMonitorInfoW(MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    FitRectToWorkArea(&wr, &mi.rcWork);
     SetWindowPos(g_hwnd, NULL, wr.left, wr.top,
                  wr.right - wr.left, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -3261,6 +3269,8 @@ static void OnCreate(HWND h)
     // 托盘图标
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
+    if (g_firstRun)
+        TrayBalloon(L"claunch 已驻留托盘：单击图标显示面板，Ctrl+Alt+K 随时唤醒，双击桌面空白也可以");
 }
 
 static void OnSize(HWND h, LPARAM l)
