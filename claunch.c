@@ -5,8 +5,7 @@
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
-// 默认静默启动：开机/双击直接进托盘不弹面板（唯一行为；配置 Silent=0
-// 可手工改回启动显示），失效清理延到首次唤醒，
+// 静默启动：开机/双击直接进托盘不弹面板（唯一行为），失效清理延到首次唤醒，
 // 托盘就绪不等磁盘。
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
@@ -194,7 +193,6 @@ static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateC
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
-static BOOL g_silent = TRUE;     // 静默启动（默认）：启动直接进托盘不淡入（配置持久化）
 static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
 static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（静默默验下的可发现性）
 // 唤醒快捷键（用户可配置，默认 Ctrl+Alt+K；配置行 Hotkey=<mods> <vk>）。
@@ -1621,7 +1619,6 @@ static void LoadConfig(void)
 
         if (!wcscmp(section, L"Main")) {
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
-            else if (!wcscmp(key, L"Silent"))  g_silent = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
                 unsigned mm = 0, vv = 0;
                 if (swscanf(val, L"%u %u", &mm, &vv) == 2 &&
@@ -1641,10 +1638,10 @@ static void LoadConfig(void)
         } else if (!wcscmp(section, L"Items")) {
             if (key[0] != L'I') continue;
             if (_wtoi(key + 1) != g_nItems) continue;
-            WCHAR *f[6] = { 0, 0, 0, 0, 0, 0 };
+            WCHAR *f[5] = { 0, 0, 0, 0, 0 };
             int nf = 0;
             WCHAR *p = val;
-            while (nf < 6) {
+            while (nf < 5) {
                 f[nf++] = p;
                 WCHAR *b = wcschr(p, L'|');
                 if (!b) break;
@@ -1655,7 +1652,7 @@ static void LoadConfig(void)
             int grp = (nf >= 3 && f[2][0]) ? _wtoi(f[2]) : 0;
             if (grp < 0 || grp >= g_nGroups) grp = DefaultGroup();
             AddItemRaw(f[0], f[1], grp,
-                       nf >= 4 ? f[3] : NULL, nf >= 6 ? f[5] : NULL);   // 第 5 槽为备用位（恒空）
+                       nf >= 4 ? f[3] : NULL, nf >= 5 ? f[4] : NULL);   // 名|路径|组|参数|提示
         }
     }
     if (r.f != INVALID_HANDLE_VALUE) CloseHandle(r.f);
@@ -1702,7 +1699,6 @@ static void SaveConfig(void)
     FmtLine(L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
     FmtLine(L"Pinned=%d\r\n", g_pinned ? 1 : 0);
-    FmtLine(L"Silent=%d\r\n", g_silent ? 1 : 0);
     FmtLine(L"Hotkey=%u %u\r\n", g_hotMods, g_hotVk);
     FmtLine(L"Group=%d\r\n", g_curGroup);
     FmtLine(L"Cell=%d\r\n", g_cellBase);
@@ -1715,10 +1711,10 @@ static void SaveConfig(void)
     FmtLine(L"[Items]\r\n");
     FmtLine(L"Count=%d\r\n", g_nItems);
     // 注意：每个字段必须用独立的缓冲区——函数参数求值顺序不确定。
-    // 条目行保留 6 个位置槽（work 槽固定为空），旧配置按位置读取不受影响
+    // 条目行五字段：名|路径|组|参数|提示
     static WCHAR sName[96], sPath[MAX_PATH + 8], sArgs[MAX_PATH + 8], sTip[128];
     for (int i = 0; i < g_nItems; i++) {
-        FmtLine(L"I%d=%s|%s|%d|%s||%s\r\n", i,
+        FmtLine(L"I%d=%s|%s|%d|%s|%s\r\n", i,
                 SafeField(sName, 96, g_items[i].name),
                 SafeField(sPath, MAX_PATH + 8, g_items[i].path), g_items[i].group,
                 SafeField(sArgs, MAX_PATH + 8, g_items[i].args),
@@ -3126,8 +3122,7 @@ static void TrayShowMenu(void)
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
         // 自启是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
-        // 效果，文本里注明生效时机，免得看着像打钩没反应。
-        // 静默启动已是唯一行为（配置 Silent=0 可手工改回，无菜单项）
+        // 效果，文本里注明生效时机，免得看着像打钩没反应
         AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
                     L"开机自启动（重启生效）");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -4663,25 +4658,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     // 路径先初始化再显示；失败则 DragAcceptFiles 兜底照旧
 
     ClampToWorkArea();
-    if (g_silent) {
-        // 静默启动（默认）：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出
-        // 检测心跳——不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零
-        // 轮询"不变量；唤醒时 ShowLauncher 会重启它。失效项目清理延到首次
-        // 唤醒（WakePrune）：托盘就绪不该等一轮磁盘 stat
-        g_needPrune = TRUE;
-        ShowWindow(g_hwnd, SW_HIDE);
-        KillTimer(g_hwnd, TIMER_HIDE);
-        ReleaseMemBuffer();                // 双缓冲 ~2MB 从未被画过：直接放
-        // 静默启动同样裁剪：托盘就绪即回落到低位工作集（与淡出隐藏路径
-        // 同一"零轮询+裁剪"不变量）。实测省 ~7MB 启动瞬时工作集——
-        // 裁剪页按需软调入，首次唤醒多几微秒故障，无感
-        TrimWS();
-    } else {
-        if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
-        ShowWindow(g_hwnd, SW_SHOW);
-        ForceForeground(g_hwnd);
-        StartFadeIn();   // 启动等同一次唤醒（TIMER_HIDE 在 WM_CREATE 已起）
-    }
+    // 静默启动是唯一行为：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出
+    // 检测心跳——不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零
+    // 轮询"不变量；唤醒时 ShowLauncher 会重启它。失效项目清理延到首次
+    // 唤醒（WakePrune）：托盘就绪不该等一轮磁盘 stat
+    g_needPrune = TRUE;
+    ShowWindow(g_hwnd, SW_HIDE);
+    KillTimer(g_hwnd, TIMER_HIDE);
+    ReleaseMemBuffer();                // 双缓冲 ~2MB 从未被画过：直接放
+    // 托盘就绪即裁剪到低位工作集（与淡出隐藏路径同一"零轮询+裁剪"不变
+    // 量）。实测省 ~7MB 启动瞬时工作集——裁剪页按需软调入，首次唤醒
+    // 多几微秒故障，无感
+    TrimWS();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
