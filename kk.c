@@ -164,6 +164,10 @@ static HBITMAP g_memBmp;
 static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
+// 侧栏分行几何：ScaleMetrics 随 DPI 一次算好，GroupRect/GroupAt/
+// EnsureGroupVisible/SidebarContentH/PaintSidebar 共用——原来裸 6/3/12
+// 散落五处，且不随 DPI 缩放（高 DPI 下侧栏留白被压扁）
+static int  g_grpPadX, g_grpPadTop, g_grpRowGap, g_grpPadY, g_grpSelBar;
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
@@ -418,7 +422,7 @@ static void ClampScroll(void)
 // 几何共用同一算式——两处各算一遍正是 thumb 与钳制曾经对不上的根源
 static int SidebarContentH(void)
 {
-    return g_nGroups * g_grpH + S_(12);
+    return g_nGroups * g_grpH + g_grpPadY;
 }
 
 static void ClampGrpScroll(void)
@@ -434,7 +438,7 @@ static void ClampGrpScroll(void)
 static void EnsureGroupVisible(int gi)
 {
     int view = g_ch - g_titleH;
-    int top = 6 + gi * g_grpH;
+    int top = g_grpPadTop + gi * g_grpH;
     int bottom = top + g_grpH;
     if (top - g_grpScroll < 0) g_grpScroll = top;
     else if (bottom - g_grpScroll > view) g_grpScroll = bottom - view;
@@ -459,15 +463,15 @@ static void SelectGroup(int gi)
 
 static RECT GroupRect(int i)
 {
-    int top = g_titleH + 6 + i * g_grpH - g_grpScroll;
-    RECT r = { 6, top, g_sideW - 6, top + g_grpH - 3 };
+    int top = g_titleH + g_grpPadTop + i * g_grpH - g_grpScroll;
+    RECT r = { g_grpPadX, top, g_sideW - g_grpPadX, top + g_grpH - g_grpRowGap };
     return r;
 }
 
 static int GroupAt(POINT p)
 {
     if (p.x >= g_sideW || p.y < g_titleH) return -1;
-    int i = (p.y - (g_titleH + 6) + g_grpScroll) / g_grpH;
+    int i = (p.y - (g_titleH + g_grpPadTop) + g_grpScroll) / g_grpH;
     if (i >= 0 && i < g_nGroups) {
         RECT r = GroupRect(i);
         if (p.y >= r.top && p.y < r.bottom) return i;
@@ -1120,15 +1124,10 @@ static void NewGroup(void)
     WCHAR name[48];
     swprintf(name, 48, L"新分组%d", g_nGroups);
     int ni = AddGroup(name);
-    if (ni >= 0) {
-        g_curGroup = ni;
-        ViewDirty();
-        RefreshCard();       // 切到空分组：悬停格可能已无对应条目，卡片收起
-        g_scroll = 0;
-        ClampGrpScroll();
-        SaveConfig();
-        InvalidateRect(g_hwnd, NULL, FALSE);
-    }
+    if (ni < 0) return;
+    SelectGroup(ni);      // 切过去：滚动位/侧栏可见性/悬停/卡片全套收尾
+                        // （新建组 appended 在末尾，EnsureGroupVisible 保证选中行看得见）
+    SaveConfig();
 }
 
 // ---------------------------------------------------------------- 启动
@@ -1647,6 +1646,11 @@ static void ScaleMetrics(void)
     g_sideW  = S_(84);
     g_gap    = S_(3);
     g_grpH   = S_(34);
+    g_grpPadX   = S_(6);      // 分行左右留白
+    g_grpPadTop = S_(6);      // 首行距标题栏
+    g_grpRowGap = S_(3);      // 行高里的间距（行视觉高度 = 行高 - 间距）
+    g_grpPadY   = S_(12);     // 列表内容高度的上下留白
+    g_grpSelBar = S_(2);      // 选中分组下方指示条粗细
     UpdateBtnRects();      // 标题栏按钮垂直居中于新标题栏高度
 }
 
@@ -1922,6 +1926,18 @@ static void InvalidateGroup(int gi)
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 
+// 重绘 [a, b] 分组行区间：侧栏重排每次移动只发一个更新区。
+// 行按 y 序排：上取 a 行顶、下取 b 行底即外接矩形（与 InvalidateCells 同构）
+static void InvalidateGroups(int a, int b)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    if (b < 0 || a >= g_nGroups) return;
+    if (a < 0) a = 0;
+    RECT r = GroupRect(a);
+    r.bottom = GroupRect(b).bottom;
+    InvalidateRect(g_hwnd, &r, FALSE);
+}
+
 static void InvalidateTitle(void)
 {
     RECT r = { 0, 0, g_cw, g_titleH };
@@ -2100,7 +2116,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         // 选中标记放在下方（原来在左侧）
         if (sel) {
-            RECT bar = { r.left, r.bottom - S_(2), r.right, r.bottom };
+            RECT bar = { r.left, r.bottom - g_grpSelBar, r.right, r.bottom };
             FillRect(dc, &bar, g_brAccel);
         }
         // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
@@ -2694,8 +2710,7 @@ static void ShowGroupMenu(int gi)
         }
     } else if (cmd == IDM_GRP_DEL) {
         DeleteGroup(gi);
-        SaveConfig();
-        InvalidateRect(g_hwnd, NULL, FALSE);
+        SyncAndSave();       // 悬停行可能随删组失效：统一收尾重算（原手滚缺 UpdateHoverText）
     } else if (cmd == IDM_GRP_NEW) {
         NewGroup();
     }
@@ -3035,8 +3050,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 int ng = GroupAt(p);
                 if (ng == 0) ng = 1;             // 组 0（全部）不参与：靠顶即落到第 1 位
                 if (ng != g_dropGroup) {
-                    InvalidateGroup(g_dropGroup);
-                    InvalidateGroup(ng);
+                    InvalidateGroups(g_dropGroup, ng);   // 行区间一个外接矩形
                     g_dropGroup = ng;
                 }
             }
