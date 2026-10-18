@@ -3171,6 +3171,11 @@ static BOOL IsDesktopPoint(POINT pt)
 
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
+    // 跨线程读 UI 态（g_hwnd/g_dlgOpen/IsWindowVisible）：按构造无害——
+    // g_hwnd 在本线程创建前就已赋值（WM_CREATE 先于 CreateThread），
+    // g_dlgOpen 是单字节标志（x86 对齐读写不可撕裂），IsWindowVisible 是
+    // 窗口管理器的内核态读取。最坏情况是慢一拍（晚一个事件才看到状态
+    // 变化），不产生错误动作
     if (nCode == HC_ACTION) {
         if (wParam == WM_LBUTTONDOWN) {
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
@@ -4101,6 +4106,10 @@ static void OnTimer(HWND h, WPARAM w)
             g_outSince = 0;
             return;
         }
+        if (g_menuOpen) {         // 弹出菜单开着（模态循环照派 WM_TIMER）：面板
+            g_outSince = 0;       // 不在眼底时也别隐藏——用户还在读菜单
+            return;
+        }
         if (g_extDrag) {          // 外部拖放悬停中：绝不自动隐藏（进入时已就地稳住）
             g_outSince = 0;
             return;
@@ -4171,6 +4180,7 @@ static void OnDestroy(HWND h)
         if (objs[i]) DeleteObject(objs[i]);
     if (g_memDC) DeleteDC(g_memDC);
     if (g_memBmp) DeleteObject(g_memBmp);
+    if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
     PostQuitMessage(0);
 }
 
@@ -4184,6 +4194,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     switch (m) {
+    // 关机/注销：DefWindowProc 对 WM_ENDSESSION 不落盘——待写配置会随进程
+    // 退出丢掉。先写后放行（QUERY 返回 TRUE=允许会话结束）
+    case WM_ENDSESSION:      SaveConfig();
+    case WM_QUERYENDSESSION:
+                               return TRUE;
     case WM_CREATE:            OnCreate(h);                              return 0;
     case WM_SIZE:              OnSize(h, l);                             return 0;
     case WM_GETMINMAXINFO: {   MINMAXINFO *mm = (MINMAXINFO *)l;
