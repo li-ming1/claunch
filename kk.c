@@ -3400,6 +3400,10 @@ static void OnDropFiles(HWND h, WPARAM w)
         int slot = SlotAt(p);
         int g = TargetGroup();
         int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
+        // 整批落点需要的空格一次补齐：逐文件调 EnsureSlot 会让视图重建
+        // nf 遍（每补一格标脏一次）；一次补到位后 ItemAtView 走缓存
+        if (slot >= 0)
+            EnsureSlot(slot + (int)(nf < (UINT)MAX_ITEMS ? nf : MAX_ITEMS) - 1);
         for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
             WCHAR path[MAX_PATH];
             if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
@@ -3407,7 +3411,6 @@ static void OnDropFiles(HWND h, WPARAM w)
             int s = slot + (int)k;          // 多文件自落点依次排开
             if (lo < 0) lo = hi = s;        // 记下受影响的格子范围
             else { if (s < lo) lo = s; if (s > hi) hi = s; }
-            EnsureSlot(s);                  // 落点在末尾之外：先补空格，前面的格子不动
             int ii = ItemAtView(s);
             if (ii >= 0) {
                 // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
@@ -3543,6 +3546,34 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     return DefWindowProcW(h, m, w, l);
 }
+// ---------------------------------------------------------------- 崩溃取证
+// build.bat 的 /MAP 产出 kk.map（RVA→符号）就是为这里服务的：未处理异常
+// 时把指令指针的 RVA 写进 exe 同目录的 kk_crash.txt，拿 RVA 对 map 一查
+// 即得崩溃点函数——单文件工具没有调试器，这是唯一的取证据手段。
+// 处理器里只用最朴素的 WinAPI（防二次崩溃），写完交还系统按默认路径终止
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
+{
+    WCHAR path[MAX_PATH];
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    WCHAR *slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = 0;
+    wcscat_s(path, MAX_PATH, L"kk_crash.txt");
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD_PTR rva = (DWORD_PTR)ep->ContextRecord->Rip -
+                        (DWORD_PTR)GetModuleHandleW(NULL);
+        char buf[96];
+        int n = snprintf(buf, sizeof buf, "code=0x%08lX rva=0x%llX\r\n",
+                         (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                         (unsigned long long)rva);
+        DWORD w = 0;
+        WriteFile(f, buf, (DWORD)n, &w, NULL);
+        CloseHandle(f);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // ---------------------------------------------------------------- 入口
 static HWND g_searchHit = NULL;
 
@@ -3598,6 +3629,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     HDC scr = GetDC(NULL);
     g_dpi = GetDeviceCaps(scr, LOGPIXELSX);
     ReleaseDC(NULL, scr);
+
+    SetUnhandledExceptionFilter(CrashFilter);   // 崩溃取证：先于一切业务初始化装上
 
     IniPath();
     ScaleMetrics();
