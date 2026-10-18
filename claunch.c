@@ -11,6 +11,7 @@
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
 // 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Del 清空悬停格、
+// Home/End/PageUp/PageDown 跳首末格/翻页（目标行自动滚进可视区）、
 // Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即跨全部分组极速搜索：前缀>词首>子串>拼音首字母>路径的相关度
 // 排序（中文应用名输拼音首字母即可命中，如 jsb→记事本），回车启动最优
@@ -582,6 +583,20 @@ static void ClampScroll(void)
     int maxS = need > visible ? (need - visible + g_cols - 1) / g_cols * (g_cell + g_gap) : 0;
     if (g_scroll > maxS) g_scroll = maxS;
     if (g_scroll < 0) g_scroll = 0;
+}
+
+// 把视图格 vi 滚进可视区（最小滚动量）。返回滚动量是否真的变了——
+// 调用方据此决定要不要整窗重绘（Home/End/翻页键走这条）
+static BOOL ScrollCellIntoView(int vi)
+{
+    if (vi < 0 || vi >= ViewCount()) return FALSE;
+    int old = g_scroll;
+    int top = (vi / g_cols) * (g_cell + g_gap);
+    int view = g_ch - g_titleH;
+    if (top < g_scroll) g_scroll = top;
+    else if (top + g_cell > g_scroll + view) g_scroll = top + g_cell - view;
+    ClampScroll();
+    return g_scroll != old;
 }
 
 // 侧栏分组列表的虚拟内容高度（行高 + 上下留白）：滚动钳制与滚动条
@@ -3700,6 +3715,26 @@ static void OnKeyDown(WPARAM w)
     if (n <= 0) return;
     int c = g_hoverCell;
     if (c < 0 || c >= n) c = 0;                     // 悬停失效时从第一格起
+    // Home/End/PageUp/PageDown：跳到首末格或翻整页（顺带把目标行滚进
+    // 可视区——键盘导航没有"光标带着视图走"就等于跳丢）
+    if (w == VK_HOME || w == VK_END || w == VK_PRIOR || w == VK_NEXT) {
+        int page = g_slots / g_cols * g_cols;       // 整页格数（按行取整）
+        if (page < g_cols) page = g_cols;
+        int nc = c;
+        if (w == VK_HOME)             nc = 0;
+        else if (w == VK_END)         nc = n - 1;
+        else if (w == VK_PRIOR)       nc = c - page;
+        else                          nc = c + page;
+        if (nc < 0) nc = 0;
+        if (nc >= n) nc = n - 1;
+        int og = g_hoverGroup;
+        BOOL moved = ScrollCellIntoView(nc);
+        g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
+        UpdateHoverText();
+        RefreshHoverSpots(c, og, TRUE);
+        if (moved) InvalidateRect(g_hwnd, NULL, FALSE);   // 滚动量变了才整窗重绘
+        return;
+    }
     int nc = c;
     switch (w) {
     case VK_LEFT:  nc = c - 1;      break;
