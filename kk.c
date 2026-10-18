@@ -2609,35 +2609,36 @@ static void TrayRemove(void)
 
 static void TrayShowMenu(void)
 {
-    // 自启状态以 HKCU Run 键为唯一事实源：弹菜单前重读一次。别处动过
-    // （任务管理器启动页/安装器/别的实例）也当即反映，不留过期打钩——
-    // 仅启动时读一次的话，菜单勾选会停在进程启动时的旧状态
-    WCHAR runPath[MAX_PATH + 8];
-    g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
+    // 开关项点击后菜单就地重弹（打钩即时更新）：标准弹出菜单选中即收，
+    // 没有“点一下钩原地翻”的能力，用关闭-重弹循环模拟——开关项回到
+    // 循环顶（状态已翻、菜单重建），点非开关项 / 按 Esc / 点空白才收场。
+    // 光标没动，重弹位置即原位置，观感是打钩当场变了
+    for (;;) {
+        // 自启状态以 HKCU Run 键为唯一事实源：每轮弹菜单前重读一次。
+        // 别处动过（任务管理器启动页/安装器/其他实例）也当即反映
+        WCHAR runPath[MAX_PATH + 8];
+        g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
 
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
-    // 两项是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
-    // 效果，文本里注明生效时机，免得看着像打钩没反应
-    AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
-                L"开机自启动（重启生效）");
-    AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
-                L"静默启动（重启生效）");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
-    int cmd = PopupAt(m);
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
+        // 两项是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
+        // 效果，文本里注明生效时机，免得看着像打钩没反应
+        AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
+                    L"开机自启动（重启生效）");
+        AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
+                    L"静默启动（重启生效）");
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
+        int cmd = PopupAt(m);
 
-    if (cmd == IDM_TRAY_SHOW) ShowLauncher();
-    else if (cmd == IDM_TRAY_PIN) {
-        TogglePin();
-    } else if (cmd == IDM_TRAY_AUTO) {
-        ToggleAutostart();
-    } else if (cmd == IDM_TRAY_SILENT) {
-        ToggleSilent();
-    } else if (cmd == IDM_EXIT) {
-        ExitApp();
+        if (cmd == IDM_TRAY_PIN)    { TogglePin();       continue; }
+        if (cmd == IDM_TRAY_AUTO)   { ToggleAutostart(); continue; }
+        if (cmd == IDM_TRAY_SILENT) { ToggleSilent();    continue; }
+        if (cmd == IDM_TRAY_SHOW)   ShowLauncher();
+        else if (cmd == IDM_EXIT)   ExitApp();
+        break;    // 非开关项（显示面板/退出/Esc/点空白）：菜单收场
     }
 }
 
