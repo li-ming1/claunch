@@ -8,7 +8,8 @@
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
 // 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
-// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
+// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Del 清空悬停格、
+// Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即跨全部分组极速搜索：前缀>词首>子串>拼音首字母>路径的相关度
 // 排序（中文应用名输拼音首字母即可命中，如 jsb→记事本），回车启动最优
 // 匹配（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
@@ -1637,7 +1638,15 @@ static void LoadConfig(void)
 static void SaveConfig(void)
 {
     if (!g_hwnd) return;
-    HANDLE f = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+    // 原子写：先写等长换名的 kk.tmp，成功后 MoveFileEx 原子替换 kk.ini——
+    // 写入中途崩溃/断电不会把配置撕成半截（直接覆盖写会）。
+    // 换名取等长替换（kk.ini→kk.tmp 同 6 字符），无路径拼接溢出风险
+    WCHAR tmp[MAX_PATH];
+    wcscpy_s(tmp, MAX_PATH, g_ini);
+    SIZE_T len = wcslen(tmp);
+    if (len < 6 || wcscmp(tmp + len - 6, L"kk.ini")) return;   // ini 名不符预期：防呆不写
+    wcscpy_s(tmp + len - 6, 7, L"kk.tmp");
+    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
     g_outFile = f;
@@ -1675,8 +1684,15 @@ static void SaveConfig(void)
                 SafeField(sTip, 128, g_items[i].tip));
     }
     OutFlush();
+    BOOL bad = !FlushFileBuffers(f);       // 落到设备：替换前的最后保障
     CloseHandle(f);
-    g_cfgDirty = FALSE;   // 磁盘已与内存一致（早退的失败路径不清：下个心跳重试）
+    // 替换失败（极少：旧 ini 被外部短暂独占）→ 删临时件、旧配置原封不动、
+    // 保留 dirty 让下个心跳重试
+    if (bad || !MoveFileExW(tmp, g_ini, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp);
+        return;
+    }
+    g_cfgDirty = FALSE;   // 磁盘已与内存一致
 }
 
 // 应用格子缩放（Ctrl+滚轮）：重算列数、按新尺寸重载图标、钳制滚动、整窗重绘。
@@ -3615,6 +3631,14 @@ static void OnKeyDown(WPARAM w)
         int v = g_hoverCell;
         if (g_filter[0] && (v < 0 || v >= ViewCount())) v = 0;
         LaunchView(v);
+        return;
+    }
+    if (w == VK_DELETE && !g_filter[0] && g_hoverCell >= 0) {   // Del：清空悬停格（槽位保留，右键菜单同款）
+        int ii = ItemAtView(g_hoverCell);
+        if (ii >= 0 && !IsBlank(ii)) {
+            ClearSlotAt(g_hoverCell);
+            FlashMsg(L"已清空");
+        }
         return;
     }
     int n = ViewCount();                            // 方向键：移动悬停高亮（与鼠标悬停同一套状态/重绘）
