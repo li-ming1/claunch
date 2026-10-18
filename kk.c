@@ -3,7 +3,8 @@
 // 拖放即与落点互换、清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
-// 右键格子可编辑 名称/文件名/参数/工具提示。
+// 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
+// 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
@@ -14,14 +15,18 @@
 // 常驻内存红线（实测）：SHGetFileInfo 只作图标轻量链路失败后的兜底、不走
 // ShellExecute 常规启动（各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开
 // IME——破防会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
+// 唯一例外是 OLE 拖放（ole32）：回收站/此电脑等虚拟项只有 PIDL 格式，
+// WM_DROPFILES（CF_HDROP）收不到，不注册 IDropTarget 拖入会被直接拒绝。
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
 #define _CRT_SECURE_NO_WARNINGS
+#define COBJMACROS              // C 侧 COM 便捷宏（IDataObject_GetData 等）
 #define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
 #define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
 #include <windows.h>
 #include <shellapi.h>
+#include <ole2.h>        // OLE 拖放：IDropTarget/RegisterDragDrop（ole32，唯一新增依赖）
 #include <shlobj.h>
 #include <commdlg.h>
 #include <imm.h>
@@ -37,6 +42,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "advapi32.lib")   // 开机自启的注册表操作；advapi32 本就经 shell32 间接映射，无新增 DLL
+#pragma comment(lib, "ole32.lib")      // OLE 拖放（回收站等虚拟项拖入）
 
 // ---------------------------------------------------------------- 常量
 #define MAX_GROUPS      16
@@ -195,6 +201,12 @@ static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖�
 static BOOL g_dragging;         // 已越过拖动阈值
 static int  g_dropCell = -1;    // 拖动悬停的目标格（视图序号）
 static BOOL g_dropIn;           // 目标在格子区内（区外释放=取消）
+static BOOL g_extDrag;          // 外部 OLE 拖放悬停中：落点高亮与内部排序同源同款，
+                                // 与内部拖动互斥（OLE 拖动时光标捕获在拖放源）
+static BOOL g_oleOk;            // 当前 OLE 拖放的数据有可收格式（DragEnter 定，整场有效）
+static BOOL g_dropOn;           // IDropTarget 已注册主窗（销毁时 Revoke）
+static BOOL g_oleInit;          // OleInitialize 已成功（销毁时配对 Uninitialize）
+static UINT g_cfShellIdList;    // CFSTR_SHELLIDLIST 格式原子（0=注册失败：虚拟项不可收）
 static int  g_pressGroup = -1;  // 按下的分组行（侧栏重排用；组 0“全部”不参与）
 static BOOL g_dragGroup;        // 分组重排中（已越过拖动阈值）
 static int  g_dropGroup = -1;   // 分组重排的落点行
@@ -225,6 +237,15 @@ static PFN_SetProcDpiCtx pSetDpi = NULL;
 
 #define UNREF(x) ((void)(x))
 
+// 对话框字段描述（格子属性/重命名/新建分组共用，RunDialog 消费）。
+// 定义在这里是因为新建分组（NewGroup）在条目/分组节就要用它
+typedef struct {
+    const WCHAR *label;
+    WCHAR *buf;
+    int    cch;
+    int    mode;      // 0 文本 / 1 带“浏览”按钮
+} DlgField;
+
 // 前向声明：只保留使用点早于定义的函数
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
@@ -241,6 +262,7 @@ static void UpdateBtnRects(void);
 static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
+static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
 
 // 条目/分组数据变化后的统一收尾：悬停文字重算、卡片重锚、整窗重绘、落盘。
 // 六处数据变更路径（粘贴×2、槽位操作、分组重排、格子/分组改名）共用同一套收尾
@@ -895,9 +917,28 @@ static HICON ShellIcon(const WCHAR *path)
     return NULL;
 }
 
+// shell 命名空间项（回收站/此电脑/控制面板…）的图标：路径是 "::{CLSID}"
+// 解析名，SHGetFileInfo 直接吃字符串不认（实测 FAIL），经 SHParseDisplayName
+// 拿 PIDL 再走 SHGFI_PIDL 就能取到资源管理器同款（实测真图标）。纯注册表/
+// 内存操作，无文件系统 I/O，UI 线程安全
+static HICON NamespaceIcon(const WCHAR *path)
+{
+    PIDLIST_ABSOLUTE pidl;
+    if (FAILED(SHParseDisplayName(path, NULL, &pidl, 0, NULL))) return NULL;
+    SHFILEINFOW fi = { 0 };
+    DWORD_PTR ok = SHGetFileInfoW((LPCWSTR)pidl, 0, &fi, sizeof fi,
+                                  SHGFI_ICON | SHGFI_PIDL | SHGFI_LARGEICON);
+    CoTaskMemFree(pidl);
+    return ok ? fi.hIcon : NULL;               // 32px：绘制时 DrawIconEx 缩到格宽
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
     HICON h = NULL;
+    // shell 命名空间解析名（"::{CLSID}"）：不进文件系统检查/扩展名关联链，
+    // 直接问 shell 要图标
+    if (path[0] == L':' && path[1] == L':')
+        return NamespaceIcon(path);
     // 网络路径/URL 整体早退：不做任何路径 I/O（断连映射盘会阻塞数秒且
     // 阻塞在 UI 线程），图标只按扩展名走注册表关联链；解析不出时返回
     // NULL，由 EnsureIcon 落到通用图标
@@ -981,7 +1022,10 @@ static void NameFromPath(const WCHAR *path, WCHAR *out, int cch)
     const WCHAR *p = wcsrchr(path, L'\\');
     p = p ? p + 1 : path;
     const WCHAR *dot = wcsrchr(p, L'.');
-    int n = dot ? (int)(dot - p) : (int)wcslen(p);
+    // 只剥"真扩展名"：点必须落在首字符之后。".workbuddy"/".gitignore" 这类
+    // 点开头的名字（隐藏目录/文件的命名习惯）从首字符剥会剩一个 "."，
+    // 连同 "archive.tar.gz" 只剥最后一截的规则一样，都是取"最后一个真扩展名"
+    int n = (dot && dot > p) ? (int)(dot - p) : (int)wcslen(p);
     if (n >= cch) n = cch - 1;
     if (n < 1) n = 1;
     wcsncpy_s(out, (size_t)cch, p, (size_t)n);
@@ -992,6 +1036,14 @@ static int AddItemByPath(const WCHAR *path, int group)
     WCHAR name[48];
     NameFromPath(path, name, 48);
     return AddItemRaw(name, path, group, NULL, NULL);
+}
+
+// 带显示名的条目：虚拟 shell 项（回收站等）的路径是 "::{CLSID}" 解析名，
+// NameFromPath 取不出可读名，由拖放方经 SHGetNameFromIDList 显式给名
+static int AddNamedItem(const WCHAR *path, const WCHAR *name, int group)
+{
+    if (name && name[0]) return AddItemRaw(name, path, group, NULL, NULL);
+    return AddItemByPath(path, group);
 }
 
 // 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、清提示、丢旧图标。
@@ -1164,10 +1216,16 @@ static int TargetGroup(void)
     return g_curGroup ? g_curGroup : DefaultGroup();
 }
 
+// 新建分组：先弹命名框（预填默认名），取消=不建；清空=回落默认名。
+// 建出来再"重命名分组"要多点一次右键，创建这一步直接把名字定了
 static void NewGroup(void)
 {
+    if (g_nGroups >= MAX_GROUPS) return;       // 预检：别弹了框再静默失败
     WCHAR name[48];
     swprintf(name, 48, L"新分组%d", g_nGroups);
+    DlgField f[1] = { { L"名称(N):", name, 48, 0 } };
+    if (!RunDialog(g_hwnd, L"新建分组", f, 1)) return;
+    if (!name[0]) swprintf(name, 48, L"新分组%d", g_nGroups);
     int ni = AddGroup(name);
     if (ni < 0) return;
     SelectGroup(ni);      // 切过去：滚动位/侧栏可见性/悬停/卡片全套收尾
@@ -2252,8 +2310,11 @@ static void PaintGrid(HDC dc, const RECT *clip)
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
             int ii = ItemAtView(vi);
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
-            BOOL drag = g_dragging && (vi == g_pressCell ||
-                                       (g_dropIn && vi == g_dropCell && vi != g_pressCell));
+            // 拖动标示两路共用：内部排序（g_dragging）与外部 OLE 拖放（g_extDrag，
+            // 无按下格概念）互斥，任一激活时落点格画常规底 + accent 边
+            BOOL drag = (g_dragging && (vi == g_pressCell ||
+                                        (g_dropIn && vi == g_dropCell && vi != g_pressCell)))
+                     || (g_extDrag && g_dropIn && vi == g_dropCell);
             if (hov || drag) {          // 焦点态：accent 边 + 提亮底（悬停）/常规底（拖动标示）
                 SelectObject(dc, g_penAccent);
                 SelectObject(dc, hov ? g_brCellHi : g_brCell);
@@ -2301,13 +2362,6 @@ static void PaintWindow(HDC dc, const RECT *clip)
 }
 
 // ---------------------------------------------------------------- 对话框（格子属性 / 重命名）
-typedef struct {
-    const WCHAR *label;
-    WCHAR *buf;
-    int    cch;
-    int    mode;      // 0 文本 / 1 带“浏览”按钮
-} DlgField;
-
 typedef struct {
     HWND     hwnd;
     WCHAR    title[64];
@@ -3382,54 +3436,277 @@ static void OnChar(WPARAM w)
     ApplyFilter();
 }
 
+// ---------------------------------------------------------------- 拖放（WM_DROPFILES + OLE 两路）
+// 文件走 CF_HDROP（老 WM_DROPFILES 协议与 OLE 拿到的是同一种 HDROP 句柄）；
+// 回收站/此电脑等虚拟项只有 CFSTR_SHELLIDLIST（PIDL），必须 OLE。两路共用
+// 同一套落位核心（DropBegin/DropApply/DropFinish），落点语义完全一致
+typedef struct { int slot, g, lo, hi; } DropCtx;
+
+// 拖放前置：清过滤（落点按全量视图的格位算，EnsureSlot 补的空格不过滤）、
+// 算落点槽位、整批补齐空格、定目标组。nf 为条目数（调用方已按 MAX_ITEMS 封顶）
+static void DropBegin(DropCtx *c, POINT p, int nf)
+{
+    c->lo = c->hi = -1;                // 受影响的格子区间（局部重绘用）
+    ClearFilter();
+    // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
+    // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
+    // 光标明明停在空格上，格子却没有任何变化。
+    c->slot = SlotAt(p);
+    c->g = TargetGroup();
+    // 整批落点需要的空格一次补齐：逐文件调 EnsureSlot 会让视图重建
+    // nf 遍（每补一格标脏一次）；一次补到位后 ItemAtView 走缓存
+    if (c->slot >= 0) EnsureSlot(c->slot + nf - 1);
+}
+
+// 单个拖入目标的落位：网格外=追加末尾；落点已占用→换上新目标；
+// 空格→填入该空位（落哪格停哪格）。多文件自落点依次排开
+static void DropApply(DropCtx *c, int k, const WCHAR *path, const WCHAR *name)
+{
+    if (c->slot < 0) { AddNamedItem(path, name, c->g); return; }
+    int s = c->slot + k;
+    if (c->lo < 0) c->lo = c->hi = s;      // 记下受影响的格子范围
+    else { if (s < c->lo) c->lo = s; if (s > c->hi) c->hi = s; }
+    int ii = ItemAtView(s);
+    if (ii >= 0) {
+        SetItemTarget(ii, path, c->g);
+        if (name && name[0]) wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
+    } else {
+        AddNamedItem(path, name, c->g);    // 条目数爆满兜底
+    }
+}
+
+// 拖放收尾：视图/配置/滚动/卡片统一同步，落点区间局部重绘
+static void DropFinish(HWND h, const DropCtx *c)
+{
+    ViewDirty();                           // 替换可能改了条目分组
+    SaveConfig();
+    ClampScroll();
+    RefreshCard();                         // 视图/名称可能变了，卡片同步
+    if (c->lo < 0) {
+        InvalidateRect(h, NULL, FALSE);    // 拖到网格外：追加到末尾，整窗重绘
+    } else {
+        InvalidateCells(c->lo, c->hi);     // 只重绘落点区间
+    }
+}
+
+// CF_HDROP 落放核心。OLE 拿到的 HDROP 不经 DragFinish——释放归
+// ReleaseStgMedium；WM_DROPFILES 路径由 OnDropFiles 收尾
+static void HandleDroppedFiles(HWND h, HDROP hd, POINT p)
+{
+    UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
+    if (!nf) return;
+    DropCtx c;
+    DropBegin(&c, p, (int)(nf < (UINT)MAX_ITEMS ? nf : MAX_ITEMS));
+    for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
+        WCHAR path[MAX_PATH];
+        if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
+        DropApply(&c, (int)k, path, NULL);
+    }
+    DropFinish(h, &c);
+}
+
 static void OnDropFiles(HWND h, WPARAM w)
 {
     HDROP hd = (HDROP)w;
     UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
     if (nf > 0) {
-        ClearFilter();      // 落点按全量视图的格位算（EnsureSlot 补的空格不过滤）：先清过滤
         POINT p;
         // DragQueryPoint 给的是本窗客户坐标；拿不到（少数拖放路径）就退回光标位置
         if (!DragQueryPoint(hd, &p)) {
             GetCursorPos(&p);
             ScreenToClient(h, &p);
         }
-        // 必须用 SlotAt：空格也是合法落点。CellAt 只匹配已有条目，
-        // 拖到空格返回 -1 会被当成“落到网格外”直接追加到列表末尾——
-        // 光标明明停在空格上，格子却没有任何变化。
-        int slot = SlotAt(p);
-        int g = TargetGroup();
-        int lo = -1, hi = -1;              // 受影响的格子区间（局部重绘用）
-        // 整批落点需要的空格一次补齐：逐文件调 EnsureSlot 会让视图重建
-        // nf 遍（每补一格标脏一次）；一次补到位后 ItemAtView 走缓存
-        if (slot >= 0)
-            EnsureSlot(slot + (int)(nf < (UINT)MAX_ITEMS ? nf : MAX_ITEMS) - 1);
-        for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
-            WCHAR path[MAX_PATH];
-            if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
-            if (slot < 0) { AddItemByPath(path, g); continue; }   // 网格外：追加末尾
-            int s = slot + (int)k;          // 多文件自落点依次排开
-            if (lo < 0) lo = hi = s;        // 记下受影响的格子范围
-            else { if (s < lo) lo = s; if (s > hi) hi = s; }
-            int ii = ItemAtView(s);
-            if (ii >= 0) {
-                // 落点已占用→换上新文件；落点是空格→填入该空位（落哪格停哪格）
-                SetItemTarget(ii, path, g);
-            } else {
-                AddItemByPath(path, g);    // 条目数爆满兜底
-            }
-        }
-        ViewDirty();                       // 替换可能改了条目分组
-        SaveConfig();
-        ClampScroll();
-        RefreshCard();                     // 视图/名称可能变了，卡片同步
-        if (lo < 0) {
-            InvalidateRect(h, NULL, FALSE);          // 拖到网格外：追加到末尾，整窗重绘
-        } else {
-            InvalidateCells(lo, hi);                 // 只重绘落点区间
-        }
+        HandleDroppedFiles(h, hd, p);
     }
     DragFinish(hd);
+}
+
+// ---- OLE 拖放：shell 项 PIDL → 落位 ----------------------------------------
+// CIDA 里 aoffset[0] 是父文件夹 PIDL、其后是相对条目。全 PIDL = 两者拼接
+//（桌面拖放时父 PIDL 为空，拼出来就是条目自身）。资源管理器同款逻辑
+static UINT PidlLen(LPCITEMIDLIST p)       // 含终结符的总字节数
+{
+    UINT n = 0;
+    if (p) while (p->mkid.cb) {
+        n += p->mkid.cb;
+        p = (LPCITEMIDLIST)((const BYTE *)p + p->mkid.cb);
+    }
+    return n + (UINT)sizeof(p->mkid.cb);
+}
+
+// a（可空）去终结符 + b（含终结符）→ 新分配的全 PIDL（CoTaskMemAlloc，调用方 CoTaskMemFree）
+static LPITEMIDLIST PidlJoin(LPCITEMIDLIST a, LPCITEMIDLIST b)
+{
+    UINT la = a ? PidlLen(a) - (UINT)sizeof(a->mkid.cb) : 0;
+    UINT lb = PidlLen(b);
+    LPITEMIDLIST p = (LPITEMIDLIST)CoTaskMemAlloc(la + lb);
+    if (!p) return NULL;
+    if (la) memcpy(p, a, la);
+    memcpy((BYTE *)p + la, b, lb);
+    return p;
+}
+
+// CFSTR_SHELLIDLIST 落放：文件系统项取路径；取不到的是虚拟项（回收站…），
+// 存桌面绝对解析名（"::{CLSID}"，ShellExecuteW 认它可直接启动），显示名
+// 另取（"回收站"）——解析名推不出可读名
+static void HandleShellIdList(HWND h, IDataObject *d, POINT p)
+{
+    FORMATETC ft = { (CLIPFORMAT)g_cfShellIdList, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM med;
+    if (FAILED(IDataObject_GetData(d, &ft, &med))) return;
+    CIDA *cid = (CIDA *)GlobalLock(med.hGlobal);
+    if (cid) {
+        DropCtx c;
+        DropBegin(&c, p, (int)cid->cidl);
+        for (UINT k = 1; k <= cid->cidl && k <= (UINT)MAX_ITEMS; k++) {
+            LPITEMIDLIST full = PidlJoin(
+                (LPCITEMIDLIST)((const BYTE *)cid + cid->aoffset[0]),
+                (LPCITEMIDLIST)((const BYTE *)cid + cid->aoffset[k]));
+            if (!full) continue;
+            WCHAR path[MAX_PATH];
+            if (SHGetPathFromIDListW(full, path) && path[0]) {
+                DropApply(&c, (int)k - 1, path, NULL);
+            } else {
+                PWSTR parse = NULL, disp = NULL;
+                if (SUCCEEDED(SHGetNameFromIDList(full, SIGDN_DESKTOPABSOLUTEPARSING, &parse))) {
+                    WCHAR name[48] = L"";
+                    if (SUCCEEDED(SHGetNameFromIDList(full, SIGDN_NORMALDISPLAY, &disp))) {
+                        wcsncpy_s(name, 48, disp, _TRUNCATE);
+                        CoTaskMemFree(disp);
+                    }
+                    DropApply(&c, (int)k - 1, parse, name);   // 空名回落 NameFromPath
+                    CoTaskMemFree(parse);
+                }
+            }
+            CoTaskMemFree(full);
+        }
+        DropFinish(h, &c);
+        GlobalUnlock(med.hGlobal);
+    }
+    ReleaseStgMedium(&med);
+}
+
+// 外部拖放悬停：落点格高亮与内部排序拖动同源（g_dropCell/g_dropIn 同款
+// 更新与失效）。光标捕获在拖放源，本窗只收 DragOver 的屏幕坐标
+static void OleUpdateOver(POINTL ptl)
+{
+    POINT p = { ptl.x, ptl.y };
+    ScreenToClient(g_hwnd, &p);
+    int nc = SlotAt(p);
+    BOOL nin = p.x >= g_sideW && p.y >= g_titleH;
+    if (nc != g_dropCell || nin != g_dropIn) {
+        if (g_dropCell >= 0 && nc >= 0) InvalidateCells(g_dropCell, nc);
+        else {
+            InvalidateCell(g_dropCell);
+            InvalidateCell(nc);
+        }
+        g_dropCell = nc;
+        g_dropIn = nin;
+    }
+}
+
+static void OleClearOver(void)
+{
+    int oc = g_dropCell;
+    g_dropCell = -1;
+    g_dropIn = FALSE;
+    InvalidateCell(oc);        // vi<0 内部早退，无需判
+}
+
+// 数据对象里有哪种可收格式：文件（CF_HDROP）或 shell 项（SHELLIDLIST）
+static BOOL OleAccepts(IDataObject *d)
+{
+    FORMATETC ft = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    if (IDataObject_QueryGetData(d, &ft) == S_OK) return TRUE;
+    if (!g_cfShellIdList) return FALSE;
+    ft.cfFormat = (CLIPFORMAT)g_cfShellIdList;
+    return IDataObject_QueryGetData(d, &ft) == S_OK;
+}
+
+// IDropTarget：进程级单例（静态对象，引用计数空转，随进程存活）。
+// 只在 Drop/DragEnter 里区分格式，DragOver 只做高亮跟随。
+// QI 里要返回自己，对象先占位声明，lpVtbl 由下方 vtbl 定义后、注册前填好
+static IDropTarget g_drop;
+
+static HRESULT __stdcall DtQueryInterface(IDropTarget *self, REFIID riid, void **out)
+{
+    UNREF(self);
+    if (out && (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropTarget))) {
+        *out = (void *)&g_drop;
+        return S_OK;
+    }
+    if (out) *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG __stdcall DtAddRef(IDropTarget *self)  { UNREF(self); return 2; }
+static ULONG __stdcall DtRelease(IDropTarget *self) { UNREF(self); return 2; }
+
+static HRESULT __stdcall DtDragEnter(IDropTarget *self, IDataObject *d, DWORD keys,
+                                     POINTL pt, DWORD *ef)
+{
+    UNREF(self); UNREF(keys);
+    g_oleOk = OleAccepts(d);
+    g_extDrag = TRUE;
+    *ef = g_oleOk ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    if (g_oleOk) OleUpdateOver(pt);
+    return S_OK;
+}
+
+static HRESULT __stdcall DtDragOver(IDropTarget *self, DWORD keys, POINTL pt, DWORD *ef)
+{
+    UNREF(self); UNREF(keys);
+    *ef = g_oleOk ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    if (g_oleOk) OleUpdateOver(pt);
+    return S_OK;
+}
+
+static HRESULT __stdcall DtDragLeave(IDropTarget *self)
+{
+    UNREF(self);
+    g_extDrag = FALSE;
+    OleClearOver();
+    return S_OK;
+}
+
+static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
+                                POINTL pt, DWORD *ef)
+{
+    UNREF(self); UNREF(keys);
+    *ef = DROPEFFECT_NONE;
+    g_extDrag = FALSE;
+    OleClearOver();
+    POINT p = { pt.x, pt.y };
+    ScreenToClient(g_hwnd, &p);
+    FORMATETC ft = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+    STGMEDIUM med;
+    if (SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
+        HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
+        ReleaseStgMedium(&med);
+        *ef = DROPEFFECT_COPY;
+        return S_OK;
+    }
+    if (g_cfShellIdList) {
+        HandleShellIdList(g_hwnd, d, p);
+        *ef = DROPEFFECT_COPY;
+    }
+    return S_OK;
+}
+
+static IDropTargetVtbl g_dtVtbl = {
+    DtQueryInterface, DtAddRef, DtRelease,
+    DtDragEnter, DtDragOver, DtDragLeave, DtDrop,
+};
+
+// 注册 OLE 拖放：回收站等虚拟项只有 PIDL 格式，WM_DROPFILES 收不到。
+// OleInitialize 失败（COM 不可用）就留在 DragAcceptFiles 老路，功能不倒退
+static void InitOleDrop(HWND h)
+{
+    if (FAILED(OleInitialize(NULL))) return;
+    g_oleInit = TRUE;
+    g_drop.lpVtbl = &g_dtVtbl;
+    g_dropOn = SUCCEEDED(RegisterDragDrop(h, &g_drop));
+    g_cfShellIdList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
 }
 
 // TIMER_HIDE 心跳（120ms）：反馈过期收起、配置防抖落盘、自动隐藏判定。
@@ -3469,6 +3746,8 @@ static void OnDestroy(HWND h)
 {
     SaveConfig();
     TrayRemove();
+    if (g_dropOn) { RevokeDragDrop(h); g_dropOn = FALSE; }
+    if (g_oleInit) { g_oleInit = FALSE; OleUninitialize(); }   // Revoke 必须在 Uninitialize 之前
     if (g_hookH) {
         PostThreadMessageW(g_hookTid, WM_QUIT, 0, 0);
         WaitForSingleObject(g_hookH, 1000);
@@ -3650,6 +3929,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     // （SogouPY.ime/SogouTSF/MSCTF/textinputframework/d2d1/DWrite ~30MB）就被拉进进程。
     // 属性对话框是独立窗口，保持默认 IME，中文输入不受影响。
     ImmAssociateContext(g_hwnd, NULL);
+
+    InitOleDrop(g_hwnd);   // OLE 拖放：回收站等虚拟项拖入（失败则 DragAcceptFiles 兜底照旧）
 
     ClampToWorkArea();
     if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
