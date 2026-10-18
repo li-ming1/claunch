@@ -269,6 +269,7 @@ typedef struct {
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
+static void ReleaseMemBuffer(void);   // 双缓冲释放：隐藏即放，唤醒首绘重建
 static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
 static void SaveConfig(void);
 static void InvalidateTitle(void);
@@ -643,6 +644,7 @@ static void SelectGroup(int gi)
     InvalidateRect(g_hwnd, NULL, FALSE);   // 标题/侧栏/格子全区都变（原三个分区矩形的并集就是全窗）
     RefreshCard();          // 视图换了：同一悬停格对应的条目可能变了，卡片重锚
     UpdateWindow(g_hwnd);   // 滚轮连发时 WM_PAINT 会被消息饿死，立即同步重绘
+    UpdateTrayTip();        // 托盘提示带当前分组名：切组后悬停信息同步
 }
 
 static RECT GroupRect(int i)
@@ -1921,6 +1923,7 @@ static void StepFade(void)
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
             KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
+            ReleaseMemBuffer();                // 双缓冲 ~2MB 随隐藏释放，唤醒首绘重建
             g_flashAt = 0;                    // 心跳停了：反馈不可能再过期重绘，直接收掉
             if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 心跳将停：待落盘的立即落
             TrimWS();
@@ -2870,20 +2873,25 @@ static void InitAutostart(void)
 // ---------------------------------------------------------------- 托盘
 // 运行时画一个 2x2 格子图标：不必引入 .ico 资源，保持单文件
 
-// 组装托盘提示：应用名 + 当前激活的开关（全关时退化为纯操作提示）。
-// 开关状态一目了然，不用每次都右键开菜单看勾选
+// 组装托盘提示：当前分组 + 激活的开关（全关时退化）。开关状态一目了然，
+// 不用每次都右键开菜单看勾选；分组名让悬停一眼知道面板停在哪组
 static void BuildTrayTip(WCHAR *out, size_t cch)
 {
     WCHAR flags[40] = L"";
     if (g_pinned)    wcscat_s(flags, 40, L"置顶·");
     if (g_autostart) wcscat_s(flags, 40, L"自启·");
     if (g_silent)    wcscat_s(flags, 40, L"静默·");
-    if (flags[0]) {
-        flags[wcslen(flags) - 1] = 0;                     // 去掉末尾分隔符
+    if (flags[0]) flags[wcslen(flags) - 1] = 0;   // 去掉末尾分隔符
+    const WCHAR *grp = (g_curGroup >= 0 && g_curGroup < g_nGroups)
+                     ? g_groups[g_curGroup].name : L"";
+    if (grp[0] && flags[0])
+        swprintf(out, cch, L"桌面格子[%s] — %s — 单击显示，右键菜单", grp, flags);
+    else if (grp[0])
+        swprintf(out, cch, L"桌面格子[%s] — 单击显示，右键菜单", grp);
+    else if (flags[0])
         swprintf(out, cch, L"桌面格子 — %s — 单击显示，右键菜单", flags);
-    } else {
+    else
         swprintf(out, cch, L"桌面格子 — 单击显示，右键菜单");
-    }
 }
 
 // 开关变化后刷新托盘提示（无托盘图标时是空操作；只改 tip，不动图标/回调）
@@ -3302,6 +3310,33 @@ static void OnCreate(HWND h)
         TrayBalloon(L"claunch 已驻留托盘：单击图标显示面板，Ctrl+Alt+K 随时唤醒，双击桌面空白也可以");
 }
 
+// 离屏双缓冲：隐藏即释放（842×631×4B ≈ 2MB commit，挂托盘时纯占窝），
+// 首绘/尺寸变化时惰性重建。OnSize 必重建（尺寸配对），OnPaint 兜底重建
+// （唤醒后第一次绘制时缓冲已被释放掉）
+static void ReleaseMemBuffer(void)
+{
+    if (g_memDC) { DeleteDC(g_memDC); g_memDC = NULL; }
+    if (g_memBmp) { DeleteObject(g_memBmp); g_memBmp = NULL; }
+}
+
+static void EnsureMemBuffer(HWND h)
+{
+    if (g_memDC) return;
+    HDC scr = GetDC(h);
+    HDC dc = CreateCompatibleDC(scr);
+    HBITMAP bmp = CreateCompatibleBitmap(scr, g_cw, g_ch);
+    ReleaseDC(h, scr);
+    if (dc && bmp) {
+        SelectObject(dc, bmp);
+        g_memDC = dc;
+        g_memBmp = bmp;
+        g_memFresh = TRUE;
+    } else {                          // 建不起：退回直接绘制路径（OnPaint 有兜底）
+        if (dc) DeleteDC(dc);
+        if (bmp) DeleteObject(bmp);
+    }
+}
+
 static void OnSize(HWND h, LPARAM l)
 {
     g_cw = LOWORD(l);
@@ -3399,6 +3434,7 @@ static void OnPaint(HWND h)
     // ~50 GDI（trace 实测：OnPaint 后 0.8M→18M/GDI 26→79）。
     // 唤醒后窗口可见，照常全量绘制
     if (IsWindowVisible(h)) {
+        EnsureMemBuffer(h);      // 隐藏期间缓冲已释放：唤醒后首绘前重建
         if (g_memDC) {
         // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
         // 其余缓冲内容保持上一帧，与屏幕一致。
@@ -4230,8 +4266,7 @@ static void OnDestroy(HWND h)
     };
     for (size_t i = 0; i < _countof(objs); i++)
         if (objs[i]) DeleteObject(objs[i]);
-    if (g_memDC) DeleteDC(g_memDC);
-    if (g_memBmp) DeleteObject(g_memBmp);
+    ReleaseMemBuffer();           // 双缓冲：与 OnSize/OnPaint 的创建路径配对
     if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
     if (g_once) { CloseHandle(g_once); g_once = NULL; }   // 释放单实例互斥体
     PostQuitMessage(0);
@@ -4442,6 +4477,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         g_needPrune = TRUE;
         ShowWindow(g_hwnd, SW_HIDE);
         KillTimer(g_hwnd, TIMER_HIDE);
+        ReleaseMemBuffer();                // 双缓冲 ~2MB 从未被画过：直接放
         // 静默启动同样裁剪：托盘就绪即回落到低位工作集（与淡出隐藏路径
         // 同一"零轮询+裁剪"不变量）。实测省 ~7MB 启动瞬时工作集——
         // 裁剪页按需软调入，首次唤醒多几微秒故障，无感
