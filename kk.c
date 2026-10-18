@@ -203,7 +203,7 @@ static BOOL  g_cardOn = FALSE;  // 悬停小卡片可见（悬停格子/分组�
 static RECT  g_cardRect;        // 卡片区域：悬停目标变化时重算，绘制只读
 static WCHAR g_cardText[80];    // 卡片文字：程序名/组名
 static WCHAR g_flashText[80];   // 标题栏启动反馈（"已启动/启动失败: 名"）
-static DWORD g_flashAt = 0;     // 反馈起始时刻；1.2s 后自然过期（0=无）
+static ULONGLONG g_flashAt = 0;  // 反馈起始时刻；1.2s 后自然过期（0=无）。64 位时刻：无 49 天回绕
 
 static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
 static BOOL g_dragging;         // 已越过拖动阈值
@@ -226,8 +226,8 @@ static POINT g_pressPt;
 static BOOL g_hoverActive = FALSE;
 static BOOL g_tracking = FALSE;
 
-static DWORD g_outSince = 0;
-static DWORD g_wakeAt = 0;
+static ULONGLONG g_outSince = 0;
+static ULONGLONG g_wakeAt = 0;
 static int   g_alpha = 255, g_fadeDir = 0;
 static BOOL  g_dlgOpen = FALSE;
 static BOOL  g_menuOpen = FALSE;   // TrackPopupMenu 弹着（模态循环里 WM_TIMER 仍会派发：
@@ -606,7 +606,10 @@ static void EnsureGroupVisible(int gi)
 static void SelectGroup(int gi)
 {
     if (gi < 0 || gi >= g_nGroups || gi == g_curGroup) return;
-    g_scrollMemo[g_curGroup] = g_scroll;    // 记住离开时的滚动位
+    // 滚动位备忘的写入边界：g_curGroup 理论上恒在 [0, MAX_GROUPS)，
+    // 这里再收一道——数组写越界没有第二次机会
+    if (g_curGroup >= 0 && g_curGroup < MAX_GROUPS)
+        g_scrollMemo[g_curGroup] = g_scroll;    // 记住离开时的滚动位
     g_curGroup = gi;
     ViewDirty();
     g_scroll = g_scrollMemo[gi];            // 恢复目标组上次的滚动位
@@ -1844,7 +1847,7 @@ static void ForceForeground(HWND h)
 static void StartFadeIn(void)
 {
     g_outSince = 0;
-    g_wakeAt = GetTickCount();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
+    g_wakeAt = GetTickCount64();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
     RefreshVirtualIcons();       // 唤醒即对时：回收站空/满等状态化图标对齐当前真实状态
     g_alpha = 0;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
@@ -2272,7 +2275,7 @@ static void InvalidateSidebar(void)
 static void FlashMsg(const WCHAR *text)
 {
     wcsncpy_s(g_flashText, 80, text, _TRUNCATE);
-    g_flashAt = GetTickCount();
+    g_flashAt = GetTickCount64();
     InvalidateTitle();
 }
 
@@ -2294,7 +2297,7 @@ static void FlashLaunch(BOOL ok, const WCHAR *name)
 
 static BOOL FlashActive(void)
 {
-    return g_flashAt && GetTickCount() - g_flashAt < FLASH_MS;
+    return g_flashAt && GetTickCount64() - g_flashAt < FLASH_MS;
 }
 
 // 启动视图位 vi 的格子并在标题栏闪现结果（单击抬起/回车/数字键 1-9 共用）
@@ -2780,6 +2783,7 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
 // 读出自启项登记的路径（无该项返回 FALSE）。容量按写入上限（引号+全路径+NUL）给足
 static BOOL QueryAutostart(WCHAR *pathOut, int cch)
 {
+    if (!pathOut || cch <= 0) return FALSE;      // 防御：NULL 目标在 RegQueryValueExW 之后必崩
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
         return FALSE;
@@ -2982,7 +2986,7 @@ static int PopupAt(HMENU m)
 static void ShowCellMenu(int vi)
 {
     int ii = ItemAtView(vi);
-    BOOL hasItem = ii >= 0 && !IsBlank(ii);
+    BOOL hasItem = ii >= 0 && ii < g_nItems && !IsBlank(ii);   // 上界写死：SAL 也认的显式边界
     // shell 虚拟项（回收站/此电脑）：没有文件位置可去，提权打开也无意义：
     // 这两个菜单项对它不诚实，直接不出现
     BOOL virt = hasItem && IsVirtualPath(g_items[ii].path);
@@ -3002,19 +3006,23 @@ static void ShowCellMenu(int vi)
     if (hasItem) AppendMenuW(m, MF_STRING, IDM_PROPS, L"格子属性(&R)...");
     int cmd = PopupAt(m);
     if (!cmd) return;
+    // 指针重解析：悬停可能已失效（删组/删格后旧下标），进 switch 前把
+    // 条目指针定死，后续读 path / 对话框原地编辑都走它——NULL 分支
+    // 即是"没有条目"的菜单项。属性对话框要原地改字段：指针非 const
+    Item *it = (ii >= 0 && ii < g_nItems) ? &g_items[ii] : NULL;
     switch (cmd) {
-    case IDM_LAUNCH: Launch(ii, FALSE); break;
+    case IDM_LAUNCH: Launch(ii, FALSE); break;      // Launch 自带下标边界守卫
     case IDM_ADMIN:  Launch(ii, TRUE); break;
-    case IDM_LOC:    OpenLocation(g_items[ii].path); break;
+    case IDM_LOC:    if (it) OpenLocation(it->path); break;
     case IDM_INS_SLOT: InsertSlotAt(vi); break;
     case IDM_DEL_SLOT: DeleteSlotAt(vi); break;
     case IDM_CLR_SLOT: ClearSlotAt(vi); break;
-    case IDM_PROPS: {
+    case IDM_PROPS: if (it) {
         WCHAR oldPath[MAX_PATH];
-        wcsncpy_s(oldPath, MAX_PATH, g_items[ii].path, _TRUNCATE);
+        wcsncpy_s(oldPath, MAX_PATH, it->path, _TRUNCATE);
         DlgField f[4] = {
-            { L"名称(N):",     g_items[ii].name, 48,       0 },
-            { L"文件名(F):",   g_items[ii].path, MAX_PATH, 1 },
+            { L"名称(N):",     it->name, 48,       0 },
+            { L"文件名(F):",   it->path, MAX_PATH, 1 },
             { L"参数(P):",     g_items[ii].args, 192,      0 },
             { L"工具提示(T):", g_items[ii].tip,  96,       0 },
         };
@@ -3032,14 +3040,14 @@ static void ShowCellMenu(int vi)
 static void ShowGroupMenu(int gi)
 {
     HMENU m = CreatePopupMenu();
-    if (gi >= 0) {               // 分组完全用户自治：任意行都可改名/删除（首组同理）
+    if (gi >= 0 && gi < g_nGroups) {    // 分组完全用户自治：任意行都可改名/删除（首组同理）
         AppendMenuW(m, MF_STRING, IDM_GRP_RENAME, L"重命名分组");
         AppendMenuW(m, MF_STRING, IDM_GRP_DEL, L"删除该分组");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
     AppendMenuW(m, MF_STRING, IDM_GRP_NEW, L"新建分组");
     int cmd = PopupAt(m);
-    if (cmd == IDM_GRP_RENAME) {
+    if (cmd == IDM_GRP_RENAME && gi >= 0 && gi < g_nGroups) {
         DlgField f[1] = { { L"名称(N):", g_groups[gi].name, 48, 0 } };
         if (RunDialog(g_hwnd, L"重命名分组", f, 1)) {
             if (!g_groups[gi].name[0]) wcsncpy_s(g_groups[gi].name, 48, L"未命名", _TRUNCATE);
@@ -3062,7 +3070,7 @@ static void ShowTitleMenu(void)
 }
 
 // ---------------------------------------------------------------- 全局双击唤醒
-static DWORD s_lastClick = 0;
+static ULONGLONG s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
 static BOOL   s_dragInRect;     // 拖动光标是否在面板静置区内（只报“从区外进入”的沿口）
 static DWORD s_dblClick;      // 双击间隔/双击容差：钩子线程启动时读一次——
@@ -3143,7 +3151,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode == HC_ACTION) {
         if (wParam == WM_LBUTTONDOWN) {
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
-            DWORD now = GetTickCount();
+            ULONGLONG now = GetTickCount64();
             int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
             if (dx < 0) dx = -dx;
             if (dy < 0) dy = -dy;
@@ -4072,7 +4080,7 @@ static void OnTimer(HWND h, WPARAM w)
             return;
         }
         if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; return; }
-        if (GetTickCount() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; return; }
+        if (GetTickCount64() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; return; }
         if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; return; }
         POINT p;
         GetCursorPos(&p);
@@ -4083,7 +4091,7 @@ static void OnTimer(HWND h, WPARAM w)
             g_outSince = 0;
             if (g_fadeDir < 0) g_fadeDir = 1;
         } else {
-            DWORD now = GetTickCount();
+            ULONGLONG now = GetTickCount64();
             if (!g_outSince) g_outSince = now;
             else if (now - g_outSince > HIDE_DELAY_MS) BeginHide(FALSE);   // 移出即开始消失
         }
@@ -4274,12 +4282,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         return 0;
     }
 
-    HMODULE u32 = GetModuleHandleW(L"user32.dll");   // 两个导出都取自 user32，取一次句柄
-    pSetDpi = (PFN_SetProcDpiCtx)
-        GetProcAddress(u32, "SetProcessDpiAwarenessContext");
-    if (pSetDpi) pSetDpi((HANDLE)-4);   // PerMonitorV2
-    pExtractIcons = (PFN_PrivateExtractIconsW)
-        GetProcAddress(u32, "PrivateExtractIconsW");
+    // 两个导出都取自 user32：取一次句柄；取不到模块（不可能发生）则
+    // 两个函数指针留空——下游全部有 NULL 路径（DPI 走默认、图标链
+    // 跳过 PrivateExtractIconsW），不会把 NULL 句柄喂给 GetProcAddress
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (u32) {
+        pSetDpi = (PFN_SetProcDpiCtx)
+            GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+        if (pSetDpi) pSetDpi((HANDLE)-4);   // PerMonitorV2
+        pExtractIcons = (PFN_PrivateExtractIconsW)
+            GetProcAddress(u32, "PrivateExtractIconsW");
+    }
 
     HDC scr = GetDC(NULL);
     g_dpi = GetDeviceCaps(scr, LOGPIXELSX);
@@ -4328,4 +4341,4 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         DispatchMessageW(&msg);
     }
     return (int)msg.wParam;
-}
+}
