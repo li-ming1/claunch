@@ -2291,130 +2291,130 @@ static void BrowseForFile(HWND edit)
     if (GetOpenFileNameW(&of)) SetWindowTextW(edit, file);
 }
 
+// ---------------------------------------------------------------- 对话框：消息处理
+// 与主窗同一风格：每条消息一个小函数，DlgProc 只做分发
+
+static void OnDlgCreate(HWND h)
+{
+    DlgCtx *c = &g_dlg;
+    int y = c->titleH + S_(10);
+    for (int i = 0; i < c->n; i++) {
+        HWND st = CreateWindowExW(0, L"STATIC", c->f[i].label,
+                                  WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                  S_(12), y + S_(4), c->labW - S_(8), S_(18),
+                                  h, (HMENU)(INT_PTR)(2000 + i), g_inst, NULL);
+        int ex = S_(16) + c->labW;
+        int ew = c->dlgW - ex - S_(14) - (c->f[i].mode ? c->browseW + S_(6) : 0);
+        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", c->f[i].buf,
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | ES_AUTOHSCROLL,
+                                  ex, y, ew, S_(23), h,
+                                  (HMENU)(INT_PTR)(ID_EDIT_BASE + i), g_inst, NULL);
+        if (st) SendMessageW(st, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(ed, WM_SETFONT, (WPARAM)g_font, TRUE);
+        c->ed[i] = ed;
+        if (c->f[i].mode) {
+            HWND b = CreateWindowExW(0, L"BUTTON", L"浏览(&B)...",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                     c->dlgW - S_(14) - c->browseW, y, c->browseW, S_(23),
+                                     h, (HMENU)(INT_PTR)(DLG_BROWSE + i), g_inst, NULL);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
+        }
+        y += c->rowH;
+    }
+    int bw = S_(84), bh = S_(27);
+    int by = c->titleH + S_(10) + c->n * c->rowH + S_(12);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"确定",
+                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              c->dlgW - S_(14) - bw * 2 - S_(8), by, bw, bh,
+                              h, (HMENU)(INT_PTR)DLG_OK, g_inst, NULL);
+    HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  c->dlgW - S_(14) - bw, by, bw, bh,
+                                  h, (HMENU)(INT_PTR)DLG_CANCEL, g_inst, NULL);
+    SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SendMessageW(cancel, WM_SETFONT, (WPARAM)g_font, TRUE);
+    SetFocus(c->n > 0 ? c->ed[0] : ok);
+    if (c->n > 0) SendMessageW(c->ed[0], EM_SETSEL, 0, -1);
+}
+
+static void OnDlgCommand(HWND h, WPARAM w)
+{
+    int id = LOWORD(w), code = HIWORD(w);
+    if (id == DLG_OK || id == DLG_CANCEL) {
+        if (id == DLG_OK) {
+            for (int i = 0; i < g_dlg.n; i++)
+                GetWindowTextW(g_dlg.ed[i], g_dlg.f[i].buf, g_dlg.f[i].cch);
+            g_dlg.ok = TRUE;
+        }
+        DestroyWindow(h);
+        return;
+    }
+    // 只在按钮真正被点击时打开浏览框（否则输入框的 EN_* 通知会误触发）
+    if (code == BN_CLICKED && id >= DLG_BROWSE && id < DLG_BROWSE + 6) {
+        int i = id - DLG_BROWSE;
+        if (g_dlg.f[i].mode == 1) BrowseForFile(g_dlg.ed[i]);
+    }
+}
+
+static void OnDlgPaint(HWND h)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc;
+    GetClientRect(h, &rc);
+    FillRect(dc, &rc, g_brPanel);
+    RECT sep = { 0, g_dlg.titleH, rc.right, g_dlg.titleH + 1 };
+    FillRect(dc, &sep, g_brLine);
+    HFONT old = (HFONT)SelectObject(dc, g_fontT);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_TEXT);
+    RECT tr = { S_(14), 0, rc.right - S_(14), g_dlg.titleH };
+    WCHAR ttl[64] = L"";
+    GetWindowTextW(h, ttl, 64);
+    DrawTextW(dc, ttl, -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(dc, old);
+    EndPaint(h, &ps);
+}
+
+// 标题栏整条都是拖动命中区；客户区其余部分转交默认过程（控件命中）
+static LRESULT OnDlgNcHitTest(HWND h, LPARAM l)
+{
+    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    ScreenToClient(h, &p);
+    if (p.y < g_dlg.titleH) return HTCAPTION;
+    return 0;
+}
+
+// ---------------------------------------------------------------- 对话框
 static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
-    case WM_CREATE: {
-        DlgCtx *c = &g_dlg;
-        int y = c->titleH + S_(10);
-        for (int i = 0; i < c->n; i++) {
-            HWND st = CreateWindowExW(0, L"STATIC", c->f[i].label,
-                                      WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                                      S_(12), y + S_(4), c->labW - S_(8), S_(18),
-                                      h, (HMENU)(INT_PTR)(2000 + i), g_inst, NULL);
-            int ex = S_(16) + c->labW;
-            int ew = c->dlgW - ex - S_(14) - (c->f[i].mode ? c->browseW + S_(6) : 0);
-            HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", c->f[i].buf,
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | ES_AUTOHSCROLL,
-                                      ex, y, ew, S_(23), h,
-                                      (HMENU)(INT_PTR)(ID_EDIT_BASE + i), g_inst, NULL);
-            if (st) SendMessageW(st, WM_SETFONT, (WPARAM)g_font, TRUE);
-            SendMessageW(ed, WM_SETFONT, (WPARAM)g_font, TRUE);
-            c->ed[i] = ed;
-            if (c->f[i].mode) {
-                HWND b = CreateWindowExW(0, L"BUTTON", L"浏览(&B)...",
-                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                         c->dlgW - S_(14) - c->browseW, y, c->browseW, S_(23),
-                                         h, (HMENU)(INT_PTR)(DLG_BROWSE + i), g_inst, NULL);
-                SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
-            }
-            y += c->rowH;
-        }
-        int bw = S_(84), bh = S_(27);
-        int by = c->titleH + S_(10) + c->n * c->rowH + S_(12);
-        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定",
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                  c->dlgW - S_(14) - bw * 2 - S_(8), by, bw, bh,
-                                  h, (HMENU)(INT_PTR)DLG_OK, g_inst, NULL);
-        HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                      c->dlgW - S_(14) - bw, by, bw, bh,
-                                      h, (HMENU)(INT_PTR)DLG_CANCEL, g_inst, NULL);
-        SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SendMessageW(cancel, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SetFocus(c->n > 0 ? c->ed[0] : ok);
-        if (c->n > 0) SendMessageW(c->ed[0], EM_SETSEL, 0, -1);
-        return 0;
-    }
-    case WM_COMMAND: {
-        int id = LOWORD(w), code = HIWORD(w);
-        if (id == DLG_OK || id == DLG_CANCEL) {
-            if (id == DLG_OK) {
-                for (int i = 0; i < g_dlg.n; i++)
-                    GetWindowTextW(g_dlg.ed[i], g_dlg.f[i].buf, g_dlg.f[i].cch);
-                g_dlg.ok = TRUE;
-            }
-            DestroyWindow(h);
-            return 0;
-        }
-        // 只在按钮真正被点击时打开浏览框（否则输入框的 EN_* 通知会误触发）
-        if (code == BN_CLICKED && id >= DLG_BROWSE && id < DLG_BROWSE + 6) {
-            int i = id - DLG_BROWSE;
-            if (g_dlg.f[i].mode == 1) BrowseForFile(g_dlg.ed[i]);
-            return 0;
-        }
-        break;
-    }
-    case WM_CLOSE:
-        DestroyWindow(h);
-        return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    case WM_ERASEBKGND: {
-        RECT rc;
-        GetClientRect(h, &rc);
-        FillRect((HDC)w, &rc, g_brPanel);
-        return 1;
-    }
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        RECT rc;
-        GetClientRect(h, &rc);
-        FillRect(dc, &rc, g_brPanel);
-        RECT sep = { 0, g_dlg.titleH, rc.right, g_dlg.titleH + 1 };
-        FillRect(dc, &sep, g_brLine);
-        HFONT old = (HFONT)SelectObject(dc, g_fontT);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, C_TEXT);
-        RECT tr = { S_(14), 0, rc.right - S_(14), g_dlg.titleH };
-        WCHAR ttl[64] = L"";
-        GetWindowTextW(h, ttl, 64);
-        DrawTextW(dc, ttl, -1, &tr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SelectObject(dc, old);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    case WM_CTLCOLORSTATIC: {
-        SetBkMode((HDC)w, TRANSPARENT);
-        SetTextColor((HDC)w, C_DIM);
-        return (LRESULT)g_brPanel;
-    }
-    case WM_CTLCOLOREDIT: {
-        SetTextColor((HDC)w, C_TEXT);
-        SetBkColor((HDC)w, C_CELL);
-        return (LRESULT)g_brCell;
-    }
+    case WM_CREATE:            OnDlgCreate(h);                     return 0;
+    case WM_COMMAND:           OnDlgCommand(h, w);                 return 0;
+    case WM_CLOSE:             DestroyWindow(h);                   return 0;
+    case WM_DESTROY:           PostQuitMessage(0);                 return 0;
+    case WM_ERASEBKGND:      { RECT rc; GetClientRect(h, &rc);
+                               FillRect((HDC)w, &rc, g_brPanel);  return 1; }
+    case WM_PAINT:             OnDlgPaint(h);                      return 0;
+    case WM_CTLCOLORSTATIC:    SetBkMode((HDC)w, TRANSPARENT);
+                               SetTextColor((HDC)w, C_DIM);
+                                                     return (LRESULT)g_brPanel;
+    case WM_CTLCOLOREDIT:      SetTextColor((HDC)w, C_TEXT);
+                               SetBkColor((HDC)w, C_CELL);
+                                                     return (LRESULT)g_brCell;
     case WM_CTLCOLORBTN:
-    case WM_CTLCOLORDLG: {
-        SetTextColor((HDC)w, C_TEXT);
-        SetBkColor((HDC)w, C_PANEL);
-        return (LRESULT)g_brPanel;
-    }
-    case WM_NCHITTEST: {
-        POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        ScreenToClient(h, &p);
-        if (p.y < g_dlg.titleH) return HTCAPTION;
-        break;
-    }
-    default:
-        break;
+    case WM_CTLCOLORDLG:       SetTextColor((HDC)w, C_TEXT);
+                               SetBkColor((HDC)w, C_PANEL);
+                                                     return (LRESULT)g_brPanel;
+    case WM_NCHITTEST:       { LRESULT ht = OnDlgNcHitTest(h, l);
+                               if (ht) return ht; }              break;
+    default:                                                            break;
     }
     return DefWindowProcW(h, m, w, l);
 }
-
+// 属性框/重命名框共用：模态小窗（IsDialogMessage 处理 Tab/方向键），
+// 关闭后由调用方读 g_dlg.ok 决定是否应用。字段值直接写回调用方的缓冲
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
 {
     DlgField *f = (DlgField *)fields;
