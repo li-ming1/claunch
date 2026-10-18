@@ -6,6 +6,7 @@
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
+// 虚拟项图标状态化（回收站空/满）：唤醒与可见期间周期重取，与桌面同步翻转。
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Ctrl+滚轮缩放格子（40~160，配置记忆）、
 // 直接键入即按名称搜索过滤（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
 // Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
@@ -939,12 +940,37 @@ static HICON NamespaceIcon(const WCHAR *path)
     return ok ? fi.hIcon : NULL;               // 32px：绘制时 DrawIconEx 缩到格宽
 }
 
+// shell 命名空间解析名（回收站/此电脑等 = "::{CLSID}"）统一判定：
+// 图标状态化（回收站空/满）、无文件位置可去、提权打开无意义
+static BOOL IsVirtualPath(const WCHAR *path)
+{
+    return path[0] == L':' && path[1] == L':';
+}
+
+// shell 虚拟项的图标随状态变化（回收站空/满——实测 SHGFI_PIDL 走 shell
+// 图标处理器，与桌面同款状态感知：桶内 17 项时与注册表 full 图标零像素差）。
+// 缓存一次就冻结，故面板可见期间定期重取：先取新再换旧，绘制无空窗。
+// 图标管线在首次加载时已驻留，重取只是热路径调用（~1ms），无新增内存账
+static void RefreshVirtualIcons(void)
+{
+    for (int i = 0; i < g_nItems; i++) {
+        if (!IsVirtualPath(g_items[i].path)) continue;
+        HICON h = NamespaceIcon(g_items[i].path);
+        if (!h) continue;
+        if (g_items[i].ownIcon && g_items[i].icon) DestroyIcon(g_items[i].icon);
+        g_items[i].icon = h;
+        g_items[i].ownIcon = TRUE;
+        for (int v = 0; v < ViewCount(); v++)       // 在当前视图里才需局部重绘
+            if (ItemAtView(v) == i) { InvalidateCell(v); break; }
+    }
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
     HICON h = NULL;
     // shell 命名空间解析名（"::{CLSID}"）：不进文件系统检查/扩展名关联链，
-    // 直接问 shell 要图标
-    if (path[0] == L':' && path[1] == L':')
+    // 直接问 shell 要图标（状态感知，见 RefreshVirtualIcons）
+    if (IsVirtualPath(path))
         return NamespaceIcon(path);
     // 网络路径/URL 整体早退：不做任何路径 I/O（断连映射盘会阻塞数秒且
     // 阻塞在 UI 线程），图标只按扩展名走注册表关联链；解析不出时返回
@@ -1653,6 +1679,7 @@ static void StartFadeIn(void)
 {
     g_outSince = 0;
     g_wakeAt = GetTickCount();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
+    RefreshVirtualIcons();       // 唤醒即对时：回收站空/满等状态化图标对齐当前真实状态
     g_alpha = 0;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     g_fadeDir = 1;
@@ -2782,9 +2809,9 @@ static void ShowCellMenu(int vi)
 {
     int ii = ItemAtView(vi);
     BOOL hasItem = ii >= 0 && !IsBlank(ii);
-    // shell 虚拟项（回收站/此电脑 = "::{CLSID}"）没有文件位置可去，
-    // 提权打开也无意义：这两个菜单项对它不诚实，直接不出现
-    BOOL virt = hasItem && g_items[ii].path[0] == L':' && g_items[ii].path[1] == L':';
+    // shell 虚拟项（回收站/此电脑）：没有文件位置可去，提权打开也无意义：
+    // 这两个菜单项对它不诚实，直接不出现
+    BOOL virt = hasItem && IsVirtualPath(g_items[ii].path);
     HMENU m = CreatePopupMenu();
     if (hasItem) {
         AppendMenuW(m, MF_STRING, IDM_LAUNCH, L"打开");
@@ -3849,6 +3876,10 @@ static void InitOleDrop(HWND h)
 static void OnTimer(HWND h, WPARAM w)
 {
     if (w == TIMER_HIDE) {
+        // 虚拟项图标周期对时（25 拍 ≈ 3s）：面板开着时回收站空/满也翻转。
+        // 只碰 :: 项，单次 ~1ms
+        static int s_virtTick = 0;
+        if (++s_virtTick >= 25) { s_virtTick = 0; RefreshVirtualIcons(); }
         if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
         if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
         if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
