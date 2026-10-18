@@ -1,10 +1,12 @@
-// kk.c — 桌面格子：单文件、零第三方依赖的桌面启动器
+// claunch.c — 桌面格子：单文件、零第三方依赖的桌面启动器
 // 左侧分组完全用户自治（默认“常用”，可删可改名、行可拖拽排序决定滚轮切换
 // 顺序，无内置“全部”聚合视图）、正方形密集格子（槽位模型：
 // 拖放即与落点互换、清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）、
 // 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
 // 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
 // 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
+// 默认静默启动：开机/双击直接进托盘不弹面板（托盘可改）；失效清理延到首次唤醒，
+// 托盘就绪不等磁盘。
 // 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
 // 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
 // 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
@@ -53,10 +55,10 @@
 // ---------------------------------------------------------------- 常量
 #define MAX_GROUPS      16
 #define MAX_ITEMS       128
-#define APP_CLASS       L"KKLauncherWnd"
-#define DLG_CLASS       L"KKDialogWnd"
-#define APPNAME         L"桌面格子"
-#define ININAME         L"kk.ini"
+#define APP_CLASS       L"ClaunchLauncherWnd"
+#define DLG_CLASS       L"ClaunchDialogWnd"
+#define APPNAME         L"claunch"
+#define ININAME         L"claunch.ini"
 
 #define WM_APP_WAKE     (WM_APP + 1)
 #define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板置顶且未聚焦时也可用）
@@ -187,7 +189,8 @@ static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateC
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
-static BOOL g_silent = FALSE;    // 静默启动：启动直接进托盘不淡入（配置持久化）
+static BOOL g_silent = TRUE;     // 静默启动（默认）：启动直接进托盘不淡入（配置持久化）
+static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
 static BOOL g_cfgDirty = FALSE;  // 配置有待落盘：缩放等连续操作防抖，避免每格滚轮都写文件
@@ -1467,6 +1470,18 @@ static void IniPath(void)
     WCHAR *p = wcsrchr(g_ini, L'\\');
     if (p) p[1] = 0;
     wcscat_s(g_ini, MAX_PATH, ININAME);
+    // 旧名接管：kk.ini → claunch.ini（程序改名时用户数据原地迁移）。
+    // 只在新名不存在时动——避免把新配置又搬回旧名
+    if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) {
+        WCHAR old[MAX_PATH];
+        wcscpy_s(old, MAX_PATH, g_ini);
+        SIZE_T n = wcslen(old);
+        if (n >= 11) {                       // 尾部 "claunch.ini" 共 11 字符
+            wcscpy_s(old + n - 11, 12, L"kk.ini");
+            if (GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES)
+                MoveFileExW(old, g_ini, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
 }
 
 typedef struct { HANDLE f; BYTE buf[4096]; int len, pos; BOOL first; } RdCtx;
@@ -1641,14 +1656,14 @@ static void LoadConfig(void)
 static void SaveConfig(void)
 {
     if (!g_hwnd) return;
-    // 原子写：先写等长换名的 kk.tmp，成功后 MoveFileEx 原子替换 kk.ini——
+    // 原子写：先写等长换名的 claunch.tmp，成功后 MoveFileEx 原子替换 claunch.ini——
     // 写入中途崩溃/断电不会把配置撕成半截（直接覆盖写会）。
-    // 换名取等长替换（kk.ini→kk.tmp 同 6 字符），无路径拼接溢出风险
+    // 换名取等长替换（claunch.ini→claunch.tmp 同 11 字符），无路径拼接溢出风险
     WCHAR tmp[MAX_PATH];
     wcscpy_s(tmp, MAX_PATH, g_ini);
     SIZE_T len = wcslen(tmp);
-    if (len < 6 || wcscmp(tmp + len - 6, L"kk.ini")) return;   // ini 名不符预期：防呆不写
-    wcscpy_s(tmp + len - 6, 7, L"kk.tmp");
+    if (len < 11 || wcscmp(tmp + len - 11, L"claunch.ini")) return;   // ini 名不符预期：防呆不写
+    wcscpy_s(tmp + len - 11, 12, L"claunch.tmp");
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -1660,7 +1675,7 @@ static void SaveConfig(void)
 
     RECT r;
     GetWindowRect(g_hwnd, &r);
-    FmtLine(L"# kk 桌面格子配置 (UTF-8)\r\n");
+    FmtLine(L"# claunch 桌面格子配置 (UTF-8)\r\n");
     FmtLine(L"[Main]\r\n");
     FmtLine(L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
@@ -1855,8 +1870,18 @@ static void StartFadeIn(void)
     SetTimer(g_hwnd, TIMER_FADE, 12, NULL);
 }
 
+// 静默启动延后的失效清理：任一唤醒路径（面板/拖放唤醒）首次执行一次。
+// 非静默启动不走这里——启动时就地清完（见 wWinMain）
+static void WakePrune(void)
+{
+    if (!g_needPrune) return;
+    g_needPrune = FALSE;
+    if (PruneInvalidItems()) SaveConfig();
+}
+
 static void ShowLauncher(void)
 {
+    WakePrune();
     POINT pt;
     GetCursorPos(&pt);
     RECT wr;
@@ -2777,7 +2802,7 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
 
 // ---------------------------------------------------------------- 开机自启
 // HKCU 的 Run 键是唯一事实源：启动时读一次供菜单勾选，切换时直接写/删，
-// 不镜像进 kk.ini——避免两处状态互相不一致。HKCU 无需管理员权限
+// 不镜像进 claunch.ini——避免两处状态互相不一致。HKCU 无需管理员权限
 #define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 
 // 读出自启项登记的路径（无该项返回 FALSE）。容量按写入上限（引号+全路径+NUL）给足
@@ -4200,6 +4225,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     // 拖放唤醒：面板隐藏时拖动光标进入其静置区——就地显示但不抢前台
     //（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动（落点就在原地）
     case WM_APP_DRAGWAKE:      if (!IsWindowVisible(h) && !g_dlgOpen) {
+                                   WakePrune();
                                    ShowWindow(h, SW_SHOWNA);
                                    StartFadeIn();
                                    SetTimer(h, TIMER_HIDE, 120, NULL);
@@ -4210,8 +4236,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 // ---------------------------------------------------------------- 崩溃取证
-// build.bat 的 /MAP 产出 kk.map（RVA→符号）就是为这里服务的：未处理异常
-// 时把指令指针的 RVA 写进 exe 同目录的 kk_crash.txt，拿 RVA 对 map 一查
+// buildclaunch.bat 的 /MAP 产出 claunch.map（RVA→符号）就是为这里服务的：未处理异常
+// 时把指令指针的 RVA 写进 exe 同目录的 claunch_crash.txt，拿 RVA 对 map 一查
 // 即得崩溃点函数——单文件工具没有调试器，这是唯一的取证据手段。
 // 处理器里只用最朴素的 WinAPI（防二次崩溃），写完交还系统按默认路径终止
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
@@ -4220,7 +4246,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     GetModuleFileNameW(NULL, path, MAX_PATH);
     WCHAR *slash = wcsrchr(path, L'\\');
     if (slash) slash[1] = 0;
-    wcscat_s(path, MAX_PATH, L"kk_crash.txt");
+    wcscat_s(path, MAX_PATH, L"claunch_crash.txt");
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
@@ -4304,7 +4330,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     ScaleMetrics();
     LoadConfig();
     InitAutostart();   // 开机自启状态以注册表为准（托盘菜单勾选用）；路径过期则自愈重写
-    g_clipFmt = RegisterClipboardFormatW(L"KKLauncherItem");   // 私有剪贴板格式；失败则 Ctrl+V 只认纯文本
+    g_clipFmt = RegisterClipboardFormatW(L"ClaunchItem");   // 私有剪贴板格式；失败则 Ctrl+V 只认纯文本
 
     RegClass(APP_CLASS, WndProc);
     RegClass(DLG_CLASS, DlgProc);   // 对话框类只注册一次：原在 RunDialog 里每开一次属性框就注册一遍
@@ -4322,14 +4348,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     InitOleDrop(g_hwnd);   // OLE 拖放：回收站等虚拟项拖入（失败则 DragAcceptFiles 兜底照旧）
 
     ClampToWorkArea();
-    if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
     if (g_silent) {
-        // 静默启动：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出检测心跳——
-        // 不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零轮询"不变量；
-        // 唤醒时 ShowLauncher 会重启它
+        // 静默启动（默认）：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出
+        // 检测心跳——不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零
+        // 轮询"不变量；唤醒时 ShowLauncher 会重启它。失效项目清理延到首次
+        // 唤醒（WakePrune）：托盘就绪不该等一轮磁盘 stat
+        g_needPrune = TRUE;
         ShowWindow(g_hwnd, SW_HIDE);
         KillTimer(g_hwnd, TIMER_HIDE);
     } else {
+        if (PruneInvalidItems()) SaveConfig();   // 失效项目启动即清，并写回配置
         ShowWindow(g_hwnd, SW_SHOW);
         ForceForeground(g_hwnd);
         StartFadeIn();   // 启动等同一次唤醒（TIMER_HIDE 在 WM_CREATE 已起）
