@@ -1,33 +1,22 @@
 // claunch.c — 桌面格子：单文件、零第三方依赖的桌面启动器
-// 左侧分组完全用户自治（默认“常用”，可删可改名、行可拖拽排序决定滚轮切换
-// 顺序，无内置“全部”聚合视图）、正方形密集格子（槽位模型：
-// 拖放即与落点互换、清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）、
-// 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、悬停顶部居中显示名称、
-// 鼠标移出自动隐藏、置顶按钮（常驻+置顶二合一）、双击桌面空白唤醒、Ctrl+Alt+K 快捷键、
-// 右键格子可编辑 名称/文件名/参数/工具提示；分组可新建（弹命名框）/重命名/删除。
-// 静默启动：开机/双击直接进托盘不弹面板（唯一行为），失效清理延到首次唤醒，
-// 托盘就绪不等磁盘。
-// 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放，见"拖放"节）：
-// 落格子=落位、落分组行=入该组、网格边缘悬停自动滚动；悬停有落点高亮。
-// 虚拟项图标状态化（回收站空/满）：唤醒面板时重取，与桌面同步翻转。
-// 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Del 清空悬停格、
-// Home/End/PageUp/PageDown 跳首末格/翻页（目标行自动滚进可视区）、
-// Ctrl+滚轮缩放格子（40~160，配置记忆）、
-// 唤醒快捷键用户可配置（默认 Ctrl+Alt+K；托盘菜单"设置唤醒快捷键"
-// 捕获新组合，Hotkey=<mods> <vk> 持久化，冲突时保留原组合并提示）、
-// 直接键入即跨全部分组极速搜索：前缀>词首>子串>拼音首字母>路径的相关度
-// 排序（中文应用名输拼音首字母即可命中，如 jsb→记事本），回车启动最优
-// 匹配（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
-// Ctrl+C/V：复制悬停格 / 粘贴到悬停格或追加（剪贴板同时带一份可外粘的路径文本）。
-// 托盘菜单可开/关：开机自启（写 HKCU Run 键）、静默启动（直接进托盘）。
-// 内存取向：配置流式读写，图标按需加载，仅依赖 Win32 + shell32。
-// 绘制走整窗离屏缓冲（~2.4MB 提交，闲置被裁剪不驻留）：直接绘制会在快速滚动时
-// 露出"画一半"的中间帧，产生频闪；离屏画完一次 BitBlt 上屏就没有这个问题。
-// 常驻内存红线（实测）：SHGetFileInfo 只作图标轻量链路失败后的兜底、不走
-// ShellExecute 常规启动（各有 .lnk 解析 + CreateProcess 直启替代）、主窗断开
-// IME——破防会把 15~30MB 的外部模块链（shell 管线 / WinRT / 输入法）拖进进程。
-// 唯一例外是 OLE 拖放（ole32）：回收站/此电脑等虚拟项只有 PIDL 格式，
-// WM_DROPFILES（CF_HDROP）收不到，不注册 IDropTarget 拖入会被直接拒绝。
+// 分组完全用户自治（默认"常用"，可删可改名、行可拖拽排序决定滚轮切换顺序，
+// 无内置"全部"聚合视图）；正方形密集格子（槽位模型：拖放即与落点互换、
+// 清空不挪其他格、可插入/删除格子、窗口铺满重排、边缘可拉伸）。
+// 拖程序进格子单击启动（标题栏闪现启动结果）、启动时自动清理失效项目、
+// 悬停顶部居中显示名称、移出自动隐藏、置顶二合一按钮、双击桌面空白唤醒、
+// 快捷键唤醒（默认 Ctrl+Alt+K，托盘菜单可改，冲突保留原键）。
+// 静默启动是唯一行为：直接进托盘，失效清理延到首次唤醒。
+// 桌面/资源管理器的文件与回收站等 shell 虚拟项均可拖入（OLE 拖放）：
+// 落格子=落位、落分组行=入该组、边缘悬停自动滚动；
+// 虚拟项图标状态化（回收站空/满），唤醒时重取与桌面同步。
+// 键盘：方向键移动悬停、回车/数字键启动、Del 清格、Home/End/PageUp/PageDown 翻页、
+// Ctrl+滚轮缩放（40~160 记忆）；键入即跨分组搜索（前缀>词首>子串>拼音首字母>
+// 路径排序，jsb→记事本），回车启动最优，Esc 清空。Ctrl+C/V 复制/粘贴悬停格。
+// 托盘菜单：显示面板 / 设置唤醒快捷键 / 开机自启（写 HKCU Run）/ 退出。
+// 内存红线（实测）：配置流式读写、图标按需加载、SHGetFileInfo 只作兜底、
+// .lnk 解析 + CreateProcess 直启替代 ShellExecute、主窗断开 IME、
+// COM/图标管线延迟到唤醒——破防会拖进 15~30MB 外部模块链。
+// 绘制走整窗离屏缓冲：直接绘制在快速滚动时露"画一半"中间帧，频闪。
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -185,16 +174,15 @@ static HBITMAP g_memBmp;
 static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
-// 侧栏分行几何：ScaleMetrics 随 DPI 一次算好，GroupRect/GroupAt/
-// EnsureGroupVisible/SidebarContentH/PaintSidebar 共用——原来裸 6/3/12
-// 散落五处，且不随 DPI 缩放（高 DPI 下侧栏留白被压扁）
+// 侧栏分行几何：ScaleMetrics 随 DPI 一次算好，五个函数共用（原来裸 6/3/12
+// 散落五处且不随 DPI 缩放）
 static int  g_grpPadX, g_grpPadTop, g_grpRowGap, g_grpPadY, g_grpSelBar;
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
 static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
-static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（静默默验下的可发现性）
+static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（可发现性）
 // 唤醒快捷键（用户可配置，默认 Ctrl+Alt+K；配置行 Hotkey=<mods> <vk>）。
 // mods 位：1=Shift 2=Ctrl 4=Alt。Win 组合不提供——那是系统的地盘
 static UINT g_hotMods = MOD_CONTROL | MOD_ALT;
@@ -377,9 +365,8 @@ static BOOL IsSepW(WCHAR c)
 }
 
 // ---------------------------------------------------------------- 拼音首字母（中文搜索）
-// 常用字拼音首字母表（人工维护，按首字母分组；生僻字不收录=不参与匹配）。
-// 覆盖 ~1800 常用字，应用名词汇足够；多音字取最常用读法的首字母。
-// 运行时启动一次性建 O(1) 映射，搜索零开销；不连输入法（内存红线）
+// 常用字拼音首字母表（人工维护，~1800 常用字；生僻字不收录=不参与匹配，
+// 多音字取最常用读法）。启动建一次 O(1) 映射，搜索零开销、不连输入法
 static const WCHAR *PINYIN_GROUPS[26] = {
     L"啊阿哀挨矮蔼爱碍安氨俺岸按案暗昂",                                        // a
     L"八巴扒吧疤拔把靶坝爸罢白百柏摆败拜斑般班颁搬板版办半伴扮拌瓣帮绑榜膀傍包胞雹饱宝保堡报抱暴杯卑悲碑北贝备背倍被辈奔本笨崩绷逼鼻比彼笔鄙币必毕闭辟避臂边编鞭扁便变遍辨辩标彪表别宾滨兵冰丙柄饼并病拨波玻剥播伯驳勃博搏薄补捕不布步部", // b
@@ -448,9 +435,8 @@ static int NameInitials(const WCHAR *name, WCHAR *out, int cch)
 }
 
 // 搜索打分：前缀 4 > 词首 3 > 名内子串 2 > 拼音首字母 3/2 > 路径子串 1 > 0。
-// 词首 = 名字中任意词的开头（空格/括号/点/横线/下划线/中点等之后）——
-// “HP Support Assistant” 输 hp、sa 均为词首命中，排在普通子串前；
-// CJK 名字无词边界概念，按子串计分，天然不误伤
+// 词首 = 词分隔符（空格/括号/点/横线/中点…）之后——"HP Support Assistant"
+// 输 hp、sa 均为词首；CJK 无词边界，按子串计分
 static int MatchScore(const WCHAR *name, const WCHAR *path, const WCHAR *q)
 {
     int pos = FindTextI(name, q);
@@ -459,8 +445,7 @@ static int MatchScore(const WCHAR *name, const WCHAR *path, const WCHAR *q)
         if (IsSepW(name[pos - 1])) return 3;
         return 2;
     }
-    // 拼音首字母：中文应用名输首字母即可命中（jsb → 记事本、hlgy → 惠普管家）。
-    // 序列含 ASCII 原样（英文名字重复命中无害）；计分并入词首/子串档
+    // 拼音首字母命中（jsb → 记事本），计分并入词首/子串档
     WCHAR ini[64];
     if (NameInitials(name, ini, 64)) {
         int pp = FindTextI(ini, q);
@@ -471,9 +456,8 @@ static int MatchScore(const WCHAR *name, const WCHAR *path, const WCHAR *q)
 }
 
 // ---------------------------------------------------------------- 布局
-// 列数按目标格宽最近取整；格子尺寸由列数反推，横向正好铺满（保持正方形）。
-// g_cols/g_slots 只在 UpdateCell 里算（WM_SIZE/DPI 变化时刷新），
-// 命中/绘制/滚动钳制路径直接读缓存，不经过包装函数
+// 列数按目标格宽最近取整、格子尺寸由列数反推（横向铺满保持正方形）；
+// g_cols/g_slots 只在 WM_SIZE/DPI 变化时算，命中/绘制/滚动直读缓存
 static void UpdateCell(void)
 {
     int w = g_cw - g_sideW;
@@ -610,7 +594,7 @@ static BOOL ScrollCellIntoView(int vi)
 }
 
 // 侧栏分组列表的虚拟内容高度（行高 + 上下留白）：滚动钳制与滚动条
-// 几何共用同一算式——两处各算一遍正是 thumb 与钳制曾经对不上的根源
+// 几何必须共用同一算式，否则 thumb 与钳制对不上
 static int SidebarContentH(void)
 {
     return g_nGroups * g_grpH + g_grpPadY;
@@ -674,9 +658,8 @@ static int GroupAt(POINT p)
     return -1;
 }
 
-// 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn / g_pressBtn）。
-// 几何是纯布局量：缓存成矩形表，命中/绘制只读表——WM_SIZE 与 DPI 变化
-// 经 UpdateCell/ScaleMetrics 刷新，热路径上不做除法和乘法
+// 标题栏右侧按钮：1=钉住 2=关闭（编码同 g_hoverBtn/g_pressBtn）。
+// 几何缓存成矩形表，命中/绘制只读——热路径上不做乘除
 static RECT g_btnRect[3];     // 下标即按钮编码（0 号位不用）
 static int  g_pressBtn = 0;   // 正按下的按钮：纯视觉反馈，动作仍即时生效
 
@@ -709,11 +692,9 @@ static int BtnAt(POINT p)
 }
 
 // ---------------------------------------------------------------- 图标（按需加载）
-// 首选轻量链：PrivateExtractIconsW 直接读文件资源 → 失败再 ExtractIconExW /
-// 资源映射 → 注册表关联链（扩展名→ProgID→DefaultIcon）→ 全部失败才
-// SHGetFileInfo（资源管理器同款；会拖来 shell 图标管线 shell.dll、PROPSYS、
-// WindowsCodecs、Windows.Storage…约 15MB 映像且常驻，故只做最后兜底，
-// 代价仅由轻量链确实解不出的文件类型承担，如打包应用关联）。
+// 轻量链优先：PrivateExtractIconsW → ExtractIconExW/资源映射 → 注册表关联链，
+// 全部失败才 SHGetFileInfo 兜底——它会拖来 ~15MB 常驻 shell 图标管线，
+// 代价只由轻量链解不出的文件类型（如打包应用关联）承担
 typedef int (WINAPI *PFN_PrivateExtractIconsW)(LPCWSTR, int, int, int,
                                                HICON *, int *, int, int);
 static PFN_PrivateExtractIconsW pExtractIcons = NULL;
@@ -917,11 +898,9 @@ static BOOL ParseLnk(const WCHAR *path, LnkInfo *li)
     return ok && ParseLnkBuf(buf, n, li);
 }
 
-// 图标画布：32bpp 自上而下 DIBSection 当颜色位图。GDI 绘制只写 RGB、
-// 不动 alpha——实测绘制还会把触碰处的 alpha 字节清 0，所以 alpha 必须在
-// 画完之后写（CanvasEnd）。掩码位图只是占位：32bpp 颜色位图下
-// CreateIconIndirect 忽略掩码内容（旧代码把颜色/掩码两张位图选进同一个 DC，
-// 绘制全部落进掩码、颜色位图留空，两个手绘图标都退化成纯黑方块）
+// 图标画布：32bpp 自上而下 DIBSection 当颜色位图。GDI 绘制不动 alpha
+// （实测还会把触碰处 alpha 清 0），所以 alpha 必须画完后在 CanvasEnd 写；
+// 掩码位图只是占位——32bpp 颜色位图下 CreateIconIndirect 忽略掩码内容
 typedef struct { HDC dc; HBITMAP col, msk; DWORD *bits; } IconCanvas;
 
 static BOOL CanvasBegin(IconCanvas *cv, int sz)
@@ -1036,11 +1015,10 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
     return IconFromImage(icon, want, idx);
 }
 
-// 文档类型关联图标：扩展名 → ProgID → DefaultIcon（.docx→Word、.txt→txtfile…）。
-// 手工走注册表，不碰 SHGetFileInfo 的 shell 图标管线（文件头内存红线）。
-// 顺序与资源管理器的有效关联一致：先用户选择（FileExts\UserChoice），
-// 用户没选或其 ProgID 无图标时才退机器默认（HKCR 扩展名→ProgID）——
-// 顺序反了会显示用户已经换掉的旧关联的图标
+// 文档类型关联图标：扩展名 → ProgID → DefaultIcon。手工走注册表，
+// 不碰 SHGetFileInfo 的 shell 图标管线（内存红线）。顺序与资源管理器
+// 一致：先用户选择（FileExts\UserChoice）再退机器默认——反了会显示
+// 用户已换掉的旧关联图标
 static HICON AssocIcon(const WCHAR *path, int want)
 {
     const WCHAR *ext = wcsrchr(path, L'.');
@@ -1111,12 +1089,10 @@ static BOOL IsVirtualPath(const WCHAR *path)
     return path[0] == L':' && path[1] == L':';
 }
 
-// shell 虚拟项的图标随状态变化（回收站空/满——实测 SHGFI_PIDL 走 shell
-// 图标处理器，与桌面同款状态感知：桶内 17 项时与注册表 full 图标零像素差）。
-// 缓存一次就冻结，故在唤醒路径重取：先取新再换旧，绘制无空窗。
-// 刻意不做心跳周期刷新——SHGetFileInfo 在 shell 忙时同步阻塞 UI 线程，
-// 定时触发等于埋雷（托盘菜单打开期间卡死即此）；唤醒是用户主动动作，
-// 时机安全，且图标管线首次加载已驻留、单次 ~1ms 无新增内存账
+// shell 虚拟项图标随状态变化（回收站空/满，与桌面同款状态感知）。
+// 缓存一次就冻结，故唤醒时重取：先取新再换旧，绘制无空窗。
+// 刻意不做心跳刷新——SHGetFileInfo 在 shell 忙时同步阻塞 UI 线程，
+// 定时触发等于埋雷；唤醒是用户主动动作，时机安全
 static void RefreshVirtualIcons(void)
 {
     if (g_menuOpen || g_dlgOpen) return;   // 菜单/对话框模态期间回避 shell 调用：
@@ -1247,11 +1223,9 @@ static int AddNamedItem(const WCHAR *path, const WCHAR *name, int group)
     return AddItemByPath(path, group);
 }
 
-// 把格子 ii 改成指向 path 的新程序：取名、换目标、清参数、清提示、丢旧图标。
-// 不在这里 EnsureIcon：图标一律由 PaintGrid 按格按需加载（绘制时才对可见格
-// 解析）。批量拖入时拖放处理器对每个落点调本函数——若就地加载，拖 50 个
-// 文档到列表末尾（屏幕外）要同步付 50 次图标链解析（每次约 0.4~1ms），
-// 全压在 UI 线程上；延迟到绘制后只有进入视野的格子才解析
+// 把格子 ii 改指向 path 的新程序：取名、换目标、清参数/提示、丢旧图标。
+// 图标不在本函数加载——一律由 PaintGrid 对可见格按需解析：批量拖 50 个
+// 文档到屏幕外时，就地加载要同步付 50 次图标链解析（每次 ~0.4-1ms）
 static void SetItemTarget(int ii, const WCHAR *path, int group)
 {
     DropIcon(ii);
@@ -1546,8 +1520,7 @@ static BOOL RdLine(RdCtx *r, WCHAR *out, int cch)
     return TRUE;
 }
 
-// 配置写出走 8KB 暂存：行满即冲、收尾一次冲完。
-// 原来逐行一次 WriteFile：128 条目的配置要 130 次系统调用
+// 配置写出走 8KB 暂存：行满即冲、收尾一次冲完（逐行 WriteFile 要 130 次系统调用）
 static HANDLE g_outFile;
 static BYTE   g_outBuf[8192];
 static int    g_outLen;
@@ -1602,8 +1575,8 @@ static void LoadConfig(void)
 
     WCHAR line[1200], section[32] = L"";
     WCHAR rect[64] = L"";
-    // 无配置文件（或打不开）时循环条件直接为假：保持默认分组，走下面的默认矩形。
-    // 原来这里提前 return，跳过了 SetDefaultRect——首启会创建出 0x0 的不可见窗口
+    // 无配置文件时循环条件直接为假：保持默认分组。这里不能提前 return——
+    // 会跳过 SetDefaultRect，首启创建出 0x0 的不可见窗口
     while (r.f != INVALID_HANDLE_VALUE && RdLine(&r, line, 1200)) {
         if (line[0] == L'[') {
             int n = 0;
@@ -2045,8 +2018,8 @@ static void MakeBrushes(void)
     g_brPanel  = CreateSolidBrush(C_PANEL);
 }
 
-// 标题栏按钮与格子边框的 GDI 对象：颜色固定，DPI 变化时整套重建。
-// 原来每画一次就 CreatePen/CreateSolidBrush 再逐个销毁，纯 churn
+// 标题栏按钮与格子边框的 GDI 对象：颜色固定，DPI 变化时整套重建
+// （画一帧建一套再销毁是纯 churn）
 static void MakeGdiObjects(void)
 {
     if (g_brPinOff)   { DeleteObject(g_brPinOff);   g_brPinOff = NULL; }
@@ -2075,10 +2048,8 @@ static void MakeFontsAndBrushes(void)
 }
 
 // ---------------------------------------------------------------- 悬停文字
-// 设置悬停文字（顺带置激活态），返回文字/激活态是否变化。
-// 原来 6 处各写一遍 wcsncpy_s，收拢到这里；比较放在写入前完成，
-// 调用方不必再拷一份旧文字来对比（80+ 字符的超长文字按显示得出的
-// 前 79 字符比较，最差情况是多重绘一次标题栏，像素不变）
+// 设置悬停文字（顺带置激活态），返回是否有变化——没变就不重绘标题栏。
+// 比较放在写入前，调用方不必拷旧文字来对比（超长按显示的前 79 字符比）
 static BOOL SetHover(const WCHAR *s, BOOL active)
 {
     BOOL chg = active != g_hoverActive || wcscmp(s, g_hoverText) != 0;
@@ -2113,11 +2084,8 @@ static BOOL UpdateHoverText(void)
     return SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
 }
 
-// 返回悬停文字/激活态是否变化（没变就不重绘标题栏）。
-// 悬停目标没变时直接返回：鼠标在同一个格子上滑动是最高频的事件，
-// 此时连文字比较都不做。同格快速路径再省一级：光标还在当前悬停格的
-// 整格矩形内，CellAt/GroupAt/BtnAt 三路命中测试全部跳过
-// （悬停格越界时除外：走完整重算把陈旧悬停清掉）
+// 返回悬停是否变化。鼠标在同一个格子上滑动是最高频事件：
+// 同格快速路径（光标还在整格矩形内）直接返回，三路命中测试全跳过
 static BOOL HoverFromPoint(POINT p)
 {
     if (g_hoverCell >= 0 && g_hoverCell < ViewCount()) {
@@ -2136,10 +2104,8 @@ static BOOL HoverFromPoint(POINT p)
 }
 
 // ---------------------------------------------------------------- 悬停小卡片
-// 悬停格子/分组时在目标周围自动挑合适的位置浮出卡片，显示程序名/组名（类工具提示）。
-// 位置锚定悬停目标而非光标：光标每帧都在动，锚光标意味着每帧重算+重绘；
-// 锚目标则只在悬停目标变化时算一次（GetDC + DT_CALCRECT 量宽），
-// 绘制阶段只读缓存的状态，零分配、零新 GDI 对象（复用面板刷/线刷/字体）
+// 悬停目标旁浮出卡片（类工具提示）。锚定悬停目标而非光标：锚光标每帧
+// 重算+重绘；锚目标只在悬停变化时算一次，绘制阶段只读缓存、零分配
 static void UpdateCard(void)
 {
     const WCHAR *txt = NULL;
@@ -2374,13 +2340,9 @@ static void TogglePin(void)
 }
 
 // ---------------------------------------------------------------- 标题栏按钮图形
-// 视觉语言（全部 GDI 原生图形，无位图资源，随 S_() 缩放）：
-//   · 悬停/按下底色是胶囊形（圆角半径 = 半高）；关闭键悬停转 Windows
-//     标题栏惯例暗红，按下各深一档
-//   · × 是两段 45° 旋转矩形多边形——GDI 线帽是方的，斜线不用多边形
-//     边缘就会阶梯状，粗细也没法随 DPI 独立于长度
-//   · 钉住是地图钉剪影（圆头 + 收尖钉尾，两段填充拼成一枚），
-//     状态用色说话：暗 = 未置顶，accent = 已置顶，悬停统一提亮
+// 视觉语言：全 GDI 原生图形，无位图资源，随 S_() 缩放。悬停/按下底色是
+// 胶囊形（关闭键悬停转标题栏惯例暗红）；× 用两段 45° 旋转矩形——GDI 线帽
+// 是方的，斜线不用多边形会阶梯；钉住是地图钉剪影，色即状态（暗=未置顶）
 
 // 四舍五入入整数：字形坐标走浮点中间量（45° 向量），别用截断
 static LONG Rnd(double v)
@@ -2945,9 +2907,8 @@ static HICON MakeTrayIcon(int sz)
     return ico;
 }
 
-// 一次性气球提示（热键被占用等异常）：静默启动是默认，热键是主唤醒
-// 路径之一——注册失败不告知，用户只会觉得"按了没反应"且无从排查。
-// V4 行为下 uTimeout 由系统接管，仍然给值（旧版本行为兜底）
+// 一次性气球（热键占用等异常）：不告知的话用户只会觉得"按了没反应"。
+// V4 下 uTimeout 由系统接管，仍给值兜底
 static void TrayBalloon(const WCHAR *text)
 {
     if (!g_trayIcon) return;
@@ -3107,12 +3068,9 @@ static BOOL RunHotkeyCapture(HWND owner, UINT *mods, UINT *vk)
 static void TrayShowMenu(void)
 {
     // 开关项点击后菜单就地重弹（打钩即时更新）：标准弹出菜单选中即收，
-    // 没有“点一下钩原地翻”的能力，用关闭-重弹循环模拟——开关项回到
-    // 循环顶（状态已翻、菜单重建），点非开关项 / 按 Esc / 点空白才收场。
-    // 光标没动，重弹位置即原位置，观感是打钩当场变了
+    // 用关闭-重弹循环模拟"点一下钩原地翻"——光标没动，观感是当场变了
     for (;;) {
-        // 自启状态以 HKCU Run 键为唯一事实源：每轮弹菜单前重读一次。
-        // 别处动过（任务管理器启动页/安装器/其他实例）也当即反映
+        // 自启以 HKCU Run 键为唯一事实源：每轮弹菜单前重读，别处动过也当即反映
         WCHAR runPath[MAX_PATH + 8];
         g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
 
@@ -3154,9 +3112,8 @@ static void TrayShowMenu(void)
 }
 
 // ---------------------------------------------------------------- 菜单
-// 四个菜单（格子/分组/标题/托盘）弹出前的动作完全一样，收拢到这一处：
-// 光标处弹出、置前台、拿命令、销毁。用 ForceForeground 而非裸
-// SetForegroundWindow——输入队列没挂反时菜单会秒关，看起来像没反应
+// 四个菜单弹出前的动作完全一样，收拢一处。用 ForceForeground 而非裸
+// SetForegroundWindow——输入队列没挂反时菜单会秒关，像没反应
 static int PopupAt(HMENU m)
 {
     POINT p;
@@ -3377,12 +3334,9 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                 s_dragInRect = FALSE;
             }
         } else if (wParam == WM_MOUSEWHEEL) {
-            // 接管条件收到最窄，缺一不可：
-            //   面板可见（否则没有转发的意义）、面板置顶（这一像素确实属于面板，
-            //   没有被别的窗口盖住）、自家对话框没开、面板当前无焦点。
-            // 四条全中才把滚轮转给面板并吞掉 —— 全局钩子只要有丝毫越界，
-            // 用户在其他窗口的正常滚动就会被偷走，这是绝不能碰的红线。
-            // 不置顶时光标底下是谁的窗口就归谁滚，绝不插手。
+            // 接管条件收到最窄，缺一不可：面板可见、置顶（这一像素确实属于
+            // 面板）、对话框没开、面板无焦点。全局钩子只要有丝毫越界就会偷走
+            // 其他窗口的滚动——绝不能碰的红线。不置顶时光标底下归谁谁滚
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
             if (IsWindowVisible(g_hwnd) && g_pinned && !g_dlgOpen &&
                 GetForegroundWindow() != g_hwnd) {
@@ -3420,9 +3374,7 @@ static DWORD WINAPI HookThread(LPVOID arg)
 }
 
 // ---------------------------------------------------------------- 窗口过程：消息处理
-// 每条消息一个小函数——过程只做状态读取与转发，副作用集中在这里；
-// WndProc 本体只做分发（分发器一屏读完，逻辑都在下面的处理函数里）。
-// 顺序与 switch 分发表一致，便于对照
+// 每条消息一个小函数，WndProc 只做分发；顺序与 switch 分发表一致
 
 // ---------------------------------------------------------------- 唤醒快捷键（可配置）
 static void ModsName(WCHAR *out, size_t cch, UINT mods)
@@ -3498,9 +3450,8 @@ static void OnCreate(HWND h)
     }
 }
 
-// 离屏双缓冲：隐藏即释放（842×631×4B ≈ 2MB commit，挂托盘时纯占窝），
-// 首绘/尺寸变化时惰性重建。OnSize 必重建（尺寸配对），OnPaint 兜底重建
-// （唤醒后第一次绘制时缓冲已被释放掉）
+// 离屏双缓冲：隐藏即释放（~2MB commit，挂托盘时纯占窝），
+// 首绘/尺寸变化时惰性重建（OnSize 必重建保尺寸配对，OnPaint 兜底）
 static void ReleaseMemBuffer(void)
 {
     if (g_memDC) { DeleteDC(g_memDC); g_memDC = NULL; }
@@ -3617,10 +3568,8 @@ static void OnPaint(HWND h)
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
     // 隐藏窗没有可画的内容：启动期实测 Windows 会给不可见的层面板发
-    // WM_PAINT（创建期消息序列/强制绘制路径）——整段跳过，图标加载、
-    // shell 图标管线、离屏缓冲全部不碰。一次跳过省 ~16MB 工作集 +
-    // ~50 GDI（trace 实测：OnPaint 后 0.8M→18M/GDI 26→79）。
-    // 唤醒后窗口可见，照常全量绘制
+    // WM_PAINT——整段跳过（图标/shell 管线/离屏缓冲全不碰），一次省
+    // ~16MB 工作集 + ~50 GDI。唤醒后窗口可见，照常全量绘制
     if (IsWindowVisible(h)) {
         EnsureMemBuffer(h);      // 隐藏期间缓冲已释放：唤醒后首绘前重建
         if (g_memDC) {
@@ -4595,10 +4544,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     UNREF(prev); UNREF(cmd); UNREF(show);
     g_inst = inst;
 
-    // 单实例权威判定：命名互斥体。窗口类检查有 race——两个实例同时启动时
-    // 互相都查不到对方的窗，会双开成两个托盘图标。互斥体由内核保证原子，
-    // 且进程退出（含被任务管理器杀）时自动释放，无残留锁。
-    // Local\ 命名空间=每会话一个，快速用户切换各会话独立（正确语义）
+    // 单实例权威判定：命名互斥体（窗口类检查有 race——同时启动互查不到对方
+    // 的窗会双开）。内核保证原子、进程被杀自动释放；Local\ 每会话一个
     g_once = CreateMutexW(NULL, TRUE, L"claunch_single_instance");
     if (g_once && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND exist = FindLauncherWindow();
@@ -4614,9 +4561,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         return 0;
     }
 
-    // 两个导出都取自 user32：取一次句柄；取不到模块（不可能发生）则
-    // 两个函数指针留空——下游全部有 NULL 路径（DPI 走默认、图标链
-    // 跳过 PrivateExtractIconsW），不会把 NULL 句柄喂给 GetProcAddress
+    // 两个导出都取自 user32；取不到模块（不可能发生）则指针留空——
+    // 下游全有 NULL 路径（DPI 走默认、图标链跳过 PrivateExtractIconsW）
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (u32) {
         pSetDpi = (PFN_SetProcDpiCtx)
@@ -4639,37 +4585,29 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     g_clipFmt = RegisterClipboardFormatW(L"ClaunchItem");   // 私有剪贴板格式；失败则 Ctrl+V 只认纯文本
 
     RegClass(APP_CLASS, WndProc);
-    RegClass(DLG_CLASS, DlgProc);   // 对话框类只注册一次：原在 RunDialog 里每开一次属性框就注册一遍
-    RegClass(CAP_CLASS, CapProc);   // 热键捕获对话框同理
+    RegClass(DLG_CLASS, DlgProc);   // 对话框类只注册一次（原在 RunDialog 里反复注册）
+    RegClass(CAP_CLASS, CapProc);
 
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_LAYERED, APP_CLASS, APPNAME, WS_POPUP,
         g_savedX, g_savedY, g_savedW, g_savedH, NULL, NULL, inst, NULL);
     if (!g_hwnd) return 1;
 
-    // 主窗没有输入框：断开 IME。否则窗口一拿焦点，整条输入法链
-    // （SogouPY.ime/SogouTSF/MSCTF/textinputframework/d2d1/DWrite ~30MB）就被拉进进程。
-    // 属性对话框是独立窗口，保持默认 IME，中文输入不受影响。
+    // 主窗没有输入框：断开 IME——否则窗口一拿焦点，整条输入法链
+    // （~30MB）就被拉进进程。属性对话框保持默认 IME，中文输入不受影响
     ImmAssociateContext(g_hwnd, NULL);
 
-    // OLE 拖放（回收站等虚拟项）刻意不在此初始化——见 InitOleDrop 注释：
-    // 静默驻托盘是默认态，面板不可见时注册拖放目标毫无意义，而
-    // OleInitialize 一次性烫入 ~16MB COM 基础设施（trace 实测）。唤醒
-    // 路径先初始化再显示；失败则 DragAcceptFiles 兜底照旧
+    // OLE 拖放刻意不在此初始化（见 InitOleDrop 注释）：静默驻托盘时注册
+    // 拖放目标毫无意义，而 OleInitialize 一次性烫入 ~16MB COM 基础设施
 
     ClampToWorkArea();
-    // 静默启动是唯一行为：直接进托盘（WM_CREATE 已加托盘图标）。停掉移出
-    // 检测心跳——不可见窗口本来就用不到，与淡出隐藏路径保持同一个"零
-    // 轮询"不变量；唤醒时 ShowLauncher 会重启它。失效项目清理延到首次
-    // 唤醒（WakePrune）：托盘就绪不该等一轮磁盘 stat
+    // 静默启动是唯一行为：直接进托盘，停掉移出检测心跳（不可见窗口用不到，
+    // 唤醒时 ShowLauncher 重启）；失效清理延到首次唤醒（托盘就绪不等磁盘）
     g_needPrune = TRUE;
     ShowWindow(g_hwnd, SW_HIDE);
     KillTimer(g_hwnd, TIMER_HIDE);
     ReleaseMemBuffer();                // 双缓冲 ~2MB 从未被画过：直接放
-    // 托盘就绪即裁剪到低位工作集（与淡出隐藏路径同一"零轮询+裁剪"不变
-    // 量）。实测省 ~7MB 启动瞬时工作集——裁剪页按需软调入，首次唤醒
-    // 多几微秒故障，无感
-    TrimWS();
+    TrimWS();                          // 托盘就绪即回落低位工作集（软调入按需，无感）
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
