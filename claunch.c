@@ -13,6 +13,8 @@
 // 键盘：方向键移动悬停高亮、回车或数字键 1-9 启动、Del 清空悬停格、
 // Home/End/PageUp/PageDown 跳首末格/翻页（目标行自动滚进可视区）、
 // Ctrl+滚轮缩放格子（40~160，配置记忆）、
+// 唤醒快捷键用户可配置（默认 Ctrl+Alt+K；托盘菜单"设置唤醒快捷键"
+// 捕获新组合，Hotkey=<mods> <vk> 持久化，冲突时保留原组合并提示）、
 // 直接键入即跨全部分组极速搜索：前缀>词首>子串>拼音首字母>路径的相关度
 // 排序（中文应用名输拼音首字母即可命中，如 jsb→记事本），回车启动最优
 // 匹配（Esc 清空；拖动排序/拖放会清空过滤回全量视图）。
@@ -69,6 +71,7 @@
 #define TIMER_FADE      2
 #define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
 #define HOTKEY_ID       1
+#define CAP_CLASS       L"ClaunchCapWnd"     // 热键捕获对话框类
 
 // 时间与容差（毫秒 / 像素）：唤醒行为的一组参数，集中在这里调
 #define WAKE_GRACE_MS   3000   // 唤醒后光标不在窗口上的宽限：误唤醒不会立刻隐去
@@ -105,6 +108,7 @@
 #define IDM_TRAY_PIN        1102
 #define IDM_TRAY_AUTO       1103
 #define IDM_TRAY_SILENT     1104
+#define IDM_TRAY_HOTKEY     1105
 
 #define DLG_OK          1
 #define DLG_CANCEL      2
@@ -193,6 +197,10 @@ static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOS
 static BOOL g_silent = TRUE;     // 静默启动（默认）：启动直接进托盘不淡入（配置持久化）
 static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
 static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（静默默验下的可发现性）
+// 唤醒快捷键（用户可配置，默认 Ctrl+Alt+K；配置行 Hotkey=<mods> <vk>）。
+// mods 位：1=Shift 2=Ctrl 4=Alt。Win 组合不提供——那是系统的地盘
+static UINT g_hotMods = MOD_CONTROL | MOD_ALT;
+static UINT g_hotVk = 'K';
 static BOOL g_autostart = FALSE; // 开机自启：以 HKCU Run 键为准，启动时读入（不进配置）
 static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注册失败则只用纯文本）
 static BOOL g_cfgDirty = FALSE;  // 配置有待落盘：缩放等连续操作防抖，避免每格滚轮都写文件
@@ -271,6 +279,8 @@ static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
 static void ReleaseMemBuffer(void);   // 双缓冲释放：隐藏即放，唤醒首绘重建
 static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
+static void HotkeyName(WCHAR *out, size_t cch);   // 唤醒快捷键的可读名（定义在 OnCreate 区）
+static BOOL ApplyHotkey(HWND h);                  // 注册/更换唤醒快捷键（原子替换语义）
 static void SaveConfig(void);
 static void InvalidateTitle(void);
 static void InvalidateSidebar(void);
@@ -1611,6 +1621,17 @@ static void LoadConfig(void)
         if (!wcscmp(section, L"Main")) {
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Silent"))  g_silent = _wtoi(val) ? TRUE : FALSE;
+            else if (!wcscmp(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
+                unsigned mm = 0, vv = 0;
+                if (swscanf(val, L"%u %u", &mm, &vv) == 2 &&
+                    (mm & (MOD_CONTROL | MOD_ALT)) &&                 // 至少 Ctrl/Alt 之一
+                    !(mm & ~(MOD_CONTROL | MOD_ALT | MOD_SHIFT)) &&    // 不许混入别的位
+                    vv > 0 && vv <= 0xFF &&                            // 合法虚拟键
+                    vv != VK_CONTROL && vv != VK_MENU && vv != VK_SHIFT) {
+                    g_hotMods = mm;
+                    g_hotVk = vv;
+                }
+            }
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
             else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
             else if (!wcscmp(key, L"Rect"))    wcsncpy_s(rect, 64, val, _TRUNCATE);
@@ -1680,6 +1701,7 @@ static void SaveConfig(void)
             r.right - r.left, r.bottom - r.top);
     FmtLine(L"Pinned=%d\r\n", g_pinned ? 1 : 0);
     FmtLine(L"Silent=%d\r\n", g_silent ? 1 : 0);
+    FmtLine(L"Hotkey=%u %u\r\n", g_hotMods, g_hotVk);
     FmtLine(L"Group=%d\r\n", g_curGroup);
     FmtLine(L"Cell=%d\r\n", g_cellBase);
     FmtLine(L"[Groups]\r\n");
@@ -2985,6 +3007,85 @@ static void TrayRemove(void)
     if (g_trayIcon) { DestroyIcon(g_trayIcon); g_trayIcon = NULL; }
 }
 
+// ---------------------------------------------------------------- 热键捕获对话框
+// 模态小窗：按下“Ctrl/Alt 之一 + 主键”即录用，Esc（无修饰）取消。
+// 修饰键先按后松都常见——主键到达那一刻读实时修饰状态即当前组合。
+// Win 组合天然设不出（只读 Ctrl/Alt/Shift 三个键的实时状态）
+static UINT g_capMods, g_capVk;
+static BOOL  g_capOk;
+
+static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_KEYDOWN: {
+        UINT mods = 0;
+        if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+        if (GetAsyncKeyState(VK_MENU) & 0x8000)    mods |= MOD_ALT;
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000)   mods |= MOD_SHIFT;
+        UINT vk = (UINT)w;
+        if (vk == VK_ESCAPE && !mods) { g_capOk = FALSE; DestroyWindow(h); return 0; }
+        // 修饰键/CapsLock：继续等主键（按住 Ctrl 不放再按 K 是标准手势）
+        if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT ||
+            vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) return 0;
+        if (!(mods & (MOD_CONTROL | MOD_ALT))) return 0;   // 裸字母/功能键不收
+        g_capMods = mods; g_capVk = vk; g_capOk = TRUE;
+        DestroyWindow(h);
+        return 0;
+    }
+    case WM_CLOSE:   DestroyWindow(h);   return 0;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc);
+                          FillRect((HDC)w, &rc, g_brPanel); return 1; }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        SetBkMode(dc, TRANSPARENT);
+        HFONT old = (HFONT)SelectObject(dc, g_font);
+        SetTextColor(dc, C_TEXT);
+        RECT tr = { S_(20), S_(26), rc.right - S_(20), S_(52) };
+        DrawTextW(dc, L"请按下新的唤醒快捷键", -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SetTextColor(dc, C_DIM);
+        RECT tr2 = { S_(20), S_(58), rc.right - S_(20), S_(88) };
+        DrawTextW(dc, L"需要包含 Ctrl 或 Alt；按 Esc 取消", -1, &tr2,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// 捕获新组合；成功写回 *mods/*vk（模态循环与 RunDialog 同款）
+static BOOL RunHotkeyCapture(HWND owner, UINT *mods, UINT *vk)
+{
+    g_capOk = FALSE;
+    RECT or_;
+    GetWindowRect(owner, &or_);
+    int cw = S_(380), chh = S_(112);
+    HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
+                             CAP_CLASS, L"设置唤醒快捷键",
+                             WS_POPUP | WS_CLIPCHILDREN,
+                             or_.left + ((or_.right - or_.left) - cw) / 2,
+                             or_.top + ((or_.bottom - or_.top) - chh) / 2,
+                             cw, chh, owner, NULL, g_inst, NULL);
+    if (!h) return FALSE;
+    ShowWindow(h, SW_SHOW);
+    ForceForeground(h);
+    EnableWindow(owner, FALSE);
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    EnableWindow(owner, TRUE);
+    if (g_capOk) { *mods = g_capMods; *vk = g_capVk; }
+    return g_capOk;
+}
+
 static void TrayShowMenu(void)
 {
     // 开关项点击后菜单就地重弹（打钩即时更新）：标准弹出菜单选中即收，
@@ -2999,6 +3100,7 @@ static void TrayShowMenu(void)
 
         HMENU m = CreatePopupMenu();
         AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
+        AppendMenuW(m, MF_STRING, IDM_TRAY_HOTKEY, L"设置唤醒快捷键(&H)...");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
         // 两项是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
@@ -3014,6 +3116,22 @@ static void TrayShowMenu(void)
         if (cmd == IDM_TRAY_PIN)    { TogglePin();       continue; }
         if (cmd == IDM_TRAY_AUTO)   { ToggleAutostart(); continue; }
         if (cmd == IDM_TRAY_SILENT) { ToggleSilent();    continue; }
+        if (cmd == IDM_TRAY_HOTKEY) {
+            UINT nm = g_hotMods, nv = g_hotVk;
+            if (RunHotkeyCapture(g_hwnd, &nm, &nv)) {
+                g_hotMods = nm; g_hotVk = nv;
+                if (ApplyHotkey(g_hwnd)) {          // 注册成功=新组合生效（旧注册被原子替换）
+                    SaveConfig();
+                    WCHAR t[40], msg[96];
+                    HotkeyName(t, 40);
+                    swprintf(msg, 96, L"唤醒快捷键已设置为 %s", t);
+                    TrayBalloon(msg);
+                } else {                            // 冲突：RegisterHotKey 失败且旧注册原样
+                    TrayBalloon(L"该组合已被其他程序占用，已保留原快捷键");  // 保留，无需回退赋值
+                }
+            }
+            break;                       // 设置后菜单收场（设置是一次性动作，不是开关）
+        }
         if (cmd == IDM_TRAY_SHOW)   ShowLauncher();
         else if (cmd == IDM_EXIT)   ExitApp();
         break;    // 非开关项（显示面板/退出/Esc/点空白）：菜单收场
@@ -3291,6 +3409,47 @@ static DWORD WINAPI HookThread(LPVOID arg)
 // WndProc 本体只做分发（分发器一屏读完，逻辑都在下面的处理函数里）。
 // 顺序与 switch 分发表一致，便于对照
 
+// ---------------------------------------------------------------- 唤醒快捷键（可配置）
+static void HotkeyName(WCHAR *out, size_t cch)
+{
+    WCHAR t[24] = L"";
+    if (g_hotMods & MOD_CONTROL) wcscat_s(t, 24, L"Ctrl+");
+    if (g_hotMods & MOD_ALT)     wcscat_s(t, 24, L"Alt+");
+    if (g_hotMods & MOD_SHIFT)   wcscat_s(t, 24, L"Shift+");
+    WCHAR key[16];
+    UINT vk = g_hotVk;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        key[0] = (WCHAR)vk; key[1] = 0;
+    } else if (vk >= VK_F1 && vk <= VK_F24) {
+        swprintf(key, 16, L"F%u", vk - VK_F1 + 1);
+    } else {
+        switch (vk) {
+        case VK_SPACE:  wcscpy_s(key, 16, L"空格");   break;
+        case VK_RETURN: wcscpy_s(key, 16, L"回车");   break;
+        case VK_TAB:    wcscpy_s(key, 16, L"Tab");    break;
+        case VK_INSERT: wcscpy_s(key, 16, L"Insert"); break;
+        case VK_DELETE: wcscpy_s(key, 16, L"Delete"); break;
+        case VK_HOME:   wcscpy_s(key, 16, L"Home");   break;
+        case VK_END:    wcscpy_s(key, 16, L"End");    break;
+        case VK_PRIOR:  wcscpy_s(key, 16, L"PageUp"); break;
+        case VK_NEXT:   wcscpy_s(key, 16, L"PageDown"); break;
+        case VK_LEFT:   wcscpy_s(key, 16, L"←"); break;
+        case VK_RIGHT:  wcscpy_s(key, 16, L"→"); break;
+        case VK_UP:     wcscpy_s(key, 16, L"↑"); break;
+        case VK_DOWN:   wcscpy_s(key, 16, L"↓"); break;
+        default:        swprintf(key, 16, L"0x%02X", vk); break;
+        }
+    }
+    swprintf(out, cch, L"%s%s", t, key);
+}
+
+// 注册/更换唤醒快捷键。同一 HOTKEY_ID 重复注册即原子替换——冲突时返回
+// FALSE 且旧注册原样保留（“先撤后注”的写法会在冲突时把旧组合弄丢）
+static BOOL ApplyHotkey(HWND h)
+{
+    return RegisterHotKey(h, HOTKEY_ID, g_hotMods | MOD_NOREPEAT, g_hotVk);
+}
+
 static void OnCreate(HWND h)
 {
     g_hwnd = h;
@@ -3300,14 +3459,22 @@ static void OnCreate(HWND h)
     SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
     DragAcceptFiles(h, TRUE);
     g_hookH = CreateThread(NULL, 0, HookThread, NULL, 0, &g_hookTid);
-    if (!RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K'))
-        TrayBalloon(L"Ctrl+Alt+K 被其他程序占用：唤醒请用托盘图标，或双击桌面空白");
+    if (!ApplyHotkey(h)) {
+        WCHAR t[40], msg[128];
+        HotkeyName(t, 40);
+        swprintf(msg, 128, L"唤醒快捷键 %s 被其他程序占用：请从托盘菜单更换，或改用托盘/桌面双击唤醒", t);
+        TrayBalloon(msg);
+    }
     SetTimer(h, TIMER_HIDE, 120, NULL);
     // 托盘图标
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     TrayAdd();
-    if (g_firstRun)
-        TrayBalloon(L"claunch 已驻留托盘：单击图标显示面板，Ctrl+Alt+K 随时唤醒，双击桌面空白也可以");
+    if (g_firstRun) {
+        WCHAR t[40], msg[160];
+        HotkeyName(t, 40);
+        swprintf(msg, 160, L"claunch 已驻留托盘：单击图标显示面板，%s 随时唤醒，双击桌面空白也可以", t);
+        TrayBalloon(msg);
+    }
 }
 
 // 离屏双缓冲：隐藏即释放（842×631×4B ≈ 2MB commit，挂托盘时纯占窝），
@@ -4452,6 +4619,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
 
     RegClass(APP_CLASS, WndProc);
     RegClass(DLG_CLASS, DlgProc);   // 对话框类只注册一次：原在 RunDialog 里每开一次属性框就注册一遍
+    RegClass(CAP_CLASS, CapProc);   // 热键捕获对话框同理
 
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_LAYERED, APP_CLASS, APPNAME, WS_POPUP,
