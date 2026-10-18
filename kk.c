@@ -1220,7 +1220,10 @@ static BOOL RdRefill(RdCtx *r)
 
 static BOOL RdLine(RdCtx *r, WCHAR *out, int cch)
 {
-    BYTE line[1200];
+    // 行缓冲按"字节"算，而写侧 FmtLine 按 1200 个 WCHAR 封顶——一条含
+    // 中文路径的行（每字 UTF-8 至多 3 字节）可到 3600 字节，缓冲小于它
+    // 就会把超出的字段静默截掉（读回的路径/参数损坏）。给足最坏值
+    BYTE line[4096];
     int n = 0;
     for (;;) {
         if (r->pos >= r->len && !RdRefill(r)) {
