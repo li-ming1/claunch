@@ -2006,6 +2006,7 @@ static void ToggleSilent(void)
     g_silent = !g_silent;
     SaveConfig();
     UpdateTrayTip();      // 托盘提示里的“静默”标记跟着变
+    FlashFmt(L"静默启动已%s：下次启动直接进托盘", g_silent ? L"开启" : L"关闭");
 }
 
 // ---------------------------------------------------------------- 标题栏按钮图形
@@ -2495,6 +2496,7 @@ static void ToggleAutostart(void)
     if (SetAutostart(!g_autostart)) {
         g_autostart = !g_autostart;
         UpdateTrayTip();      // 托盘提示里的“自启”标记跟着变
+        FlashFmt(L"开机自启动已%s", g_autostart ? L"开启" : L"关闭");
     }
 }
 
@@ -2607,14 +2609,22 @@ static void TrayRemove(void)
 
 static void TrayShowMenu(void)
 {
+    // 自启状态以 HKCU Run 键为唯一事实源：弹菜单前重读一次。别处动过
+    // （任务管理器启动页/安装器/别的实例）也当即反映，不留过期打钩——
+    // 仅启动时读一次的话，菜单勾选会停在进程启动时的旧状态
+    WCHAR runPath[MAX_PATH + 8];
+    g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
+
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"显示主面板");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
+    // 两项是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
+    // 效果，文本里注明生效时机，免得看着像打钩没反应
     AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
-                L"开机自启动");
+                L"开机自启动（重启生效）");
     AppendMenuW(m, MF_STRING | (g_silent ? MF_CHECKED : 0), IDM_TRAY_SILENT,
-                L"静默启动（进托盘）");
+                L"静默启动（重启生效）");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
     int cmd = PopupAt(m);
