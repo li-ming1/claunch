@@ -263,6 +263,7 @@ static BOOL  UpdateHoverText(void);
 static void RefreshCard(void);
 static void UpdateTrayTip(void);
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n);
+static void DropTrace(const WCHAR *fmt, ...);
 
 // 条目/分组数据变化后的统一收尾：悬停文字重算、卡片重锚、整窗重绘、落盘。
 // 六处数据变更路径（粘贴×2、槽位操作、分组重排、格子/分组改名）共用同一套收尾
@@ -3479,9 +3480,13 @@ static void DropApply(DropCtx *c, int k, const WCHAR *path, const WCHAR *name)
 static void DropFinish(HWND h, const DropCtx *c)
 {
     ViewDirty();                           // 替换可能改了条目分组
+    // 落点分组必须对用户可见：在“全部”视图落下时条目进了具体组，视图若
+    // 不跟过去，用户看到的就是“拖了没反应”（回收站拖入无感即此）
+    if (g_curGroup == 0 && c->g > 0) SelectGroup(c->g);
     SaveConfig();
     ClampScroll();
     RefreshCard();                         // 视图/名称可能变了，卡片同步
+    DropTrace(L"finish: slot=%d grp=%d lo=%d hi=%d items=%d", c->slot, c->g, c->lo, c->hi, g_nItems);
     if (c->lo < 0) {
         InvalidateRect(h, NULL, FALSE);    // 拖到网格外：追加到末尾，整窗重绘
     } else {
@@ -3546,26 +3551,65 @@ static LPITEMIDLIST PidlJoin(LPCITEMIDLIST a, LPCITEMIDLIST b)
     return p;
 }
 
+// 拖放取证（临时诊断）：每次拖放追加一行到 exe 同目录 kk_droplog.txt，
+// 根因定位后整体移除。拖放是低频操作，每次几百字节，开销可忽略
+static void DropTrace(const WCHAR *fmt, ...)
+{
+    WCHAR path[MAX_PATH];
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    WCHAR *s = wcsrchr(path, L'\\');
+    if (s) s[1] = 0;
+    wcscat_s(path, MAX_PATH, L"kk_droplog.txt");
+    HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    WCHAR line[400];
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf(line, 400, fmt, ap);
+    va_end(ap);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    WCHAR out[460];
+    swprintf(out, 460, L"[%02u:%02u:%02u.%03u] %s\r\n",
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+    char utf8[920];
+    int cb = WideCharToMultiByte(CP_UTF8, 0, out, -1, utf8, sizeof utf8, NULL, NULL);
+    DWORD w = 0;
+    if (cb > 1) WriteFile(f, utf8, (DWORD)(cb - 1), &w, NULL);
+    CloseHandle(f);
+}
+
 // CFSTR_SHELLIDLIST 落放：文件系统项取路径；取不到的是虚拟项（回收站…），
 // 存桌面绝对解析名（"::{CLSID}"，ShellExecuteW 认它可直接启动），显示名
-// 另取（"回收站"）——解析名推不出可读名
-static void HandleShellIdList(HWND h, IDataObject *d, POINT p)
+// 另取（"回收站"）——解析名推不出可读名。返回落位的条目数（取证日志用）
+static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
 {
     FORMATETC ft = { (CLIPFORMAT)g_cfShellIdList, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM med;
-    if (FAILED(IDataObject_GetData(d, &ft, &med))) return;
+    if (FAILED(IDataObject_GetData(d, &ft, &med))) {
+        DropTrace(L"idlist: getdata FAIL");
+        return 0;
+    }
+    int applied = 0;
     CIDA *cid = (CIDA *)GlobalLock(med.hGlobal);
-    if (cid) {
+    SIZE_T gsz = cid ? GlobalSize(med.hGlobal) : 0;
+    // 尺寸防御：cidl 不越上限，每个 PIDL 偏移至少要容得下 2 字节终结符
+    if (cid && gsz >= sizeof(CIDA) && cid->cidl <= MAX_ITEMS &&
+        cid->aoffset[0] + 2 <= gsz) {
         DropCtx c;
         DropBegin(&c, p, (int)cid->cidl);
-        for (UINT k = 1; k <= cid->cidl && k <= (UINT)MAX_ITEMS; k++) {
+        for (UINT k = 1; k <= cid->cidl; k++) {
+            if (cid->aoffset[k] + 2 > gsz) break;                    // 越界防御
             LPITEMIDLIST full = PidlJoin(
                 (LPCITEMIDLIST)((const BYTE *)cid + cid->aoffset[0]),
                 (LPCITEMIDLIST)((const BYTE *)cid + cid->aoffset[k]));
             if (!full) continue;
             WCHAR path[MAX_PATH];
             if (SHGetPathFromIDListW(full, path) && path[0]) {
+                DropTrace(L"idlist item%u: fs='%s'", k, path);
                 DropApply(&c, (int)k - 1, path, NULL);
+                applied++;
             } else {
                 PWSTR parse = NULL, disp = NULL;
                 if (SUCCEEDED(SHGetNameFromIDList(full, SIGDN_DESKTOPABSOLUTEPARSING, &parse))) {
@@ -3574,16 +3618,24 @@ static void HandleShellIdList(HWND h, IDataObject *d, POINT p)
                         wcsncpy_s(name, 48, disp, _TRUNCATE);
                         CoTaskMemFree(disp);
                     }
+                    DropTrace(L"idlist item%u: virtual parse='%s' disp='%s'", k, parse, name);
                     DropApply(&c, (int)k - 1, parse, name);   // 空名回落 NameFromPath
+                    applied++;
                     CoTaskMemFree(parse);
+                } else {
+                    DropTrace(L"idlist item%u: no fs-path, no parse-name", k);
                 }
             }
             CoTaskMemFree(full);
         }
         DropFinish(h, &c);
         GlobalUnlock(med.hGlobal);
+    } else {
+        DropTrace(L"idlist: global %s size=%u cidl=%u",
+                  cid ? L"bounds" : L"lock", (UINT)gsz, cid ? cid->cidl : 0);
     }
     ReleaseStgMedium(&med);
+    return applied;
 }
 
 // 外部拖放悬停：落点格高亮与内部排序拖动同源（g_dropCell/g_dropIn 同款
@@ -3613,14 +3665,34 @@ static void OleClearOver(void)
     InvalidateCell(oc);        // vi<0 内部早退，无需判
 }
 
-// 数据对象里有哪种可收格式：文件（CF_HDROP）或 shell 项（SHELLIDLIST）
+// 数据对象里有哪种可收格式：文件（CF_HDROP）或 shell 项（SHELLIDLIST）。
+// QueryGetData 全落空时再用 GetData 探一次——个别数据对象对查询报不出
+// 实际有的格式（懒渲染）。命中即收，medium 立刻还给系统
 static BOOL OleAccepts(IDataObject *d)
 {
     FORMATETC ft = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
-    if (IDataObject_QueryGetData(d, &ft) == S_OK) return TRUE;
-    if (!g_cfShellIdList) return FALSE;
-    ft.cfFormat = (CLIPFORMAT)g_cfShellIdList;
-    return IDataObject_QueryGetData(d, &ft) == S_OK;
+    HRESULT q1 = IDataObject_QueryGetData(d, &ft);
+    BOOL ok = q1 == S_OK;
+    STGMEDIUM med;
+    BOOL g1 = FALSE, g2 = FALSE;
+    if (!ok && SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
+        g1 = TRUE;                              // 查不到但取得到：懒渲染
+        ReleaseStgMedium(&med);
+    }
+    HRESULT q2 = 0;
+    if (g_cfShellIdList) {
+        ft.cfFormat = (CLIPFORMAT)g_cfShellIdList;
+        q2 = IDataObject_QueryGetData(d, &ft);
+        ok = ok || q2 == S_OK;
+        if (q2 != S_OK && !g1 && SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
+            g2 = TRUE;
+            ReleaseStgMedium(&med);
+        }
+    }
+    DropTrace(L"enter: qd(HDROP)=%s qd(IDLIST)=%s gd(HDROP)=%d gd(IDLIST)=%d",
+              S_OK == q1 ? L"S_OK" : L"no", g_cfShellIdList ? (S_OK == q2 ? L"S_OK" : L"no") : L"-",
+              g1, g2);
+    return ok || g1 || g2;
 }
 
 // IDropTarget：进程级单例（静态对象，引用计数空转，随进程存活）。
@@ -3681,13 +3753,23 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
     FORMATETC ft = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
     STGMEDIUM med;
     if (SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
-        HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
+        UINT nf = DragQueryFileW((HDROP)med.hGlobal, 0xFFFFFFFF, NULL, 0);
+        DropTrace(L"drop: HDROP ok, nf=%u", nf);
+        if (nf > 0) {
+            HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
+            ReleaseStgMedium(&med);
+            *ef = DROPEFFECT_COPY;
+            return S_OK;
+        }
+        // 关键：虚拟项（回收站等）的数据对象可能挂一个"零文件"的合法
+        // HDROP——不能当成功收场，必须落到 SHELLIDLIST 路线拿 PIDL
         ReleaseStgMedium(&med);
-        *ef = DROPEFFECT_COPY;
-        return S_OK;
+    } else {
+        DropTrace(L"drop: HDROP getdata fail");
     }
     if (g_cfShellIdList) {
-        HandleShellIdList(g_hwnd, d, p);
+        int n = HandleShellIdList(g_hwnd, d, p);
+        DropTrace(L"drop: idlist applied=%d", n);
         *ef = DROPEFFECT_COPY;
     }
     return S_OK;
