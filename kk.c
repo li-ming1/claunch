@@ -205,6 +205,7 @@ static BOOL g_dropIn;           // 目标在格子区内（区外释放=取消�
 static BOOL g_extDrag;          // 外部 OLE 拖放悬停中：落点高亮与内部排序同源同款，
                                 // 与内部拖动互斥（OLE 拖动时光标捕获在拖放源）
 static BOOL g_oleOk;            // 当前 OLE 拖放的数据有可收格式（DragEnter 定，整场有效）
+static DWORD g_oleAllow;        // 拖放源允许的效果集合（DragEnter 入参 *ef，整场有效）
 static BOOL g_dropOn;           // IDropTarget 已注册主窗（销毁时 Revoke）
 static BOOL g_oleInit;          // OleInitialize 已成功（销毁时配对 Uninitialize）
 static UINT g_cfShellIdList;    // CFSTR_SHELLIDLIST 格式原子（0=注册失败：虚拟项不可收）
@@ -3685,6 +3686,17 @@ static void OleClearOver(void)
     InvalidateCell(oc);        // vi<0 内部早退，无需判
 }
 
+// 源允许集与目标偏好的交集：回收站这类虚拟项的拖放源可能只允许
+// MOVE|LINK（"复制回收站"无意义，shell 会把 COPY 从允许集剔除）——
+// 返回不在允许集里的效果会被源端掩成 NONE，光标全程禁止
+static DWORD PickEffect(DWORD allowed)
+{
+    if (allowed & DROPEFFECT_COPY) return DROPEFFECT_COPY;
+    if (allowed & DROPEFFECT_MOVE) return DROPEFFECT_MOVE;
+    if (allowed & DROPEFFECT_LINK) return DROPEFFECT_LINK;
+    return DROPEFFECT_NONE;
+}
+
 // 数据对象里有哪种可收格式：文件（CF_HDROP）或 shell 项（SHELLIDLIST）。
 // QueryGetData 全落空时再用 GetData 探一次——个别数据对象对查询报不出
 // 实际有的格式（懒渲染）。命中即收，medium 立刻还给系统
@@ -3758,7 +3770,9 @@ static HRESULT __stdcall DtDragEnter(IDropTarget *self, IDataObject *d, DWORD ke
     g_extDrag = TRUE;                  // 先冻结心跳隐藏，再稳住可见性
     DragSteadyShow();
     g_oleOk = OleAccepts(d);
-    *ef = g_oleOk ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    g_oleAllow = *ef;                  // 源允许集：返回值必须落在它的子集里
+    DropTrace(L"enter: allow=%u (1=COPY 2=MOVE 4=LINK)", g_oleAllow);
+    *ef = g_oleOk ? PickEffect(g_oleAllow) : DROPEFFECT_NONE;
     if (g_oleOk) OleUpdateOver(pt);
     return S_OK;
 }
@@ -3766,7 +3780,7 @@ static HRESULT __stdcall DtDragEnter(IDropTarget *self, IDataObject *d, DWORD ke
 static HRESULT __stdcall DtDragOver(IDropTarget *self, DWORD keys, POINTL pt, DWORD *ef)
 {
     UNREF(self); UNREF(keys);
-    *ef = g_oleOk ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    *ef = g_oleOk ? PickEffect(g_oleAllow) : DROPEFFECT_NONE;
     if (g_oleOk) OleUpdateOver(pt);
     return S_OK;
 }
@@ -3797,7 +3811,7 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
         if (nf > 0) {
             HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
             ReleaseStgMedium(&med);
-            *ef = DROPEFFECT_COPY;
+            *ef = PickEffect(g_oleAllow);
             return S_OK;
         }
         // 关键：虚拟项（回收站等）的数据对象可能挂一个"零文件"的合法
@@ -3809,7 +3823,7 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
     if (g_cfShellIdList) {
         int n = HandleShellIdList(g_hwnd, d, p);
         DropTrace(L"drop: idlist applied=%d", n);
-        *ef = DROPEFFECT_COPY;
+        *ef = PickEffect(g_oleAllow);
     }
     return S_OK;
 }
