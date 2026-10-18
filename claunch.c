@@ -1470,18 +1470,6 @@ static void IniPath(void)
     WCHAR *p = wcsrchr(g_ini, L'\\');
     if (p) p[1] = 0;
     wcscat_s(g_ini, MAX_PATH, ININAME);
-    // 旧名接管：kk.ini → claunch.ini（程序改名时用户数据原地迁移）。
-    // 只在新名不存在时动——避免把新配置又搬回旧名
-    if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) {
-        WCHAR old[MAX_PATH];
-        wcscpy_s(old, MAX_PATH, g_ini);
-        SIZE_T n = wcslen(old);
-        if (n >= 11) {                       // 尾部 "claunch.ini" 共 11 字符
-            wcscpy_s(old + n - 11, 12, L"kk.ini");
-            if (GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES)
-                MoveFileExW(old, g_ini, MOVEFILE_REPLACE_EXISTING);
-        }
-    }
 }
 
 typedef struct { HANDLE f; BYTE buf[4096]; int len, pos; BOOL first; } RdCtx;
@@ -1598,7 +1586,6 @@ static void LoadConfig(void)
 
         if (!wcscmp(section, L"Main")) {
             if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
-            else if (!wcscmp(key, L"Topmost")) { if (_wtoi(val)) g_pinned = TRUE; }   // 旧字段迁移：原置顶偏好并入置顶开关
             else if (!wcscmp(key, L"Silent"))  g_silent = _wtoi(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
             else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
@@ -1622,22 +1609,10 @@ static void LoadConfig(void)
             int grp = (nf >= 3 && f[2][0]) ? _wtoi(f[2]) : 0;
             if (grp < 0 || grp >= g_nGroups) grp = DefaultGroup();
             AddItemRaw(f[0], f[1], grp,
-                       nf >= 4 ? f[3] : NULL, nf >= 6 ? f[5] : NULL);   // f[4] 是旧格式的 work 槽：跳过
+                       nf >= 4 ? f[3] : NULL, nf >= 6 ? f[5] : NULL);   // 第 5 槽为备用位（恒空）
         }
     }
     if (r.f != INVALID_HANDLE_VALUE) CloseHandle(r.f);
-    // 旧格式迁移：老配置的 G0 恒为“全部”伪分组（条目从不在它名下）——
-    // 新模型里它只是个空组，剥掉，后续组前移一位、条目组号与当前组跟着平移
-    if (g_nGroups > 1 && !wcscmp(g_groups[0].name, L"全部")) {
-        BOOL used = FALSE;
-        for (int i = 0; i < g_nItems && !used; i++) used = g_items[i].group == 0;
-        if (!used) {
-            for (int k = 0; k < g_nGroups - 1; k++) g_groups[k] = g_groups[k + 1];
-            g_nGroups--;
-            for (int i = 0; i < g_nItems; i++) if (g_items[i].group > 0) g_items[i].group--;
-            if (g_curGroup > 0) g_curGroup--;
-        }
-    }
     if (g_nGroups < 1) AddGroup(L"常用");   // 空配置/全删光：兜底建首组
     if (g_curGroup < 0 || g_curGroup >= g_nGroups) g_curGroup = 0;
     ViewDirty();
@@ -1871,10 +1846,11 @@ static void StartFadeIn(void)
 }
 
 // 静默启动延后的失效清理：任一唤醒路径（面板/拖放唤醒）首次执行一次。
-// 非静默启动不走这里——启动时就地清完（见 wWinMain）
+// 非静默启动不走这里——启动时就地清完（见 wWinMain）。
+// 外部拖放悬停中跳过：清理会挪动视图序号，光标下的落点会跳
 static void WakePrune(void)
 {
-    if (!g_needPrune) return;
+    if (!g_needPrune || g_extDrag) return;
     g_needPrune = FALSE;
     if (PruneInvalidItems()) SaveConfig();
 }
@@ -2921,6 +2897,20 @@ static HICON MakeTrayIcon(int sz)
     return ico;
 }
 
+// 一次性气球提示（热键被占用等异常）：静默启动是默认，热键是主唤醒
+// 路径之一——注册失败不告知，用户只会觉得"按了没反应"且无从排查。
+// V4 行为下 uTimeout 由系统接管，仍然给值（旧版本行为兜底）
+static void TrayBalloon(const WCHAR *text)
+{
+    if (!g_trayIcon) return;
+    NOTIFYICONDATAW nid = g_nid;               // 结构拷贝：cbSize/hWnd/uID 等照旧
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;               // 信息级：不发声不闪烁
+    wcsncpy_s(nid.szInfo, 256, text, _TRUNCATE);
+    nid.uTimeout = 8000;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 static void TrayAdd(void)
 {
     if (!g_trayIcon) {
@@ -3265,7 +3255,8 @@ static void OnCreate(HWND h)
     SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
     DragAcceptFiles(h, TRUE);
     g_hookH = CreateThread(NULL, 0, HookThread, NULL, 0, &g_hookTid);
-    RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
+    if (!RegisterHotKey(h, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K'))
+        TrayBalloon(L"Ctrl+Alt+K 被其他程序占用：唤醒请用托盘图标，或双击桌面空白");
     SetTimer(h, TIMER_HIDE, 120, NULL);
     // 托盘图标
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
