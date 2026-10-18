@@ -794,6 +794,20 @@ static HICON MakeFolderIcon(int sz)
     return CanvasEnd(&cv, sz, NULL);
 }
 
+// 路径存在性检查的安全边界：断连的映射盘（盘符在、网络不通）会让
+// GetFileAttributesW 阻塞数秒，而启动修剪与图标加载都在 UI 线程上——
+// 只对本地盘做存在性检查；UNC/映射盘/未知类型/URL 一律返回 FALSE
+// （跳过），由调用方决定降级策略（修剪=保留条目、图标=走注册表关联链）
+static BOOL PathCheckable(const WCHAR *path)
+{
+    if (path[0] == L'\\' && path[1] == L'\\') return FALSE;   // UNC
+    if (wcsstr(path, L"://")) return FALSE;                   // URL（http://、steam://…）
+    if (path[1] != L':') return TRUE;                        // 相对路径：无盘符
+    WCHAR root[4] = { path[0], L':', L'\\', 0 };
+    UINT t = GetDriveTypeW(root);             // 查映射表，不产生文件系统 I/O
+    return t == DRIVE_FIXED || t == DRIVE_REMOVABLE || t == DRIVE_CDROM;
+}
+
 // 扩展名判断：.lnk 检测等处共用（大小写不敏感）
 static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
 {
@@ -884,21 +898,38 @@ static HICON ShellIcon(const WCHAR *path)
 static HICON IconFor(const WCHAR *path, int want)
 {
     HICON h = NULL;
-    DWORD a = GetFileAttributesW(path);
-    BOOL isDir = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    // 网络路径/URL 整体早退：不做任何路径 I/O（断连映射盘会阻塞数秒且
+    // 阻塞在 UI 线程），图标只按扩展名走注册表关联链；解析不出时返回
+    // NULL，由 EnsureIcon 落到通用图标
+    if (!PathCheckable(path))
+        return AssocIcon(path, want);
+    BOOL isDir = FALSE;
+    {
+        DWORD a = GetFileAttributesW(path);
+        isDir = a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    }
     if (isDir) {
         h = FolderIcon(path, want);
     } else if (HasExt(path, L".lnk")) {
         LnkInfo lnk;
         if (ParseLnk(path, &lnk)) {
-            if (lnk.iconLoc[0]) h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
+            if (lnk.iconLoc[0]) {
+                if (PathCheckable(lnk.iconLoc))
+                    h = IconFromImage(lnk.iconLoc, want, lnk.iconIdx);
+                else
+                    h = AssocIcon(lnk.iconLoc, want);   // 图标位置在网络盘：注册表兜底
+            }
             if (!h && lnk.target[0]) {
-                DWORD ta = GetFileAttributesW(lnk.target);
-                if (ta != INVALID_FILE_ATTRIBUTES && (ta & FILE_ATTRIBUTE_DIRECTORY))
-                    h = FolderIcon(lnk.target, want);   // 指向文件夹的快捷方式
-                else {
-                    h = IconFromImage(lnk.target, want, 0);
-                    if (!h) h = ShellIcon(lnk.target);  // 目标：资源管理器同款
+                if (!PathCheckable(lnk.target)) {
+                    h = AssocIcon(lnk.target, want);    // 目标在网络盘：注册表兜底
+                } else {
+                    DWORD ta = GetFileAttributesW(lnk.target);
+                    if (ta != INVALID_FILE_ATTRIBUTES && (ta & FILE_ATTRIBUTE_DIRECTORY))
+                        h = FolderIcon(lnk.target, want);   // 指向文件夹的快捷方式
+                    else {
+                        h = IconFromImage(lnk.target, want, 0);
+                        if (!h) h = ShellIcon(lnk.target);  // 目标：资源管理器同款
+                    }
                 }
             }
         }
@@ -1077,16 +1108,16 @@ static void DeleteSlotAt(int vi)
 }
 
 // 启动时清理失效项目：路径已不存在（含 .lnk 被删）直接移除并写回配置。
-// URL（含 ://）不走 GetFileAttributes；UNC 断连会让启动卡到网络超时，也跳过。
-// 空格（空路径）不是失效项：那是用户保留的空位，不能清。
+// URL（含 ://）不走 GetFileAttributes；UNC/映射盘/未知盘的连通性不可信
+// （PathCheckable 统一判定），跳过存在性检查——断连的映射盘宁可留着条目，
+// 也不能让启动修剪卡在网络上。空格（空路径）不是失效项：那是用户保留的空位
 static BOOL PruneInvalidItems(void)
 {
     BOOL removed = FALSE;
     for (int i = 0; i < g_nItems; ) {
         const WCHAR *p = g_items[i].path;
-        if (!p[0]) { i++; continue; }
-        if (!wcsstr(p, L"://") && !(p[0] == L'\\' && p[1] == L'\\') &&
-            GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) {
+        if (!p[0] || !PathCheckable(p)) { i++; continue; }
+        if (GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) {
             RemoveItemAt(i);
             removed = TRUE;
         } else {
