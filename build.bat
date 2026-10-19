@@ -17,15 +17,21 @@ if not exist "%VSD%" (
 )
 call "%VSD%" -arch=x64 -no_logo
 if errorlevel 1 exit /b 1
-rem claunch.asm provides two compiler shims that only ucrt would otherwise offer:
+rem claunch.asm provides what only ucrt/vcruntime would otherwise offer:
 rem   __chkstk        stack probe (size in RAX), makes the guard page grow safely
 rem   __GSHandlerCheck referenced by /GS on the exception path
-ml64 /nologo /c /Fo:claunch_chkstk.obj claunch.asm
+rem   memcpy/memmove/memset/memcmp  the four VCRUNTIME140 imports (dumpbin
+rem       /imports showed those were the only ones)
+rem /Fo takes the object name as a SEPARATE argument: ml64 accepts "/Fo x.obj",
+rem never "/Fo:x.obj" -- the colon form silently assembles nothing and still
+rem returns 0, so the link step used a stale object and the error only surfaced
+rem when vcruntime was dropped and the stale object no longer matched.
+ml64 /nologo /c /Fo claunch_chkstk.obj claunch.asm
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /O1 /GS /GL /Zi /utf-8 /D CLAUNCH_NOCRT claunch.c ^
     /link /NODEFAULTLIB /ENTRY:wWinMainCRTStartup /SUBSYSTEM:WINDOWS ^
     /LTCG /OPT:REF /OPT:ICF /MAP /OUT:claunch.exe /MANIFEST:EMBED /MANIFESTINPUT:claunch.manifest ^
-    claunch_chkstk.obj vcruntime.lib kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib
+    claunch_chkstk.obj kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib
 if errorlevel 1 exit /b 1
 rem Why this is leaner than the classic static-CRT build:
 rem   /NODEFAULTLIB + the explicit import list above   -> libcmt/ucrt gone.
@@ -34,8 +40,10 @@ rem       the above, the whole launcher is 72KB instead of 174KB.
 rem   /D CLAUNCH_NOCRT                            -> homegrown entry point,
 rem       bootstrapped /GS security cookie, and own wide-char primitives
 rem       (they used to drag in the whole locale/nls data chain).
-rem   vcruntime.lib only                        -> compiler support lib
-rem       (memcpy/memmove/memset/memcmp), no CRT startup.
+rem   mem* in claunch.asm                        -> vcruntime.lib gone as well.
+rem       dumpbin /imports showed VCRUNTIME140.dll existed for exactly four
+rem       symbols (memcpy/memmove/memset/memcmp); the asm shim implements
+rem       those, so the import table now lists no CRT dll at all.
 rem   comdlg32 is now lazy-loaded by hand (GetOpenFileNameW), so /DELAYLOAD and
 rem       delayimp are gone and comdlg32 disappears from the import table.
 rem /MAP writes claunch.map (RVA -> symbol): claunch_crash.txt records RVAs, and

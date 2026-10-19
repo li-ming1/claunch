@@ -12,4 +12,4 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /O1 /GS /GL /Zi /utf-8 /D CLAUNCH_NOCRT claunch.c ^
     /link /NODEFAULTLIB /ENTRY:wWinMainCRTStartup /SUBSYSTEM:WINDOWS ^
     /LTCG /OPT:REF /OPT:ICF /MAP /OUT:claunch.exe /MANIFEST:EMBED /MANIFESTINPUT:claunch.manifest ^
-    claunch_chkstk.obj vcruntime.lib kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib
+    claunch_chkstk.obj kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib

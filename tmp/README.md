@@ -102,6 +102,10 @@ kbtest 的像素哈希就全变了（这坑踩过三次，每次都得从快照�
 | `libtest` | `wcpy/wcat` 对 `wcsncpy_s/wcscat_s`；`S_` 对 `MulDiv` | 24012 例 0 差异 |
 | `fmtfmt` | `wfmt/wToI/wScan*` 对 `swprintf/_wtoi/swscanf` | 65602 例 0 差异 |
 | `parsefuzz` | 三个"吃外来数据"入口的对抗性测试（见下） | 容纳不变式 + 存读往返全过 |
+| `memtest` | `..\claunch.asm` 的 mem* 四件套对朴素参考实现（含 memmove 重叠双向、哨兵越界） | 217 例 0 差异 |
+
+> `memtest` 是**唯一不链 CRT 的探针**（链 CRT 就会测到 CRT 的 memcpy，永远假通过）。
+> `buildall.bat` 对它特判走专用链接行，两种入口都支持（全量 / 指名 `memtest`）。
 
 结果写 `tmp\<name>.txt`（避开控制台 orientation 干扰）。这几个是本轮格式化层 /
 字符串层 / DPI 宏的安全网，改动那三处后必须重跑。
