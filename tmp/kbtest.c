@@ -45,6 +45,19 @@ static unsigned long long HashWnd(HWND w)
     return h;
 }
 
+// 连拍取帧：两张相同才算画面静止（图标填充完成）。上限 20 次×100ms
+static unsigned long long Settle(HWND w)
+{
+    unsigned long long a = HashWnd(w);
+    for (int i = 0; i < 20; i++) {
+        Sleep(100);
+        unsigned long long b = HashWnd(w);
+        if (b == a) return b;
+        a = b;
+    }
+    return a;
+}
+
 int wmain(int argc, WCHAR **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -61,19 +74,18 @@ int wmain(int argc, WCHAR **argv)
     PostMessageW(w, WM_APP_DRAGWAKE, 0, 0);
     Sleep(900);                            // 等淡入+图标加载
 
-    unsigned long long h0 = HashWnd(w);
+    // 画面静止再取帧：图标是首绘时同步填充的，滚动还会揭示新格子、触发新
+    // 一批加载，固定 sleep 会撞上填充时序——曾把"PageUp != Home"误判成导航
+    // 回归。做法是连拍两张、相同才算稳，最多等 2s
+    unsigned long long h0 = Settle(w);
     PostMessageW(w, WM_KEYDOWN, VK_END, 0);
-    Sleep(350);
-    unsigned long long hEnd = HashWnd(w);
+    unsigned long long hEnd = Settle(w);
     PostMessageW(w, WM_KEYDOWN, VK_HOME, 0);
-    Sleep(350);
-    unsigned long long hHome = HashWnd(w);
+    unsigned long long hHome = Settle(w);
     PostMessageW(w, WM_KEYDOWN, VK_HOME, 0);      // 再按一次 Home：应幂等无变化
-    Sleep(350);
-    unsigned long long hHome2 = HashWnd(w);
+    unsigned long long hHome2 = Settle(w);
     PostMessageW(w, WM_KEYDOWN, VK_PRIOR, 0);     // 顶部再上翻：应无变化
-    Sleep(350);
-    unsigned long long hPgUp = HashWnd(w);
+    unsigned long long hPgUp = Settle(w);
 
     // 注意：初始态无悬停环，Home 后第一格出现焦点环——画面本就该和初始
     // 不同。断言的是行为语义：End 有位移、Home 离开底部、再 Home 幂等、

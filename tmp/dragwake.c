@@ -71,8 +71,20 @@ int wmain(int argc, WCHAR **argv)
     Mouse(MOUSEEVENTF_LEFTUP, 0, 0);
     Sleep(300);
 
-    // 松开后（不再有按键）把光标移到面板外：不应再有拖放唤醒，且应自动隐藏
-    MoveTo(r.left - 400, r.top - 300);
+    // 松开后（不再有按键）把光标移到面板外：不应再有拖放唤醒，且应自动隐藏。
+    // 落点必须在屏内且在面板外——面板贴左上角时"left-400"会算出负坐标，
+    // SetCursorPos 失败就等于没移，光标还留在面板里（这条断言栽过）
+    int ox = r.left - 400, oy = r.top - 300;
+    if (ox < 20) ox = 20;
+    if (oy < 20) oy = 20;
+    RECT inf;
+    inf.left = r.left - 40; inf.top = r.top - 40;
+    inf.right = r.right + 40; inf.bottom = r.bottom + 40;
+    if (ox >= inf.left && ox <= inf.right && oy >= inf.top && oy <= inf.bottom) {
+        ox = r.left + 60;                 // 挪到面板下面：一定在面板外
+        oy = r.bottom + 160;
+    }
+    MoveTo(ox, oy);
     Sleep(4500);        // 唤醒有 3s 宽限 + 150ms 移出延迟：等够再断言
     Check(!IsWindowVisible(w), "松开按键后移出 → 自动隐藏");
 

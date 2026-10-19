@@ -111,13 +111,13 @@ static void FuzzRdLine(int rounds)
 
         RdCtx r;
         ZeroMemory(&r, sizeof r);
-        r.f = CreateFileW(L"tmp\\parsefuzz.bin", GENERIC_WRITE, 0, NULL,
+        r.f = CreateFileW(L"parsefuzz.bin", GENERIC_WRITE, 0, NULL,
                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (r.f == INVALID_HANDLE_VALUE) { printf("FAIL 临时文件建不了\n"); g_fail++; return; }
         DWORD wrote = 0;
         WriteFile(r.f, raw, n, &wrote, NULL);
         CloseHandle(r.f);
-        r.f = CreateFileW(L"tmp\\parsefuzz.bin", GENERIC_READ, 0, NULL,
+        r.f = CreateFileW(L"parsefuzz.bin", GENERIC_READ, 0, NULL,
                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         r.first = TRUE;
 
@@ -138,7 +138,7 @@ static void FuzzRdLine(int rounds)
         CloseHandle(r.f);
         Chk(!wcscmp(guard, L"GUARD"), "RdLine 踩到缓冲区外");
     }
-    DeleteFileW(L"tmp\\parsefuzz.bin");
+    DeleteFileW(L"parsefuzz.bin");
 }
 
 // ---------------------------------------------------------------- LoadConfig
@@ -148,7 +148,7 @@ static void WriteIniTo(const WCHAR *path, const char *buf, int n);
 
 static void WriteIni2(const char *buf, int n)   // 按长度写：随机字节里可能有 NUL
 {
-    WriteIniTo(L"tmp\\parsefuzz.ini", buf, n);
+    WriteIniTo(L"parsefuzz.ini", buf, n);
 }
 
 static void WriteIniTo(const WCHAR *path, const char *buf, int n)
@@ -159,7 +159,7 @@ static void WriteIniTo(const WCHAR *path, const char *buf, int n)
 
 static void WriteIni(const char *text)
 {
-    FILE *f = fopen("tmp\\parsefuzz.ini", "wb");
+    FILE *f = _wfopen(L"parsefuzz.ini", L"wb");
     if (!f) { printf("FAIL ini 写不出\n"); g_fail++; return; }
     fwrite(text, 1, strlen(text), f);
     fclose(f);
@@ -182,7 +182,7 @@ static void CheckInvariants(const char *what)
         Chk(g_groups[i].name[47] == 0, what);
 }
 
-static const WCHAR *kIni = L"tmp\\parsefuzz.ini";
+static const WCHAR *kIni = L"parsefuzz.ini";
 
 static void LoadOne(const char *text)
 {
@@ -225,7 +225,7 @@ static void FuzzConfig(void)
         LoadConfig();
         CheckInvariants("LoadConfig 随机字节不变式");
     }
-    DeleteFileW(L"tmp\\parsefuzz.ini");
+    DeleteFileW(L"parsefuzz.ini");
 }
 
 // 结构化配置生成：按图索骥地打每个不变式对应的代码点。
@@ -293,7 +293,7 @@ static void FuzzConfigStructured(int rounds)
 // SaveConfig 的防呆要求 ini 名以 claunch.ini 结尾，且它只画不建目录：先自建。
 // g_hwnd 用假句柄（只为骗过 !g_hwnd 的早退），GetWindowRect 失败也没关系——
 // Rect 由 g_savedX/Y/W/H 决定，读取端同样走这几个字段
-#define RT_DIR L"tmp\\pf"
+#define RT_DIR L"pf"
 #define RT_INI RT_DIR L"\\claunch.ini"
 
 static LRESULT CALLBACK RtWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
