@@ -2485,25 +2485,21 @@ static void TogglePin(void)
 // 胶囊形（关闭键悬停转标题栏惯例暗红）；× 用两段 45° 旋转矩形——GDI 线帽
 // 是方的，斜线不用多边形会阶梯；钉住是地图钉剪影，色即状态（暗=未置顶）
 
-// 四舍五入入整数：字形坐标走浮点中间量（45° 向量），别用截断
-static LONG Rnd(double v)
-{
-    return (LONG)(v < 0 ? v - 0.5 : v + 0.5);
-}
-
-// 45° 粗描边：以 (cx,cy) 为中心、方向 (sx,sy)（各 ∈ {-1,1}）、
-// 长 len 粗 th 的一根斜“胶囊”。th 与 len 都是 DPI 缩放后传入的
+// 45° 粗描边：以 (cx,cy) 为中心、方向 (sx,sy)（各 ∈ {-1,1}）、长 len 粗 th 的
+// 一根斜“胶囊”。th 与 len 都是 DPI 缩放后传入的。
+// 1/√2 用 Q8 定点（181/256 = 0.70703，误差 1e-4，最长 40px 的线也只差 0.004px）：
+// 整条绘制路径不碰浮点——窗口过程里的 double 会把浮点支持和整套数学表拖进镜像
 static void Stroke45(HDC dc, int cx, int cy, int sx, int sy, int len, int th)
 {
-    const double k = 0.7071067811865476;      // 1/√2
-    double hx = sx * k, hy = sy * k;          // 沿线单位向量
-    double px = -hy, py = hx;                 // 垂线单位向量
-    double hl = len / 2.0, ht = th / 2.0;
+    const int dl = (181 * len + 256) >> 9;   // 沿线半长分量（四舍五入，同 Rnd）
+    const int dt = (181 * th + 256) >> 9;    // 垂线半粗分量（th ≥ 2，不会退化成 0）
+    const int ax = sx * dl, ay = sy * dl;    // 沿线向量
+    const int bx = -sy * dt, by = sx * dt;   // 垂线向量
     POINT q[4] = {
-        { Rnd(cx + hx * hl + px * ht), Rnd(cy + hy * hl + py * ht) },
-        { Rnd(cx + hx * hl - px * ht), Rnd(cy + hy * hl - py * ht) },
-        { Rnd(cx - hx * hl - px * ht), Rnd(cy - hy * hl - py * ht) },
-        { Rnd(cx - hx * hl + px * ht), Rnd(cy - hy * hl + py * ht) },
+        { cx + ax + bx, cy + ay + by },
+        { cx + ax - bx, cy + ay - by },
+        { cx - ax - bx, cy - ay - by },
+        { cx - ax + bx, cy - ay + by },
     };
     Polygon(dc, q, 4);
 }
@@ -3347,6 +3343,8 @@ static void ShowTitleMenu(void)
 static ULONGLONG s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
 static BOOL   s_dragInRect;     // 拖动光标是否在面板静置区内（只报“从区外进入”的沿口）
+static BOOL   s_lbtnDown;       // 左键按住的本地镜像：钩子自己看得到按下/抬起，
+                                // 移动事件里就不必再问 GetAsyncKeyState
 static DWORD s_dblClick;      // 双击间隔/双击容差：钩子线程启动时读一次——
 static int    s_dblX, s_dblY; // 全局输入路径上每次点击都问，不值当
 
@@ -3426,10 +3424,11 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     // g_hwnd 在本线程创建前就已赋值（WM_CREATE 先于 CreateThread），
     // g_dlgOpen 是单字节标志（x86 对齐读写不可撕裂），IsWindowVisible 是
     // 窗口管理器的内核态读取。最坏情况是慢一拍（晚一个事件才看到状态
-    // 变化），不产生错误动作
+    // 变化），不产生错误动作。s_* 全是本线程私有，不共享
     if (nCode == HC_ACTION) {
         if (wParam == WM_LBUTTONDOWN) {
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+            s_lbtnDown = TRUE;
             ULONGLONG now = GetTickCount64();
             int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
             if (dx < 0) dx = -dx;
@@ -3444,15 +3443,19 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                              MAKELPARAM((WORD)p->pt.x, (WORD)p->pt.y));
             s_lastClick = now;
             s_lastPt = p->pt;
+        } else if (wParam == WM_LBUTTONUP) {
+            s_lbtnDown = FALSE;
         } else if (wParam == WM_MOUSEMOVE) {
             // 拖放唤醒：按住左键拖动、光标从区外进入面板静置区（面板隐藏时）——
             // 就地弹回面板（WM_APP_DRAGWAKE → SW_SHOWNA 不抢拖放源的前台），
             // 让落点重新可投递。只在进入沿口发一次；普通移动/悬停零打扰。
-            // GetWindowRect 是窗口管理器查询不发消息，UI 线程卡死也不拖累钩子
-            MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
-            BOOL armed = !g_dlgOpen && !IsWindowVisible(g_hwnd) &&
-                         (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
-            if (armed) {
+            // 没按左键的移动是系统里最频繁的事件：先看本地镜像直接走掉，
+            // 原来的 IsWindowVisible + GetAsyncKeyState 两次内核查询全省了
+            if (!s_lbtnDown) {
+                s_dragInRect = FALSE;
+            } else if (!g_dlgOpen && !IsWindowVisible(g_hwnd)) {
+                // GetWindowRect 是窗口管理器查询不发消息，UI 线程卡死也不拖累钩子
+                MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
                 RECT r;
                 GetWindowRect(g_hwnd, &r);
                 BOOL inside = PtInRect(&r, p->pt) != 0;
@@ -3492,6 +3495,9 @@ static DWORD WINAPI HookThread(LPVOID arg)
     s_dblClick = GetDoubleClickTime();
     s_dblX = GetSystemMetrics(SM_CXDOUBLECLK);   // 双击容差就是这两个指标；
     s_dblY = GetSystemMetrics(SM_CYDOUBLECLK);   // 原用 SM_C*DLGFRAME（边框宽）是张冠李戴
+    // 左键状态的初值：程序可能在用户已经按住左键时启动，此后钩子只看得见
+    // 后续的按下/抬起，这里补一次真实状态，拖放唤醒才不会漏掉这一场拖动
+    s_lbtnDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -4437,8 +4443,10 @@ static void OnTimer(HWND h, WPARAM w)
     if (w == TIMER_HIDE) {
         if (g_flashAt && !FlashActive()) { g_flashAt = 0; InvalidateTitle(); }   // 反馈过期：收起
         if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 待落盘的配置（缩放防抖）
-        if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集
-            TrimWS();
+        if (g_dlgOpen) {          // 对话框开着：定期裁剪，输入法/WinRT 的堆不驻留工作集。
+                                  // 120ms 一次是空转——裁完立刻又被触碰，一秒一次足够
+            static int tick;
+            if (++tick >= 8) { tick = 0; TrimWS(); }
             g_outSince = 0;
             return;
         }
