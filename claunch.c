@@ -20,9 +20,10 @@
 // ole32/combase 被 shell32 静态拖着，托盘态 32 个模块里那 9 个去不掉
 // （tmp\mods.c 实测，两次试图摘掉都被证伪）。
 // 绘制走整窗离屏缓冲：直接绘制在快速滚动时露"画一半"中间帧，频闪。
-// 运行时零依赖：不链 libcmt/ucrt（build.bat 里 /NODEFAULTLIB + /D CLAUNCH_NOCRT）。
-// 宽字符原语、格式化核、配置读写全是自实现；入口、/GS cookie 与两个编译器桩
-// （chkstk.asm）也自己来。量化收益见 build.bat 注释
+// 运行时零依赖：不链 libcmt/ucrt 也不链 vcruntime（构建命令行里 /NODEFAULTLIB
+// + /D CLAUNCH_NOCRT，见 README）。
+// 宽字符原语、格式化核、配置读写全是自实现；入口、/GS cookie 与 claunch.asm
+// 里的编译器桩（__chkstk/__GSHandlerCheck）、mem* 四件套也自己来。量化收益见 README
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -4838,8 +4839,8 @@ static int AppMain(HINSTANCE inst)
 
 
 // ---------------------------------------------------------------- 入口
-// CLAUNCH_NOCRT：不链 CRT（libcmt/ucrt）的入口自举。同样内容的开关在 build.bat
-// 里由 /D CLAUNCH_NOCRT + /NODEFAULTLIB + /ENTRY:wWinMainCRTStartup 打开。
+// CLAUNCH_NOCRT：不链 CRT（libcmt/ucrt）的入口自举。开关在构建命令行里
+// 由 /D CLAUNCH_NOCRT + /NODEFAULTLIB + /ENTRY:wWinMainCRTStartup 打开（见 README）。
 // 少掉的正是 CRT 的启动开销（空 GUI 程序的地板就有 102KB）
 #ifndef CLAUNCH_NOCRT
 // 链回 CRT 时的入口壳子：CRT 启动后调 wWinMain，我们只做 AppMain 的转发

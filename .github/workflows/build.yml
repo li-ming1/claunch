@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repository ships no build script on purpose (local scripts hardcode
+      # VS install paths), so the two compile commands live here and in README.
+      # claunch.asm supplies __chkstk / __GSHandlerCheck and the four mem*
+      # routines, which is why vcruntime.lib is not linked at all.
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Assemble asm shim
+        run: ml64 /nologo /c /Fo claunch_chkstk.obj claunch.asm
+
+      - name: Compile (no CRT)
+        run: >
+          cl /nologo /std:c11 /W4 /O1 /GS /GL /utf-8 /D CLAUNCH_NOCRT claunch.c
+          /link /NODEFAULTLIB /ENTRY:wWinMainCRTStartup /SUBSYSTEM:WINDOWS
+          /LTCG /OPT:REF /OPT:ICF /MANIFEST:EMBED /MANIFESTINPUT:claunch.manifest
+          /OUT:claunch.exe claunch_chkstk.obj
+          kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib
+
+      - name: Assert no CRT dll in the import table
+        shell: pwsh
+        run: |
+          $deps = (dumpbin /dependents claunch.exe | Out-String)
+          Write-Host $deps
+          if ($deps -match 'VCRUNTIME|ucrtbase|msvcp') { throw 'CRT dll is still imported' }
+
+      - name: Build mem* self-check
+        run: >
+          cl /nologo /std:c11 /O1 /GS- /utf-8 tmp\memtest.c claunch_chkstk.obj
+          /link /NODEFAULTLIB /ENTRY:mem_main /SUBSYSTEM:CONSOLE
+          /OUT:tmp\memtest.exe kernel32.lib
+
+      - name: Run mem* self-check
+        run: |
+          tmp\memtest.exe
+          Get-Content tmp\memtest.txt
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claunch-x64
+          path: claunch.exe

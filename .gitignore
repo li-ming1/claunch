@@ -7,6 +7,10 @@
 *.exp
 *.lib
 
+# 本地构建脚本：写死了本机 VS 安装路径，不入库
+# （构建命令见 README「构建」一节；CI 用同一组命令行）
+build.bat
+
 # 运行时生成的配置（程序自己写入，第四十轮由 kk 改名 claunch 后一直是新名）
 claunch.ini
 
@@ -19,9 +23,4 @@ desktop.ini
 .workbuddy/
 
 # 探针套件里探针自建的种子配置/输出，源码与 README 入库、产物不入
-tmp/*.txt
-tmp/parsefuzz.*
-parsefuzz.*
-tmp/pf/
-tmp/claunch.ini
-tmp/*.obj
+tmp/
