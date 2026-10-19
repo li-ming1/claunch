@@ -78,6 +78,20 @@ additionally asserts the import table contains no CRT dependency and runs the `m
 > The `ml64` object name must be `/Fo claunch_chkstk.obj` — with a **space**, not `/Fo:…`.
 > The colon form silently produces no file yet returns 0.
 
+## Releases
+
+Official releases live on the [Releases](../../releases) page. Pushing a `vX.Y.Z` tag makes CI
+build from the clean source and attach `claunch.exe` to the matching release. Assets:
+
+| Asset | Contents |
+|---|---|
+| `claunch.exe` | x64 executable (~70 KB, no CRT dependency), built by tag-triggered CI from clean sources |
+| Source code (zip / tar.gz) | Source archives attached automatically by GitHub |
+
+Everyday builds (pushes / PRs without a tag) are available as the `claunch-x64` artifact of the
+matching run on [Actions](../../actions). To verify the binary: `dumpbin /dependents claunch.exe`
+should list only the 7 system DLLs.
+
 ## Usage
 
 1. Double-click `claunch.exe`; it goes silently to the tray.

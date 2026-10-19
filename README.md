@@ -64,6 +64,20 @@ CI（[.github/workflows/build.yml](.github/workflows/build.yml)）执行相同�
 > `ml64` 的对象名要写成 `/Fo claunch_chkstk.obj`（**空格**，不是 `/Fo:…`）。
 > 冒号形式在这里会静默不产出文件且返回 0。
 
+## 发布
+
+正式版本见 [Releases](../../releases)。打 `vX.Y.Z` 形式的 tag 推送后，CI 自动构建并
+把 `claunch.exe` 挂到对应 Release。资产说明：
+
+| 资产 | 内容 |
+|---|---|
+| `claunch.exe` | x64 可执行文件（约 70 KB，零 CRT 依赖），由 tag 触发的 CI 从干净源码构建 |
+| Source code (zip / tar.gz) | GitHub 自动附带的源码包 |
+
+日常构建（非 tag 的 push / PR）产物可在 [Actions](../../actions) 对应运行的
+`claunch-x64` artifact 里下载。验证可执行文件：`dumpbin /dependents claunch.exe`
+应只列出 7 个系统 DLL。
+
 ## 使用
 
 1. 双击 `claunch.exe`，静默进托盘。

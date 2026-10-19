@@ -40,17 +40,40 @@ jobs:
 
       - name: Build mem* self-check
         run: >
-          cl /nologo /std:c11 /O1 /GS- /utf-8 tmp\memtest.c claunch_chkstk.obj
+          ml64 /nologo /c /Fo tests\memtest_asm.obj claunch.asm &&
+          cl /nologo /std:c11 /O1 /GS- /utf-8 tests\memtest.c tests\memtest_asm.obj
           /link /NODEFAULTLIB /ENTRY:mem_main /SUBSYSTEM:CONSOLE
-          /OUT:tmp\memtest.exe kernel32.lib
+          /OUT:tests\memtest.exe kernel32.lib
 
       - name: Run mem* self-check
         run: |
-          tmp\memtest.exe
-          Get-Content tmp\memtest.txt
+          tests\memtest.exe
+          Get-Content tests\memtest.txt
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - uses: actions/upload-artifact@v4
         with:
           name: claunch-x64
           path: claunch.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: claunch-x64
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: claunch.exe
+          body: |
+            Windows x64 build. See the README for build flags and usage.
+
+            - `claunch.exe` — the launcher binary (~70 KB, no CRT dependency)
+
+            Verify: `dumpbin /dependents claunch.exe` must list only system DLLs
+            (kernel32, user32, shell32, gdi32, imm32, advapi32, ole32).
