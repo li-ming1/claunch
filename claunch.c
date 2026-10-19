@@ -265,8 +265,8 @@ static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
 static void ReleaseMemBuffer(void);   // 双缓冲释放：隐藏即放，唤醒首绘重建
 static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
-static void HotkeyName(WCHAR *out, size_t cch);   // 唤醒快捷键的可读名（定义在 OnCreate 区）
-static void ModsName(WCHAR *out, size_t cch, UINT mods);   // 仅修饰键部分（捕获框预览用）
+static void HotkeyName(WCHAR *out, int cch);   // 唤醒快捷键的可读名（定义在 OnCreate 区）
+static void ModsName(WCHAR *out, int cch, UINT mods);   // 仅修饰键部分（捕获框预览用）
 static BOOL ApplyHotkey(HWND h);                  // 注册/更换唤醒快捷键（原子替换语义）
 static void SaveConfig(void);
 static void InvalidateTitle(void);
@@ -311,7 +311,28 @@ static HANDLE g_once;              // 单实例互斥体：进程生命周期持
 
 
 // ---------------------------------------------------------------- 工具
-static int S_(int v) { return MulDiv(v, g_dpi, 96); }
+// DPI 缩放：96 为基准、四舍五入（与 MulDiv 同语义，正数域逐值等价）。
+// 原实现走 MulDiv——一次 kernel32 调用约 30 周期，而 PaintGrid 每格要问 5 次；
+// 换成整数算式后 /96 被编译器折成乘移，调用点直接进寄存器
+#define S_(v) (((v) * g_dpi + 48) / 96)
+
+// 定长宽字符拷贝：截断且必带 NUL。替代 wcsncpy_s——后者每次调用都走 CRT 的
+// 参数校验分支，热路径（悬停文字、每格字段）上纯属白付
+static void wcpy(WCHAR *d, int cch, const WCHAR *s)
+{
+    int n = cch - 1;
+    while (n > 0 && *s) { *d++ = *s++; n--; }
+    *d = 0;
+}
+
+// 定长拼接：剩余空间内追加，永不越界
+static void wcat(WCHAR *d, int cch, const WCHAR *s)
+{
+    int n = 0;
+    while (n < cch - 1 && d[n]) n++;
+    while (n < cch - 1 && *s) d[n++] = *s++;
+    d[n] = 0;
+}
 
 // 格子缩放基准的合法区间（配置与 Ctrl+滚轮共用同一处钳制）
 static int ClampCellBase(int v)
@@ -331,7 +352,7 @@ static int IconSize(void)
 // 把 '|' 换成 '_'，避免破坏配置格式
 static const WCHAR *SafeField(WCHAR *dst, int cch, const WCHAR *src)
 {
-    wcsncpy_s(dst, (size_t)cch, src, _TRUNCATE);
+    wcpy(dst, cch, src);
     for (WCHAR *p = dst; *p; p++) if (*p == L'|') *p = L'_';
     return dst;
 }
@@ -554,20 +575,30 @@ static int RealCount(void)
 static int SlotAt(POINT p)
 {
     if (p.x < g_sideW || p.y < g_titleH) return -1;
-    int c = g_cols;
-    int col = (p.x - g_sideW) / (g_cell + g_gap);
-    int row = (p.y - g_titleH + g_scroll) / (g_cell + g_gap);
-    int vi = row * c + col;
+    int step = g_cell + g_gap;
+    int col = (p.x - g_sideW) / step;
+    // 列数取整后右边缘可能剩一条窄带：落进去的 col 会等于 g_cols，算出的
+    // vi 就窜到下一行行首——拖放落点会指错格。拦在这里
+    if (col >= g_cols) return -1;
+    int vi = ((p.y - g_titleH + g_scroll) / step) * g_cols + col;
     return vi < g_slots ? vi : -1;
 }
 
-// 格子命中：槽位序号再查视图范围 + 整格矩形。格子间隙里的点击不算命中（保持原语义）
+// 格子命中：列/行一次除到位，槽位与整格上界同源算清——原来经
+// SlotAt + CellRect 要四次除法，而这是鼠标移动的最高频路径。
+// 格子间隙里的点击不算命中（保持原语义）
 static int CellAt(POINT p)
 {
-    int vi = SlotAt(p);
-    if (vi < 0 || vi >= ViewCount()) return -1;
-    RECT r = CellRect(vi);
-    return PtInRect(&r, p) ? vi : -1;
+    if (p.x < g_sideW || p.y < g_titleH) return -1;
+    int step = g_cell + g_gap;
+    int col = (p.x - g_sideW) / step;
+    if (col >= g_cols) return -1;
+    int row = (p.y - g_titleH + g_scroll) / step;
+    int x = g_sideW + col * step, y = g_titleH + row * step - g_scroll;
+    // 已保证 p.x >= x、p.y >= y（除法取整的构造），只需查右/下边界
+    if (p.x >= x + g_cell || p.y >= y + g_cell) return -1;
+    int vi = row * g_cols + col;
+    return vi < g_slots && vi < ViewCount() ? vi : -1;
 }
 
 static void ClampScroll(void)
@@ -662,12 +693,7 @@ static int GroupAt(POINT p)
 // 几何缓存成矩形表，命中/绘制只读——热路径上不做乘除
 static RECT g_btnRect[3];     // 下标即按钮编码（0 号位不用）
 static int  g_pressBtn = 0;   // 正按下的按钮：纯视觉反馈，动作仍即时生效
-
-// 按钮集群总宽（两钮 + 间距 + 右边距）：标题文字右边界据此避让
-static int BtnZoneW(void)
-{
-    return S_(28) * 2 + S_(4) + S_(6);
-}
+static int  g_btnZoneW;       // 按钮集群总宽（两钮+间距+右边距）：标题文字右边界据此避让
 
 static void UpdateBtnRects(void)
 {
@@ -677,11 +703,7 @@ static void UpdateBtnRects(void)
     SetRect(&g_btnRect[BTN_CLOSE], x, y, x + w, y + h);
     x -= w + S_(4);                           // 钉住：左边一位
     SetRect(&g_btnRect[BTN_PIN], x, y, x + w, y + h);
-}
-
-static RECT BtnRect(int b)
-{
-    return g_btnRect[b];
+    g_btnZoneW = g_cw - x;                    // 即 2w + 间距 + 右边距，少两处 S_
 }
 
 static int BtnAt(POINT p)
@@ -728,12 +750,9 @@ static HICON IconFromImage(const WCHAR *path, int want, int idx)
             if (!dir) continue;
             WORD pic = (WORD)LookupIconIdFromDirectoryEx(dir, TRUE, want, want, 0);
             if (!pic) continue;
-            HRSRC hi = FindResourceW(hm, MAKEINTRESOURCEW(pic), RT_ICON);
-            HGLOBAL gi = hi ? LoadResource(hm, hi) : NULL;
-            HICON *p = gi ? (HICON *)LockResource(gi) : NULL;
-            if (p && *p)
-                out = (HICON)LoadImageW(hm, MAKEINTRESOURCEW(pic), IMAGE_ICON,
-                                        want, want, LR_DEFAULTCOLOR);
+            if (!FindResourceW(hm, MAKEINTRESOURCEW(pic), RT_ICON)) continue;
+            out = (HICON)LoadImageW(hm, MAKEINTRESOURCEW(pic), IMAGE_ICON,
+                                    want, want, LR_DEFAULTCOLOR);
         }
         FreeLibrary(hm);
         if (out) return out;
@@ -1178,16 +1197,23 @@ static void EnsureIcon(int i)
 }
 
 // ---------------------------------------------------------------- 条目与分组
+// 条目文本字段的唯一写入口：新建/换目标/粘贴三条路径共用，截断规则只此一处
+static void ItemSetText(Item *it, const WCHAR *name, const WCHAR *path,
+                        const WCHAR *args, const WCHAR *tip)
+{
+    wcpy(it->name, 48, name);
+    wcpy(it->path, MAX_PATH, path);
+    wcpy(it->args, 192, args ? args : L"");
+    wcpy(it->tip, 96, tip ? tip : L"");
+}
+
 static int AddItemRaw(const WCHAR *name, const WCHAR *path, int group,
                       const WCHAR *args, const WCHAR *tip)
 {
     if (g_nItems >= MAX_ITEMS) return -1;
     Item *it = &g_items[g_nItems];
     ZeroMemory(it, sizeof *it);
-    wcsncpy_s(it->name, 48, name, _TRUNCATE);
-    wcsncpy_s(it->path, MAX_PATH, path, _TRUNCATE);
-    if (args) wcsncpy_s(it->args, 192, args, _TRUNCATE);
-    if (tip)  wcsncpy_s(it->tip, 96, tip, _TRUNCATE);
+    ItemSetText(it, name, path, args, tip);
     it->group = group;
     g_nItems++;
     ViewDirty();
@@ -1201,11 +1227,13 @@ static void NameFromPath(const WCHAR *path, WCHAR *out, int cch)
     const WCHAR *dot = wcsrchr(p, L'.');
     // 只剥"真扩展名"：点必须落在首字符之后。".workbuddy"/".gitignore" 这类
     // 点开头的名字（隐藏目录/文件的命名习惯）从首字符剥会剩一个 "."，
-    // 连同 "archive.tar.gz" 只剥最后一截的规则一样，都是取"最后一个真扩展名"
-    int n = (dot && dot > p) ? (int)(dot - p) : (int)wcslen(p);
-    if (n >= cch) n = cch - 1;
-    if (n < 1) n = 1;
-    wcsncpy_s(out, (size_t)cch, p, (size_t)n);
+    // 连同 "archive.tar.gz" 只剥最后一截的规则一样，都是取"最后一个真扩展名"。
+    // 一遍扫到"结尾或扩展名点"即停，不再 wcslen + 再拷一遍
+    int cut = (dot && dot > p) ? (int)(dot - p) : 0x7FFFFFFF;
+    int n = 0;
+    while (n < cch - 1 && n < cut && p[n]) n++;
+    memcpy(out, p, (size_t)n * sizeof(WCHAR));
+    out[n] = 0;
 }
 
 static int AddItemByPath(const WCHAR *path, int group)
@@ -1228,21 +1256,19 @@ static int AddNamedItem(const WCHAR *path, const WCHAR *name, int group)
 // 文档到屏幕外时，就地加载要同步付 50 次图标链解析（每次 ~0.4-1ms）
 static void SetItemTarget(int ii, const WCHAR *path, int group)
 {
-    DropIcon(ii);
     WCHAR name[48];
     NameFromPath(path, name, 48);
-    wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
-    wcsncpy_s(g_items[ii].path, MAX_PATH, path, _TRUNCATE);
+    DropIcon(ii);
+    ItemSetText(&g_items[ii], name, path, L"", L"");   // 旧参数/提示描述的是旧目标
     g_items[ii].group = group;
-    g_items[ii].args[0] = 0;
-    g_items[ii].tip[0] = 0;   // 旧程序的提示描述的是旧目标：不清会顶掉新名字
 }
 
 static void RemoveItemAt(int k)
 {
     if (k < 0 || k >= g_nItems) return;
     DropIcon(k);
-    for (int i = k; i < g_nItems - 1; i++) g_items[i] = g_items[i + 1];
+    if (k + 1 < g_nItems)
+        memmove(&g_items[k], &g_items[k + 1], (size_t)(g_nItems - k - 1) * sizeof(Item));
     g_nItems--;
     ViewDirty();
 }
@@ -1255,9 +1281,9 @@ static void MoveGroup(int from, int to)
     if (from < 0 || to < 0 || from >= g_nGroups || to >= g_nGroups || from == to) return;
     Group tmp = g_groups[from];
     if (from < to)
-        for (int k = from; k < to; k++) g_groups[k] = g_groups[k + 1];
+        memmove(&g_groups[from], &g_groups[from + 1], (size_t)(to - from) * sizeof(Group));
     else
-        for (int k = from; k > to; k--) g_groups[k] = g_groups[k - 1];
+        memmove(&g_groups[to + 1], &g_groups[to], (size_t)(from - to) * sizeof(Group));
     g_groups[to] = tmp;
     for (int i = 0; i < g_nItems; i++) {
         int g = g_items[i].group;
@@ -1306,7 +1332,7 @@ static void InsertSlotAt(int vi)
     int at = ItemAtView(vi);
     int pos = (at >= 0) ? at : g_nItems;
     int g = TargetGroup();
-    for (int i = g_nItems; i > pos; i--) g_items[i] = g_items[i - 1];
+    memmove(&g_items[pos + 1], &g_items[pos], (size_t)(g_nItems - pos) * sizeof(Item));
     ZeroMemory(&g_items[pos], sizeof g_items[pos]);
     g_items[pos].group = g;
     g_nItems++;
@@ -1358,7 +1384,7 @@ static BOOL PruneInvalidItems(void)
 static int AddGroup(const WCHAR *name)
 {
     if (g_nGroups >= MAX_GROUPS) return -1;
-    wcsncpy_s(g_groups[g_nGroups].name, 48, name, _TRUNCATE);
+    wcpy(g_groups[g_nGroups].name, 48, name);
     return g_nGroups++;
 }
 
@@ -1369,11 +1395,15 @@ static void DeleteGroup(int i)
         if (g_items[k].group == i) RemoveItemAt(k);
         else k++;
     }
-    for (int k = i; k < g_nGroups - 1; k++) g_groups[k] = g_groups[k + 1];
+    if (i + 1 < g_nGroups)
+        memmove(&g_groups[i], &g_groups[i + 1], (size_t)(g_nGroups - i - 1) * sizeof(Group));
     g_nGroups--;
     for (int k = 0; k < g_nItems; k++)
         if (g_items[k].group > i) g_items[k].group--;
-    if (g_curGroup >= g_nGroups) g_curGroup = 0;
+    // 当前组跟着编号平移走：否则删掉前面的组后，视图会莫名跳到别的组
+    if (g_curGroup > i) g_curGroup--;
+    if (g_curGroup >= g_nGroups) g_curGroup = g_nGroups - 1;
+    if (g_curGroup < 0) g_curGroup = 0;
     ViewDirty();
     ClampScroll();
     RefreshCard();       // 视图/分组列表变了：悬停目标可能已失效，卡片重算
@@ -1475,7 +1505,7 @@ static void IniPath(void)
     GetModuleFileNameW(NULL, g_ini, MAX_PATH);
     WCHAR *p = wcsrchr(g_ini, L'\\');
     if (p) p[1] = 0;
-    wcscat_s(g_ini, MAX_PATH, ININAME);
+    wcat(g_ini, MAX_PATH, ININAME);
 }
 
 typedef struct { HANDLE f; BYTE buf[4096]; int len, pos; BOOL first; } RdCtx;
@@ -1508,14 +1538,11 @@ static BOOL RdLine(RdCtx *r, WCHAR *out, int cch)
     }
     if (n > 0 && line[n - 1] == '\r') n--;
     int w = MultiByteToWideChar(CP_UTF8, 0, (char *)line, n, out, cch - 1);
-    if (w < 0) w = 0;
     out[w] = 0;
     if (r->first) {
         r->first = FALSE;
-        if (out[0] == 0xFEFF) {                      // 去掉 UTF-8 BOM
-            int i = 0;
-            while (out[i]) { out[i] = out[i + 1]; i++; }
-        }
+        if (out[0] == 0xFEFF)                        // 去掉 UTF-8 BOM
+            memmove(out, out + 1, (size_t)w * sizeof(WCHAR));
     }
     return TRUE;
 }
@@ -1549,6 +1576,7 @@ static void FmtLine(const WCHAR *fmt, ...)
     va_start(ap, fmt);
     vswprintf(line, 1200, fmt, ap);
     va_end(ap);
+    line[1199] = 0;      // 溢出时 vswprintf 返回 -1 且不保证收尾：兜一手
     OutLine(line);
 }
 
@@ -1605,7 +1633,7 @@ static void LoadConfig(void)
             }
             else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
             else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
-            else if (!wcscmp(key, L"Rect"))    wcsncpy_s(rect, 64, val, _TRUNCATE);
+            else if (!wcscmp(key, L"Rect"))    wcpy(rect, 64, val);
         } else if (!wcscmp(section, L"Groups")) {
             if (key[0] == L'G' && _wtoi(key + 1) == g_nGroups) AddGroup(val);
         } else if (!wcscmp(section, L"Items")) {
@@ -1651,10 +1679,10 @@ static void SaveConfig(void)
     // 写入中途崩溃/断电不会把配置撕成半截（直接覆盖写会）。
     // 换名取等长替换（claunch.ini→claunch.tmp 同 11 字符），无路径拼接溢出风险
     WCHAR tmp[MAX_PATH];
-    wcscpy_s(tmp, MAX_PATH, g_ini);
+    wcpy(tmp, MAX_PATH, g_ini);
     SIZE_T len = wcslen(tmp);
     if (len < 11 || wcscmp(tmp + len - 11, L"claunch.ini")) return;   // ini 名不符预期：防呆不写
-    wcscpy_s(tmp + len - 11, 12, L"claunch.tmp");
+    wcpy(tmp + len - 11, 12, L"claunch.tmp");
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -1725,10 +1753,10 @@ static void ApplyCellBase(int v)
 // 没有悬停格就追加到当前组
 static void ItemToClip(const Item *it, ClipItem *ci)
 {
-    wcsncpy_s(ci->name, 48, it->name, _TRUNCATE);
-    wcsncpy_s(ci->path, MAX_PATH, it->path, _TRUNCATE);
-    wcsncpy_s(ci->args, 192, it->args, _TRUNCATE);
-    wcsncpy_s(ci->tip, 96, it->tip, _TRUNCATE);
+    wcpy(ci->name, 48, it->name);
+    wcpy(ci->path, MAX_PATH, it->path);
+    wcpy(ci->args, 192, it->args);
+    wcpy(ci->tip, 96, it->tip);
 }
 
 static BOOL ClipSet(const ClipItem *ci)
@@ -1754,7 +1782,7 @@ static BOOL ClipSet(const ClipItem *ci)
     if (ht) {
         WCHAR *dst = (WCHAR *)GlobalLock(ht);
         if (dst) {
-            wcscpy_s(dst, cb / sizeof(WCHAR), ci->path);
+            wcpy(dst, (int)(cb / sizeof(WCHAR)), ci->path);
             GlobalUnlock(ht);
             if (!SetClipboardData(CF_UNICODETEXT, ht)) GlobalFree(ht);
         } else {
@@ -1785,7 +1813,7 @@ static BOOL ClipGet(ClipItem *ci)
             WCHAR *s = (WCHAR *)GlobalLock(h);
             if (s && s[0]) {
                 ZeroMemory(ci, sizeof *ci);
-                wcsncpy_s(ci->path, MAX_PATH, s, _TRUNCATE);
+                wcpy(ci->path, MAX_PATH, s);
                 NameFromPath(ci->path, ci->name, 48);
                 ok = TRUE;
             }
@@ -1798,7 +1826,7 @@ static BOOL ClipGet(ClipItem *ci)
             WCHAR p[MAX_PATH];
             if (DragQueryFileW((HDROP)h, 0, p, MAX_PATH) > 0) {   // 取第一个文件
                 ZeroMemory(ci, sizeof *ci);
-                wcsncpy_s(ci->path, MAX_PATH, p, _TRUNCATE);
+                wcpy(ci->path, MAX_PATH, p);
                 NameFromPath(ci->path, ci->name, 48);
                 ok = TRUE;
             }
@@ -1812,10 +1840,7 @@ static BOOL ClipGet(ClipItem *ci)
 // 同 SetItemTarget：不就地加载，图标由随后那次绘制按需加载
 static void PasteItemAt(int ii, const ClipItem *ci)
 {
-    wcsncpy_s(g_items[ii].name, 48, ci->name, _TRUNCATE);
-    wcsncpy_s(g_items[ii].path, MAX_PATH, ci->path, _TRUNCATE);
-    wcsncpy_s(g_items[ii].args, 192, ci->args, _TRUNCATE);
-    wcsncpy_s(g_items[ii].tip, 96, ci->tip, _TRUNCATE);
+    ItemSetText(&g_items[ii], ci->name, ci->path, ci->args, ci->tip);   // 组号不变：粘到哪格入哪组
     DropIcon(ii);
     ViewDirty();                     // 名字可能变了：过滤视图要重建
     SyncAndSave();
@@ -1996,7 +2021,7 @@ static void MakeFonts(void)
     if (g_fontT) { DeleteObject(g_fontT); g_fontT = NULL; }
     ZeroMemory(&lf, sizeof lf);
     lf.lfQuality = CLEARTYPE_QUALITY;
-    wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
+    wcpy(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
     lf.lfHeight = -MulDiv(9, g_dpi, 72);
     lf.lfWeight = FW_NORMAL;
     g_font = CreateFontIndirectW(&lf);
@@ -2053,7 +2078,7 @@ static void MakeFontsAndBrushes(void)
 static BOOL SetHover(const WCHAR *s, BOOL active)
 {
     BOOL chg = active != g_hoverActive || wcscmp(s, g_hoverText) != 0;
-    wcsncpy_s(g_hoverText, 80, s, _TRUNCATE);
+    wcpy(g_hoverText, 80, s);
     g_hoverActive = active;
     return chg;
 }
@@ -2084,14 +2109,10 @@ static BOOL UpdateHoverText(void)
     return SetHover(g_groups[g_curGroup].name, FALSE);   // 闲时显示当前分组
 }
 
-// 返回悬停是否变化。鼠标在同一个格子上滑动是最高频事件：
-// 同格快速路径（光标还在整格矩形内）直接返回，三路命中测试全跳过
+// 返回悬停是否变化。鼠标在同一个格子上滑动是最高频事件：CellAt 一次算清
+// 列/行/槽位（两除），与旧悬停比较后直接早退——不再单设"整格矩形包含"快路径
 static BOOL HoverFromPoint(POINT p)
 {
-    if (g_hoverCell >= 0 && g_hoverCell < ViewCount()) {
-        RECT r = CellRect(g_hoverCell);
-        if (PtInRect(&r, p)) return FALSE;
-    }
     int nc = CellAt(p);
     int ng = (nc >= 0) ? -1 : GroupAt(p);
     // 按钮只在标题栏里：光标在标题栏以下时连 BtnAt 都不必问
@@ -2151,7 +2172,7 @@ static void UpdateCard(void)
     if (x + w > maxX) x = maxX - w;
     if (y < minY) y = minY;
     if (y + h > maxY) y = maxY - h;
-    wcsncpy_s(g_cardText, 80, txt, _TRUNCATE);
+    wcpy(g_cardText, 80, txt);
     g_cardRect.left = x; g_cardRect.top = y;
     g_cardRect.right = x + w; g_cardRect.bottom = y + h;
     g_cardOn = TRUE;
@@ -2293,7 +2314,7 @@ static void InvalidateSidebar(void)
 // 标题栏闪现一条消息 FLASH_MS（时间戳驱动，不占新定时器；过期重绘由 TIMER_HIDE 顺带做）
 static void FlashMsg(const WCHAR *text)
 {
-    wcsncpy_s(g_flashText, 80, text, _TRUNCATE);
+    wcpy(g_flashText, 80, text);
     g_flashAt = GetTickCount64();
     InvalidateTitle();
 }
@@ -2399,7 +2420,7 @@ static void DrawPinGlyph(HDC dc, RECT r, HBRUSH br)
 static void PaintTitleButtons(HDC dc)
 {
     for (int b = BTN_PIN; b <= BTN_CLOSE; b++) {
-        RECT r = BtnRect(b);
+        RECT r = g_btnRect[b];
         BOOL hov = (g_hoverBtn == b), prs = (g_pressBtn == b);
         if (hov || prs) {
             HBRUSH bg = prs ? (b == BTN_CLOSE ? g_brClosePr : g_brBtnPress)
@@ -2430,6 +2451,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
     FillRect(dc, &ln, g_brLine);
 
     RECT hit;
+    const int pad = S_(4);
     for (int i = 0; i < g_nGroups; i++) {
         RECT r = GroupRect(i);
         if (r.bottom < g_titleH || r.top > g_ch) continue;
@@ -2439,7 +2461,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         // “这一行有反应”可感知（两者互斥取同一刷子，不会叠加）
         if (sel || hov) FillRect(dc, &r, g_brCell);
         SetTextColor(dc, sel ? C_ACCEL : (hov ? C_TEXT : C_DIM));
-        RECT tr = { r.left + S_(4), r.top, r.right - S_(4), r.bottom };
+        RECT tr = { r.left + pad, r.top, r.right - pad, r.bottom };
         DrawTextW(dc, g_groups[i].name, -1, &tr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         // 选中标记放在下方（原来在左侧）
@@ -2474,7 +2496,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
 static void PaintTitle(HDC dc)
 {
     HFONT old = (HFONT)SelectObject(dc, g_fontT);
-    RECT ttl = { g_sideW + S_(8), 0, g_cw - BtnZoneW() - S_(8), g_titleH };
+    RECT ttl = { g_sideW + S_(8), 0, g_cw - g_btnZoneW - S_(8), g_titleH };
     if (FlashActive()) {
         // 启动反馈优先：刚点过启动，先让用户看到结果（悬停/搜索都让位）
         SetTextColor(dc, C_TEXT);
@@ -2501,32 +2523,34 @@ static void PaintTitle(HDC dc)
 
 static void PaintGrid(HDC dc, const RECT *clip)
 {
-    int step = g_cell + g_gap;
-    int isz = IconSize();
-    int n = ViewCount();
-    int limit = g_slots;
-    if (n > limit) limit = n;
-    // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
-    // 按行递增算坐标：省掉 CellRect 里每格两次除法（% 和 /）
-    RECT hit;
+    const int step   = g_cell + g_gap;
+    const int isz    = IconSize();
+    const int n      = ViewCount();               // 一次定表：循环里直读 g_viewIdx
+    const int limit  = n > g_slots ? n : g_slots;
+    const int rad0   = g_cell / 2 - 1;
+    const int rad    = rad0 > S_(6) ? S_(6) : rad0;
+    // 每格要用的缩放量全部提到循环外：原来每格 5 次 S_、两次除法
+    const int lblIn  = S_(2), lblTop = S_(17), lblBot = S_(3);
+    const int iconX  = (g_cell - isz) / 2;        // 图标在格内的相对位置
+    const int iconY  = (g_cell - S_(20) - isz) / 2;
     // 边框 pen / 底色 brush 循环外只选一次（普通态）；一枚 RoundRect 同时
     // 完成填充+边框+圆角。悬停/拖动格换 accent 边——焦点环贴着圆角走
     // （替代旧的内缩 FrameRect），悬停重绘反而少一次 GDI 调用
-    int rad = g_cell / 2 - 1;
-    if (rad > S_(6)) rad = S_(6);        // 大格子封顶：小圆角才耐看
     HPEN   op = (HPEN)SelectObject(dc, g_penLine);
     HBRUSH ob = (HBRUSH)SelectObject(dc, g_brCell);
     SetTextColor(dc, C_TEXT);            // 所有格子的标签同色：循环外设一次
+    RECT hit;
     for (int row = 0; row * g_cols < limit; row++) {
         int y = g_titleH + row * step - g_scroll;
         if (y >= g_ch) break;                       // 整行在可视区下方
         if (y + g_cell <= g_titleH) continue;       // 整行已滚出上方
-        for (int col = 0; col < g_cols; col++) {
-            int vi = row * g_cols + col;
-            RECT r = { g_sideW + col * step, y,
-                       g_sideW + col * step + g_cell, y + g_cell };
+        int x = g_sideW;
+        int vi = row * g_cols;
+        for (int col = 0; col < g_cols; col++, x += step, vi++) {
+            RECT r = { x, y, x + g_cell, y + g_cell };
+            // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
-            int ii = ItemAtView(vi);
+            int ii = vi < n ? g_viewIdx[vi] : -1;   // 视图表直读：省掉脏检查与边界重验
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
             // 拖动标示两路共用：内部排序（g_dragging）与外部 OLE 拖放（g_extDrag，
             // 无按下格概念）互斥，任一激活时落点格画常规底 + accent 边
@@ -2542,14 +2566,13 @@ static void PaintGrid(HDC dc, const RECT *clip)
                 SelectObject(dc, g_penLine);
                 SelectObject(dc, g_brCell);
             }
-            if (ii < 0 || IsBlank(ii)) continue;    // 空格：只画底框（悬停高亮已画），无图标/名字
-            EnsureIcon(ii);
-            if (g_items[ii].icon) {
-                int ix = (r.left + r.right - isz) / 2;
-                int iy = r.top + (g_cell - S_(20) - isz) / 2;   // 标签上方垂直居中
-                DrawIconEx(dc, ix, iy, g_items[ii].icon, isz, isz, 0, NULL, DI_NORMAL);
-            }
-            RECT lr = { r.left + S_(2), r.bottom - S_(17), r.right - S_(2), r.bottom - S_(3) };
+            if (ii < 0 || !g_items[ii].path[0]) continue;   // 空格：只画底框，无图标/名字
+            if (!g_items[ii].iconTried) EnsureIcon(ii);     // 已解析的格子省一次调用
+            if (g_items[ii].icon)
+                DrawIconEx(dc, x + iconX, y + iconY, g_items[ii].icon, isz, isz,
+                           0, NULL, DI_NORMAL);
+            RECT lr = { x + lblIn, y + g_cell - lblTop,
+                        x + g_cell - lblIn, y + g_cell - lblBot };
             DrawTextW(dc, g_items[ii].name, -1, &lr,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
@@ -2740,7 +2763,7 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
     ZeroMemory(&g_dlg, sizeof g_dlg);
     for (int i = 0; i < n && i < 6; i++) g_dlg.f[i] = f[i];
     g_dlg.n = n;
-    wcsncpy_s(g_dlg.title, 64, title, _TRUNCATE);
+    wcpy(g_dlg.title, 64, title);
     g_dlg.dlgW   = S_(540);
     g_dlg.titleH = S_(34);
     g_dlg.rowH   = S_(32);
@@ -2849,22 +2872,17 @@ static void InitAutostart(void)
 // 组装托盘提示：当前分组 + 激活的开关（全关时退化）。开关状态一目了然，
 // 不用每次都右键开菜单看勾选；分组名让悬停一眼知道面板停在哪组。
 // 静默启动已是唯一行为（配置可手工改），不再是“开关”所以不进提示
-static void BuildTrayTip(WCHAR *out, size_t cch)
+static void BuildTrayTip(WCHAR *out, int cch)
 {
-    WCHAR flags[40] = L"";
-    if (g_pinned)    wcscat_s(flags, 40, L"置顶·");
-    if (g_autostart) wcscat_s(flags, 40, L"自启·");
-    if (flags[0]) flags[wcslen(flags) - 1] = 0;   // 去掉末尾分隔符
     const WCHAR *grp = (g_curGroup >= 0 && g_curGroup < g_nGroups)
                      ? g_groups[g_curGroup].name : L"";
-    if (grp[0] && flags[0])
-        swprintf(out, cch, L"桌面格子[%s] — %s — 单击显示，右键菜单", grp, flags);
-    else if (grp[0])
-        swprintf(out, cch, L"桌面格子[%s] — 单击显示，右键菜单", grp);
-    else if (flags[0])
-        swprintf(out, cch, L"桌面格子 — %s — 单击显示，右键菜单", flags);
-    else
-        swprintf(out, cch, L"桌面格子 — 单击显示，右键菜单");
+    // 顺序拼装，分隔符随项走：原实现先攒 flags 再四分支 swprintf，
+    // 六条格式串里有一半是重复的
+    wcpy(out, cch, L"桌面格子");
+    if (grp[0]) { wcat(out, cch, L"["); wcat(out, cch, grp); wcat(out, cch, L"]"); }
+    if (g_pinned)    wcat(out, cch, L" — 置顶");
+    if (g_autostart) wcat(out, cch, L" — 自启");
+    wcat(out, cch, L" — 单击显示，右键菜单");
 }
 
 // 开关变化后刷新托盘提示（无托盘图标时是空操作；只改 tip，不动图标/回调）
@@ -2915,7 +2933,7 @@ static void TrayBalloon(const WCHAR *text)
     NOTIFYICONDATAW nid = g_nid;               // 结构拷贝：cbSize/hWnd/uID 等照旧
     nid.uFlags = NIF_INFO;
     nid.dwInfoFlags = NIIF_INFO;               // 信息级：不发声不闪烁
-    wcsncpy_s(nid.szInfo, 256, text, _TRUNCATE);
+    wcpy(nid.szInfo, 256, text);
     nid.uTimeout = 8000;
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -3021,7 +3039,7 @@ static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
         WCHAR prev[48], pv[24];
         ModsName(pv, 24, mods);
         if (pv[0]) swprintf(prev, 48, L"%s…", pv);
-        else       wcscpy_s(prev, 48, L"（等待按键）");
+        else       wcpy(prev, 48, L"（等待按键）");
         SetTextColor(dc, C_TEXT);
         RECT tr1 = { S_(20), S_(44), rc.right - S_(20), S_(76) };
         DrawTextW(dc, prev, -1, &tr1,
@@ -3164,15 +3182,15 @@ static void ShowCellMenu(int vi)
     case IDM_CLR_SLOT: ClearSlotAt(vi); break;
     case IDM_PROPS: if (it) {
         WCHAR oldPath[MAX_PATH];
-        wcsncpy_s(oldPath, MAX_PATH, it->path, _TRUNCATE);
+        wcpy(oldPath, MAX_PATH, it->path);
         DlgField f[4] = {
             { L"名称(N):",     it->name, 48,       0 },
             { L"文件名(F):",   it->path, MAX_PATH, 1 },
-            { L"参数(P):",     g_items[ii].args, 192,      0 },
-            { L"工具提示(T):", g_items[ii].tip,  96,       0 },
+            { L"参数(P):",     it->args, 192,      0 },
+            { L"工具提示(T):", it->tip,  96,       0 },
         };
         if (RunDialog(g_hwnd, L"格子属性", f, 4)) {
-            if (wcscmp(oldPath, g_items[ii].path))   // 目标变了：丢掉旧图标，绘制时按新目标重载
+            if (wcscmp(oldPath, it->path))   // 目标变了：丢掉旧图标，绘制时按新目标重载
                 DropIcon(ii);
             SyncAndSave();
         }
@@ -3195,7 +3213,7 @@ static void ShowGroupMenu(int gi)
     if (cmd == IDM_GRP_RENAME && gi >= 0 && gi < g_nGroups) {
         DlgField f[1] = { { L"名称(N):", g_groups[gi].name, 48, 0 } };
         if (RunDialog(g_hwnd, L"重命名分组", f, 1)) {
-            if (!g_groups[gi].name[0]) wcsncpy_s(g_groups[gi].name, 48, L"未命名", _TRUNCATE);
+            if (!g_groups[gi].name[0]) wcpy(g_groups[gi].name, 48, L"未命名");
             SyncAndSave();
         }
     } else if (cmd == IDM_GRP_DEL) {
@@ -3361,8 +3379,8 @@ static DWORD WINAPI HookThread(LPVOID arg)
 {
     UNREF(arg);
     s_dblClick = GetDoubleClickTime();
-    s_dblX = GetSystemMetrics(SM_CXDLGFRAME);
-    s_dblY = GetSystemMetrics(SM_CYDLGFRAME);
+    s_dblX = GetSystemMetrics(SM_CXDOUBLECLK);   // 双击容差就是这两个指标；
+    s_dblY = GetSystemMetrics(SM_CYDOUBLECLK);   // 原用 SM_C*DLGFRAME（边框宽）是张冠李戴
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, NULL, 0);
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -3377,43 +3395,40 @@ static DWORD WINAPI HookThread(LPVOID arg)
 // 每条消息一个小函数，WndProc 只做分发；顺序与 switch 分发表一致
 
 // ---------------------------------------------------------------- 唤醒快捷键（可配置）
-static void ModsName(WCHAR *out, size_t cch, UINT mods)
+static void ModsName(WCHAR *out, int cch, UINT mods)
 {
-    WCHAR t[24] = L"";
-    if (mods & MOD_CONTROL) wcscat_s(t, 24, L"Ctrl+");
-    if (mods & MOD_ALT)     wcscat_s(t, 24, L"Alt+");
-    if (mods & MOD_SHIFT)   wcscat_s(t, 24, L"Shift+");
-    wcsncpy_s(out, cch, t, _TRUNCATE);
+    out[0] = 0;
+    if (mods & MOD_CONTROL) wcat(out, cch, L"Ctrl+");
+    if (mods & MOD_ALT)     wcat(out, cch, L"Alt+");
+    if (mods & MOD_SHIFT)   wcat(out, cch, L"Shift+");
 }
 
-static void HotkeyName(WCHAR *out, size_t cch)
+// 特殊主键的可读名：查表比 15 个 case 短，也免了每次调用的分支链
+static const struct { UINT vk; const WCHAR *name; } VK_NAMES[] = {
+    { VK_SPACE,  L"空格" },   { VK_RETURN, L"回车" },
+    { VK_TAB,    L"Tab" },    { VK_INSERT, L"Insert" },
+    { VK_DELETE, L"Delete" }, { VK_HOME,   L"Home" },
+    { VK_END,    L"End" },    { VK_PRIOR,  L"PageUp" },
+    { VK_NEXT,   L"PageDown" },
+    { VK_LEFT,   L"←" },      { VK_RIGHT,  L"→" },
+    { VK_UP,     L"↑" },      { VK_DOWN,   L"↓" },
+};
+
+static void HotkeyName(WCHAR *out, int cch)
 {
-    WCHAR t[24], key[16];
-    ModsName(t, 24, g_hotMods);
+    ModsName(out, cch, g_hotMods);
+    int n = (int)wcslen(out);
     UINT vk = g_hotVk;
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
-        key[0] = (WCHAR)vk; key[1] = 0;
+        if (n + 1 < cch) { out[n] = (WCHAR)vk; out[n + 1] = 0; }
     } else if (vk >= VK_F1 && vk <= VK_F24) {
-        swprintf(key, 16, L"F%u", vk - VK_F1 + 1);
+        swprintf(out + n, cch - n, L"F%u", vk - VK_F1 + 1);
     } else {
-        switch (vk) {
-        case VK_SPACE:  wcscpy_s(key, 16, L"空格");   break;
-        case VK_RETURN: wcscpy_s(key, 16, L"回车");   break;
-        case VK_TAB:    wcscpy_s(key, 16, L"Tab");    break;
-        case VK_INSERT: wcscpy_s(key, 16, L"Insert"); break;
-        case VK_DELETE: wcscpy_s(key, 16, L"Delete"); break;
-        case VK_HOME:   wcscpy_s(key, 16, L"Home");   break;
-        case VK_END:    wcscpy_s(key, 16, L"End");    break;
-        case VK_PRIOR:  wcscpy_s(key, 16, L"PageUp"); break;
-        case VK_NEXT:   wcscpy_s(key, 16, L"PageDown"); break;
-        case VK_LEFT:   wcscpy_s(key, 16, L"←"); break;
-        case VK_RIGHT:  wcscpy_s(key, 16, L"→"); break;
-        case VK_UP:     wcscpy_s(key, 16, L"↑"); break;
-        case VK_DOWN:   wcscpy_s(key, 16, L"↓"); break;
-        default:        swprintf(key, 16, L"0x%02X", vk); break;
-        }
+        UINT i = 0;
+        while (i < _countof(VK_NAMES) && VK_NAMES[i].vk != vk) i++;
+        if (i < _countof(VK_NAMES)) wcat(out, cch, VK_NAMES[i].name);
+        else                        swprintf(out + n, cch - n, L"0x%02X", vk);
     }
-    swprintf(out, cch, L"%s%s", t, key);
 }
 
 // 注册/更换唤醒快捷键。同一 HOTKEY_ID 重复注册即原子替换——冲突时返回
@@ -3481,21 +3496,9 @@ static void OnSize(HWND h, LPARAM l)
     g_cw = LOWORD(l);
     g_ch = HIWORD(l);
     UpdateCell();       // 横向铺满的正方格宽随窗口变化
-    // 重建离屏缓冲（失败则退回直接绘制）
-    HDC scr = GetDC(h);
-    HDC dc = CreateCompatibleDC(scr);
-    HBITMAP bmp = CreateCompatibleBitmap(scr, g_cw, g_ch);
-    ReleaseDC(h, scr);
-    if (dc && bmp) {
-        SelectObject(dc, bmp);
-        if (g_memDC) { DeleteDC(g_memDC); DeleteObject(g_memBmp); }
-        g_memDC = dc;
-        g_memBmp = bmp;
-        g_memFresh = TRUE;
-    } else {
-        if (dc) DeleteDC(dc);
-        if (bmp) DeleteObject(bmp);
-    }
+    // 离屏缓冲按新尺寸重建：先放旧的再惰性建新的（失败则 OnPaint 直绘兜底）
+    ReleaseMemBuffer();
+    EnsureMemBuffer(h);
     int rad = S_(10);
     HRGN rgn = CreateRoundRectRgn(0, 0, g_cw + 1, g_ch + 1, rad, rad);
     if (rgn) SetWindowRgn(h, rgn, TRUE);
@@ -3572,25 +3575,24 @@ static void OnPaint(HWND h)
     // ~16MB 工作集 + ~50 GDI。唤醒后窗口可见，照常全量绘制
     if (IsWindowVisible(h)) {
         EnsureMemBuffer(h);      // 隐藏期间缓冲已释放：唤醒后首绘前重建
-        if (g_memDC) {
-        // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
-        // 其余缓冲内容保持上一帧，与屏幕一致。
-        RECT rc;
-        if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
-        else            rc = ps.rcPaint;
-        // 设裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
-        // 复位成整幅位图（WM_SIZE 重建时也是全新 DC），起始裁剪即全图，
-        // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
-        // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
-        IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
-        PaintWindow(g_memDC, &rc);     // 裁剪区即 rc：直接传，省一次 GetClipBox
-        SelectClipRgn(g_memDC, NULL);
-        BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-               g_memDC, rc.left, rc.top, SRCCOPY);
-        g_memFresh = FALSE;
-    } else {
-        PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
-    }
+        if (!g_memDC) {
+            PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
+        } else {
+            // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
+            // 其余缓冲内容保持上一帧，与屏幕一致
+            RECT rc = ps.rcPaint;
+            if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
+            // 裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
+            // 复位成整幅位图（WM_SIZE 重建时也是全新 DC），起始裁剪即全图，
+            // 四次矩形求交等价于替换裁剪区，但省掉每次绘制一次 GDI 区域对象
+            // 的创建+销毁——WM_PAINT 是悬停/拖动/滚动每条热路径的终点
+            IntersectClipRect(g_memDC, rc.left, rc.top, rc.right, rc.bottom);
+            PaintWindow(g_memDC, &rc);     // 裁剪区即 rc：直接传，省一次 GetClipBox
+            SelectClipRgn(g_memDC, NULL);
+            BitBlt(dc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                   g_memDC, rc.left, rc.top, SRCCOPY);
+            g_memFresh = FALSE;
+        }
     }
     EndPaint(h, &ps);
 }
@@ -3697,13 +3699,12 @@ static void OnLButtonDown(HWND h, LPARAM l)
         } else {
             SelectGroup(g_hoverGroup);   // 切组：滚动位记忆/恢复与滚轮切组同一路径
         }
-        if (g_hoverGroup >= 0) {         // 任意分组行按下即记住起点（重排）
-            g_pressGroup = g_hoverGroup;
-            g_pressPt = p;
-            g_dragGroup = FALSE;
-            g_dropGroup = -1;
-            SetCapture(h);
-        }
+        // 任意分组行按下即记住起点（重排）。SelectGroup 不动 g_hoverGroup，无需重验
+        g_pressGroup = g_hoverGroup;
+        g_pressPt = p;
+        g_dragGroup = FALSE;
+        g_dropGroup = -1;
+        SetCapture(h);
         return;
     }
     if (g_hoverCell >= 0) {
@@ -3726,9 +3727,8 @@ static void OnLButtonDown(HWND h, LPARAM l)
 }
 
 // 返回是否消费（TRUE=有按下态在管）；都不在管时转交 DefWindowProc
-static BOOL OnLButtonUp(HWND h)
+static BOOL OnLButtonUp(void)
 {
-    UNREF(h);                         // 捕获释放不需要句柄
     if (g_pressBtn) {                 // 按钮抬起：按压态收头
         g_pressBtn = 0;
         InvalidateTitle();
@@ -3794,9 +3794,8 @@ static void OnCaptureLost(void)
     }
 }
 
-static void OnRButtonUp(HWND h, LPARAM l)
+static void OnRButtonUp(LPARAM l)
 {
-    UNREF(h);                         // 菜单定位全靠悬停状态，不需要句柄
     POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
     HoverFromPoint(p);
     RefreshCard();
@@ -3985,7 +3984,7 @@ static void DropApply(DropCtx *c, int k, const WCHAR *path, const WCHAR *name)
     int ii = ItemAtView(s);
     if (ii >= 0) {
         SetItemTarget(ii, path, c->g);
-        if (name && name[0]) wcsncpy_s(g_items[ii].name, 48, name, _TRUNCATE);
+        if (name && name[0]) wcpy(g_items[ii].name, 48, name);
     } else {
         AddNamedItem(path, name, c->g);    // 条目数爆满兜底
     }
@@ -4009,14 +4008,15 @@ static void DropFinish(HWND h, const DropCtx *c)
 }
 
 // CF_HDROP 落放核心。OLE 拿到的 HDROP 不经 DragFinish——释放归
-// ReleaseStgMedium；WM_DROPFILES 路径由 OnDropFiles 收尾
-static void HandleDroppedFiles(HWND h, HDROP hd, POINT p)
+// ReleaseStgMedium；WM_DROPFILES 路径由 OnDropFiles 收尾。
+// nf 由调用方给（两路调用前都已问过一次，不再重复问）
+static void HandleDroppedFiles(HWND h, HDROP hd, POINT p, UINT nf)
 {
-    UINT nf = DragQueryFileW(hd, 0xFFFFFFFF, NULL, 0);
     if (!nf) return;
+    if (nf > (UINT)MAX_ITEMS) nf = MAX_ITEMS;
     DropCtx c;
-    DropBegin(&c, p, (int)(nf < (UINT)MAX_ITEMS ? nf : MAX_ITEMS));
-    for (UINT k = 0; k < nf && k < (UINT)MAX_ITEMS; k++) {
+    DropBegin(&c, p, (int)nf);
+    for (UINT k = 0; k < nf; k++) {
         WCHAR path[MAX_PATH];
         if (!DragQueryFileW(hd, k, path, MAX_PATH)) continue;
         DropApply(&c, (int)k, path, NULL);
@@ -4035,7 +4035,7 @@ static void OnDropFiles(HWND h, WPARAM w)
             GetCursorPos(&p);
             ScreenToClient(h, &p);
         }
-        HandleDroppedFiles(h, hd, p);
+        HandleDroppedFiles(h, hd, p, nf);
     }
     DragFinish(hd);
 }
@@ -4096,7 +4096,7 @@ static int HandleShellIdList(HWND h, IDataObject *d, POINT p)
                 if (SUCCEEDED(SHGetNameFromIDList(full, SIGDN_DESKTOPABSOLUTEPARSING, &parse))) {
                     WCHAR name[48] = L"";
                     if (SUCCEEDED(SHGetNameFromIDList(full, SIGDN_NORMALDISPLAY, &disp))) {
-                        wcsncpy_s(name, 48, disp, _TRUNCATE);
+                        wcpy(name, 48, disp);
                         CoTaskMemFree(disp);
                     }
                     DropApply(&c, (int)k - 1, parse, name);   // 空名回落 NameFromPath
@@ -4286,7 +4286,7 @@ static HRESULT __stdcall DtDrop(IDropTarget *self, IDataObject *d, DWORD keys,
     if (SUCCEEDED(IDataObject_GetData(d, &ft, &med))) {
         UINT nf = DragQueryFileW((HDROP)med.hGlobal, 0xFFFFFFFF, NULL, 0);
         if (nf > 0) {
-            HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p);
+            HandleDroppedFiles(g_hwnd, (HDROP)med.hGlobal, p, nf);
             ReleaseStgMedium(&med);
             *ef = PickEffect(g_oleAllow);
             return S_OK;
@@ -4437,10 +4437,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_MOUSEMOVE:         OnMouseMove(h, l);                        return 0;
     case WM_MOUSELEAVE:        OnMouseLeave();                           return 0;
     case WM_LBUTTONDOWN:       OnLButtonDown(h, l);                      return 0;
-    case WM_LBUTTONUP:         if (OnLButtonUp(h))                       return 0;
+    case WM_LBUTTONUP:         if (OnLButtonUp())                        return 0;
                                break;
     case WM_CAPTURECHANGED:    OnCaptureLost();                          return 0;
-    case WM_RBUTTONUP:         OnRButtonUp(h, l);                        return 0;
+    case WM_RBUTTONUP:         OnRButtonUp(l);                           return 0;
     case WM_APP_WHEEL:
     case WM_MOUSEWHEEL:        OnWheel(h, m, w, l);                      return 0;
     case WM_KEYDOWN:           OnKeyDown(w);                             return 0;
@@ -4488,7 +4488,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     GetModuleFileNameW(NULL, path, MAX_PATH);
     WCHAR *slash = wcsrchr(path, L'\\');
     if (slash) slash[1] = 0;
-    wcscat_s(path, MAX_PATH, L"claunch_crash.txt");
+    wcat(path, MAX_PATH, L"claunch_crash.txt");
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
