@@ -15,7 +15,10 @@
 // 托盘菜单：显示面板 / 设置唤醒快捷键 / 开机自启（写 HKCU Run）/ 退出。
 // 内存红线（实测）：配置流式读写、图标按需加载、SHGetFileInfo 只作兜底、
 // .lnk 解析 + CreateProcess 直启替代 ShellExecute、主窗断开 IME、
-// COM/图标管线延迟到唤醒——破防会拖进 15~30MB 外部模块链。
+// OLE 初始化与图标管线延迟到唤醒（见 InitOleDrop 注释）——破防会拖进
+// 15~30MB 外部模块链。注意"延迟"延的是初始化与管线，不是 DLL 本身：
+// ole32/combase 被 shell32 静态拖着，托盘态 32 个模块里那 9 个去不掉
+// （tmp\mods.c 实测，两次试图摘掉都被证伪）。
 // 绘制走整窗离屏缓冲：直接绘制在快速滚动时露"画一半"中间帧，频闪。
 // 运行时零依赖：不链 libcmt/ucrt（build.bat 里 /NODEFAULTLIB + /D CLAUNCH_NOCRT）。
 // 宽字符原语、格式化核、配置读写全是自实现；入口、/GS cookie 与两个编译器桩

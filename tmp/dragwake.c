@@ -85,8 +85,14 @@ int wmain(int argc, WCHAR **argv)
         oy = r.bottom + 160;
     }
     MoveTo(ox, oy);
-    Sleep(4500);        // 唤醒有 3s 宽限 + 150ms 移出延迟：等够再断言
-    Check(!IsWindowVisible(w), "松开按键后移出 → 自动隐藏");
+    // 自动隐藏是"唤醒后 3s 宽限 + 150ms 移出延迟 + 6 步淡出"的时序链，
+    // 固定等 4.5s 会偶发差一点点——轮询等它真的消失（上限 8s）
+    int gone = 0;
+    for (int i = 0; i < 80 && !gone; i++) {
+        Sleep(100);
+        if (!IsWindowVisible(w)) gone = 1;
+    }
+    Check(gone, "松开按键后移出 → 自动隐藏");
 
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
