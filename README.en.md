@@ -73,7 +73,7 @@ cl /nologo /std:c11 /W4 /O1 /GS /GL /utf-8 /D CLAUNCH_NOCRT claunch.c ^
 ```
 
 CI ([.github/workflows/build.yml](.github/workflows/build.yml)) runs the same commands and
-additionally asserts the import table contains no CRT dependency and runs the `mem*` self-check.
+additionally asserts the import table contains no CRT dependency.
 
 > The `ml64` object name must be `/Fo claunch_chkstk.obj` — with a **space**, not `/Fo:…`.
 > The colon form silently produces no file yet returns 0.

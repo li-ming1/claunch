@@ -59,7 +59,7 @@ cl /nologo /std:c11 /W4 /O1 /GS /GL /utf-8 /D CLAUNCH_NOCRT claunch.c ^
 ```
 
 CI（[.github/workflows/build.yml](.github/workflows/build.yml)）执行相同的命令，
-并额外断言导入表中不含 CRT 依赖、运行 `mem*` 自检。
+并额外断言导入表中不含 CRT 依赖。
 
 > `ml64` 的对象名要写成 `/Fo claunch_chkstk.obj`（**空格**，不是 `/Fo:…`）。
 > 冒号形式在这里会静默不产出文件且返回 0。

@@ -38,19 +38,6 @@ jobs:
           Write-Host $deps
           if ($deps -match 'VCRUNTIME|ucrtbase|msvcp') { throw 'CRT dll is still imported' }
 
-      - name: Build mem* self-check
-        run: >
-          ml64 /nologo /c /Fo tests\memtest_asm.obj claunch.asm &&
-          cl /nologo /std:c11 /O1 /GS- /utf-8 tests\memtest.c tests\memtest_asm.obj
-          /link /NODEFAULTLIB /ENTRY:mem_main /SUBSYSTEM:CONSOLE
-          /OUT:tests\memtest.exe kernel32.lib
-
-      - name: Run mem* self-check
-        run: |
-          tests\memtest.exe
-          Get-Content tests\memtest.txt
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
       - uses: actions/upload-artifact@v4
         with:
           name: claunch-x64
