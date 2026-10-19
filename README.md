@@ -1,9 +1,11 @@
+简体中文 | [English](README.en.md)
+
 # claunch
 
 单文件、零第三方依赖、零 C 运行库的 Windows 桌面格子启动器（x64 / Win10、11）。
 
-一个 4889 行的 `claunch.c` + 一个 115 行的汇编桩，编出来 70KB的 exe，
-导入表里只有 7 个系统 DLL。桌面格子这一件事它全做完了，多一行运行时依赖都不加。
+一个 4889 行的 `claunch.c` 加一个 115 行的汇编桩，编译产物约 70 KB，
+导入表中仅 7 个系统 DLL。专注桌面格子启动器这一件事，不引入任何额外的运行时依赖。
 
 ## 特性
 
@@ -22,32 +24,31 @@
 
 ## 内存与体积
 
-这是本项目真正在优化的东西，全部实测：
+这是本项目重点优化的指标，以下均为实测数据：
 
 | 状态 | 模块数 | total WS | 私有提交 |
 |---|---|---|---|
 | 托盘（静默） | 23 | 0.37 MB | 1.75 MB |
 | 唤醒可见 | 31~33 | ~11 MB | 2.5 MB |
 
-镜像 71,680 字节；`dumpbin /dependents` 里没有任何 CRT dll。
-对照同场景的 CLaunch 4.10：62 个模块、24.8 MB 私有提交。
+镜像 71,680 字节；`dumpbin /dependents` 输出中不含任何 CRT DLL。
 
-> 口径提醒：`total WS` 含共享映像页（唤醒时拉进来的是一串系统 DLL 的共享页），
-> 任务管理器"内存"列看的是**私有工作集**，不含它们。比内存请认准私有口径。
+> 说明：`total WS` 含共享映像页（唤醒时载入的系统 DLL 共享页），
+> 任务管理器"内存"列显示的是**私有工作集**，不含它们。比较内存占用请以私有工作集为准。
 
-做到这个量级靠的是几条红线（细节都写在 [claunch.c](claunch.c) 顶部注释里）：
+达到这一量级依托以下设计约束（细节见 [claunch.c](claunch.c) 顶部注释）：
 
-- 不用 `SHGetFileInfo` 取图标（会拉整条 shell 图标管线）；`.lnk` 按 MS-SHLLINK 自己最小解析。
-- 常规启动走 `CreateProcessW`，不用 `ShellExecuteW`（会拉 WinRT 栈且常驻不卸）。
+- 不用 `SHGetFileInfo` 取图标（避免引入整条 shell 图标管线）；`.lnk` 按 MS-SHLLINK 自行最小解析。
+- 常规启动走 `CreateProcessW`，不用 `ShellExecuteW`（后者会引入 WinRT 栈且常驻不卸载）。
 - 主窗断开 IME 关联，避免输入法被注入进程。
-- OLE 初始化与图标管线延迟到首次唤醒：挂托盘时不付 COM 的钱。
+- OLE 初始化与图标管线延迟到首次唤醒：静默驻留阶段不承担 COM 初始化开销。
 - 面板隐藏后裁剪工作集、释放离屏缓冲。
 - **不链 libcmt/ucrt**：宽字符原语、格式化核、配置读写、入口点、`/GS` cookie、`mem*` 全自实现。
 
 ## 构建
 
-需要 Visual Studio 2022（C++ 工具集）+ Windows SDK。仓库**不带构建脚本**
-（本地脚本写死了本机 VS 路径，不入库），在 *x64 Native Tools Command Prompt* 里跑两行：
+需要 Visual Studio 2022（含 C++ 工具集）与 Windows SDK。在
+*x64 Native Tools Command Prompt* 中执行：
 
 ```bat
 ml64 /nologo /c /Fo claunch_chkstk.obj claunch.asm
@@ -57,8 +58,8 @@ cl /nologo /std:c11 /W4 /O1 /GS /GL /utf-8 /D CLAUNCH_NOCRT claunch.c ^
     claunch_chkstk.obj kernel32.lib user32.lib shell32.lib gdi32.lib imm32.lib advapi32.lib ole32.lib
 ```
 
-CI 跑的就是这两行，并额外断言导入表里没有 CRT、跑一遍 `mem*` 自检：见
-[.github/workflows/build.yml](.github/workflows/build.yml)。
+CI（[.github/workflows/build.yml](.github/workflows/build.yml)）执行相同的命令，
+并额外断言导入表中不含 CRT 依赖、运行 `mem*` 自检。
 
 > `ml64` 的对象名要写成 `/Fo claunch_chkstk.obj`（**空格**，不是 `/Fo:…`）。
 > 冒号形式在这里会静默不产出文件且返回 0。
@@ -73,7 +74,7 @@ CI 跑的就是这两行，并额外断言导入表里没有 CRT、跑一遍 `me
 ## 配置
 
 `claunch.ini`（UTF-8）放在 exe 同目录，程序自己原子读写（先写 `claunch.tmp` 再改名替换，
-写一半断电不会撕坏配置）。手写参考 [claunch.ini.example](claunch.ini.example)。
+写一半断电不会撕坏配置）。各键含义如下：
 
 | 键 | 含义 |
 |---|---|
@@ -84,19 +85,6 @@ CI 跑的就是这两行，并额外断言导入表里没有 CRT、跑一遍 `me
 | `Cell=<40..160>` | 格子基准尺寸（Ctrl+滚轮的记忆值） |
 | `[Groups] G0…` | 分组名，编号必须从 0 连续 |
 | `[Items] I0…` | 条目，五段：`名|路径|组|参数|提示`（后三段可省） |
-
-## 测试
-
-`tmp/` 是一套纯 Win32 探针（无框架、无外部依赖），每个探针拉起被测 exe、注入输入，
-对照可观测事实（像素哈希 / 句柄数 / 模块表 / 配置文件字节 / 计数）给结论：
-
-- **行为回归**：`kbtest`（像素哈希）、`dragwake`、`dropchk`、`probe2`、`soak`、`starttime`
-- **量化光源**：`zoomcount`、`wheel2`、`wakecost`、`hooktime`、`mods`、`watch`、`floor`
-- **单元测试**：`nametest`、`libtest`、`fmtfmt`、`parsefuzz`、`memtest`
-
-`memtest` 是 `mem*` 四件套的对拍自检（217 例，含 `memmove` 重叠双向），
-也是唯一不链 CRT 的探针；CI 里跑它，其余探针要本机手动跑。
-用法与判据见 [tmp/README.md](tmp/README.md)。
 
 ## 许可
 
