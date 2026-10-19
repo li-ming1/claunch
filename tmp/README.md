@@ -36,13 +36,20 @@ tmp\starttime.exe tmp\claunch.exe 3      :: 启动耗时
 
 | 探针 | 做什么 | 通过判据 |
 |---|---|---|
-| `kbtest` | 唤醒 → 截图 → End/Home/PageUp → 再截图，逐张算 FNV 哈希 | 五张哈希与历史一致即"渲染纹丝未动" |
+| `kbtest` | 唤醒 → 截图 → End/Home/PageUp → 再截图，逐张算 FNV 哈希 | 六张哈希与**当前基线**一致 |
 | `dragwake` | 按住左键把光标从面板外拖入面板 | 面板就地弹出；松开移出后自动隐藏 |
 | `dropchk` | OLE 拖放注册状态 | `OleDropTargetInterface=SET` 且 `WS_EX_ACCEPTFILES=set` |
 | `probe2` | 钉死变量测自动隐藏 | 移到面板外后按 3s 宽限 + 150ms 隐藏 |
 | `soak` | 反复唤醒/隐藏，数 GDI/user 句柄与工作集 | 句柄不爬（基线 gdi82/user14，见下） |
 | `starttime` | `CreateProcess` → 托盘就绪的墙钟 | min 值可复现（当前 ~110ms，噪声 ±30ms） |
 | `traytip4` | 托盘悬停提示内容（Win11 XAML 弹层） | 差分检测通过 |
+
+> **`kbtest` 的哈希跟活配置走**：`Rect=`（窗口几何）和 `Cell=`（格子尺寸）变了，
+> 六张哈希就全变——这不是回归。历史哈希 `2C716E5C/978B520C/EA46015E` 属于
+> `Rect=770 333 842 631` + `Cell=56`；你手动拉伸过面板之后基线就成了另一组
+> （当前是 `1163700B/685DFC3B/12576AAB`，Rect=1239 389 540 631）。
+> **判断标准是"本次改动前后一致"，不是"和历史一致"**——几何被人改过就重新记基线。
+> 缩放类探针会把 `Cell=` 写坏，看到哈希集体变化先查配置，别怀疑代码。
 
 ### 配置写出回归
 
@@ -94,9 +101,27 @@ kbtest 的像素哈希就全变了（这坑踩过三次，每次都得从快照�
 | `nametest` | `NameFromPath` 新旧实现逐例 | 0 例差异 |
 | `libtest` | `wcpy/wcat` 对 `wcsncpy_s/wcscat_s`；`S_` 对 `MulDiv` | 24012 例 0 差异 |
 | `fmtfmt` | `wfmt/wToI/wScan*` 对 `swprintf/_wtoi/swscanf` | 65602 例 0 差异 |
+| `parsefuzz` | 三个"吃外来数据"入口的对抗性测试（见下） | 容纳不变式 + 存读往返全过 |
 
-结果写 `tmp\<name>.txt`（避开控制台 orientation 干扰）。这三个是本轮格式化层 /
+结果写 `tmp\<name>.txt`（避开控制台 orientation 干扰）。这几个是本轮格式化层 /
 字符串层 / DPI 宏的安全网，改动那三处后必须重跑。
+
+`parsefuzz` 直接 `#include "../claunch.c"`（把 `wWinMain` 改名避开入口冲突），
+所以测的是**真代码而不是副本**，不拉起窗口：
+
+- `ParseLnkBuf`：随机/畸形 .lnk 缓冲（头长越界、截断、标志全随机）——返回 TRUE
+  的五个字段必须 NUL 收尾
+- `RdLine`：任意字节流 × 任意 cch（含 1）——必须收尾、不许越界、哨兵字节不许动
+- `LoadConfig`：缺字段/多字段/跳号索引/越界组号/非法 UTF-8/超长数字/BOM/随机字节
+  ——之后条目分组不超上限、组号合法、每个字符串收尾
+- **存读往返**：结构化配置 → `LoadConfig` → `SaveConfig` → 再 `LoadConfig`，
+  条目数/条目名/组号/窗口尺寸必须一一还原（这条直接保护用户数据；
+
+  真宿主窗是必须的——`SaveConfig` 的 Rect 来自 `GetWindowRect(g_hwnd)`，
+  给假句柄会让它写出垃圾 Rect，往返断言就变成测脚手架自己）
+- **覆盖计数器**是它的牙齿：`true 333 / RdLine 4967 / 47 条目 / 往返 101 轮带条目`
+  全为 0 就说明什么都没测到（这坑踩过两次：`g_ini` 没设导致配置段空跑、
+  往返写错了路径）
 
 ## 已知失效/已删（勿再找）
 

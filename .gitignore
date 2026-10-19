@@ -20,5 +20,7 @@ desktop.ini
 
 # 探针套件里探针自建的种子配置/输出，源码与 README 入库、产物不入
 tmp/*.txt
+tmp/parsefuzz.*
+tmp/pf/
 tmp/claunch.ini
 tmp/*.obj
