@@ -58,6 +58,7 @@
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
 #define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
+#define TIMER_ICONS     4    // 缩放手势停稳后重解析图标
 #define HOTKEY_ID       1
 #define CAP_CLASS       L"ClaunchCapWnd"     // 热键捕获对话框类
 
@@ -1861,7 +1862,10 @@ static void ApplyCellBase(int v)
     if (v == g_cellBase) return;
     g_cellBase = v;
     UpdateCell();
-    for (int i = 0; i < g_nItems; i++) DropIcon(i);   // 图标尺寸变了：丢掉，下次绘制按新尺寸重载
+    // 图标尺寸变了要按新尺寸重解析，但 Ctrl+滚轮是连续手势：每格都丢等于每格
+    // 重解析一屏图标（~15ms/次，连拨十几格就是几百毫秒的卡顿）。改成手势停稳
+    // 150ms 后一次性丢——期间的旧图标由 DrawIconEx 缩到新尺寸，只差 1~2px
+    SetTimer(g_hwnd, TIMER_ICONS, 150, NULL);   // 连续拨动会不断重置，只在停稳后触发
     ClampScroll();
     InvalidateRect(g_hwnd, NULL, FALSE);
     g_cfgDirty = TRUE;        // 缩放是连续操作：落盘交给心跳防抖，别每格滚轮都写文件
@@ -4495,6 +4499,11 @@ static void OnTimer(HWND h, WPARAM w)
         RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
         InvalidateRect(h, &gr, FALSE);
         OleUpdateOver((POINTL){ g_oleAutoPt.x, g_oleAutoPt.y });
+    } else if (w == TIMER_ICONS) {
+        // 缩放手势停稳：图标尺寸已定，丢掉旧图标，下次绘制按新尺寸重解析
+        KillTimer(h, TIMER_ICONS);
+        for (int i = 0; i < g_nItems; i++) DropIcon(i);
+        InvalidateRect(h, NULL, FALSE);
     }
 }
 
