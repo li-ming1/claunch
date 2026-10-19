@@ -17,6 +17,9 @@
 // .lnk 解析 + CreateProcess 直启替代 ShellExecute、主窗断开 IME、
 // COM/图标管线延迟到唤醒——破防会拖进 15~30MB 外部模块链。
 // 绘制走整窗离屏缓冲：直接绘制在快速滚动时露"画一半"中间帧，频闪。
+// 运行时零依赖：不链 libcmt/ucrt（build.bat 里 /NODEFAULTLIB + /D CLAUNCH_NOCRT）。
+// 宽字符原语、格式化核、配置读写全是自实现；入口、/GS cookie 与两个编译器桩
+// （chkstk.asm）也自己来。量化收益见 build.bat 注释
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
@@ -42,6 +45,48 @@
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "advapi32.lib")   // 开机自启的注册表操作；advapi32 本就经 shell32 间接映射，无新增 DLL
 #pragma comment(lib, "ole32.lib")      // OLE 拖放（回收站等虚拟项拖入）
+
+
+// ---------------------------------------------------------------- 宽字符原语
+// 自己实现的几个：wcslen/wcscmp/wcschr/wcsrchr/wcsstr 在 ucrt 里都拖着整条
+// 宽字符/locale 支持，而这个程序只需要"取长度/比较/找字符"，全是几行循环。
+// 命名加下划线后缀以免与 CRT 同名（将来若链回 CRT 也不会撞）
+__declspec(noinline) size_t wlen_(const WCHAR *s)
+{
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+__declspec(noinline) WCHAR *wchr_(const WCHAR *s, WCHAR c)
+{
+    for (; *s; s++) if (*s == c) return (WCHAR *)s;
+    return NULL;
+}
+
+__declspec(noinline) WCHAR *wrchr_(const WCHAR *s, WCHAR c)
+{
+    WCHAR *last = NULL;
+    for (; *s; s++) if (*s == c) last = (WCHAR *)s;
+    return last;
+}
+
+__declspec(noinline) int wcmp_(const WCHAR *a, const WCHAR *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return (int)*a - (int)*b;
+}
+
+__declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
+{
+    if (!*nd) return (WCHAR *)h;
+    for (; *h; h++) {
+        const WCHAR *a = h, *b = nd;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b) return (WCHAR *)h;
+    }
+    return NULL;
+}
 
 // ---------------------------------------------------------------- 常量
 #define MAX_GROUPS      16
@@ -1000,7 +1045,7 @@ static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
             if (soffu && soffu + 2 <= lisz) {
                 const WCHAR *s = (const WCHAR *)(linfo + soffu);
                 const WCHAR *se = (const WCHAR *)(linfo + lisz);
-                int m = (int)wcslen(li->target);
+                int m = (int)wlen_(li->target);
                 while (s < se && *s && m < MAX_PATH - 1) li->target[m++] = *s++;
                 li->target[m] = 0;
             }
@@ -1009,7 +1054,7 @@ static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
             const char *se = (const char *)(linfo + lisz);
             int r = 0;
             while (s + r < se && s[r]) r++;
-            int m = (int)wcslen(li->target);
+            int m = (int)wlen_(li->target);
             if (r) {
                 MultiByteToWideChar(CP_ACP, 0, s, r, li->target + m, MAX_PATH - m);
                 li->target[MAX_PATH - 1] = 0;
@@ -1017,7 +1062,7 @@ static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
         }
     }
     // ICON_LOCATION 的 ",N" 后缀 → 图标索引；没有则用头部 IconIndex
-    WCHAR *c = wcsrchr(li->iconLoc, L',');
+    WCHAR *c = wrchr_(li->iconLoc, L',');
     if (c && c[1] >= L'0' && c[1] <= L'9') {
         li->iconIdx = wToI(c + 1);
         *c = 0;
@@ -1115,7 +1160,7 @@ static HICON MakeFolderIcon(int sz)
 static BOOL PathCheckable(const WCHAR *path)
 {
     if (path[0] == L'\\' && path[1] == L'\\') return FALSE;   // UNC
-    if (wcsstr(path, L"://")) return FALSE;                   // URL（http://、steam://…）
+    if (wstr_(path, L"://")) return FALSE;                   // URL（http://、steam://…）
     if (path[1] != L':') return TRUE;                        // 相对路径：无盘符
     WCHAR root[4] = { path[0], L':', L'\\', 0 };
     UINT t = GetDriveTypeW(root);             // 查映射表，不产生文件系统 I/O
@@ -1125,7 +1170,7 @@ static BOOL PathCheckable(const WCHAR *path)
 // 扩展名判断：.lnk 检测等处共用（大小写不敏感）
 static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
 {
-    const WCHAR *dot = wcsrchr(path, L'.');
+    const WCHAR *dot = wrchr_(path, L'.');
     return dot && SameTextI(dot, ext);
 }
 
@@ -1142,17 +1187,17 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
     int idx = 0;
     WCHAR *icon = val;
     if (*icon == L'"') {                       // "带引号的路径",索引
-        WCHAR *e = wcschr(icon + 1, L'"');
+        WCHAR *e = wchr_(icon + 1, L'"');
         if (!e) return NULL;
         *e = 0;
         if (e[1] == L',') idx = wToI(e + 2);
         icon = icon + 1;
     } else {
-        WCHAR *c = wcsrchr(icon, L',');        // 从右往左找逗号（路径可能含逗号）
+        WCHAR *c = wrchr_(icon, L',');        // 从右往左找逗号（路径可能含逗号）
         if (c && c[1]) { *c = 0; idx = wToI(c + 1); }
     }
     if (!icon[0]) return NULL;
-    if (!wcscmp(icon, L"%1") || !wcscmp(icon, L"%0")) icon = (WCHAR *)src;
+    if (!wcmp_(icon, L"%1") || !wcmp_(icon, L"%0")) icon = (WCHAR *)src;
     return IconFromImage(icon, want, idx);
 }
 
@@ -1162,8 +1207,8 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
 // 用户已换掉的旧关联图标
 static HICON AssocIcon(const WCHAR *path, int want)
 {
-    const WCHAR *ext = wcsrchr(path, L'.');
-    if (!ext || wcslen(ext) < 2 || wcslen(ext) > 30) return NULL;
+    const WCHAR *ext = wrchr_(path, L'.');
+    if (!ext || wlen_(ext) < 2 || wlen_(ext) > 30) return NULL;
     WCHAR key[300];
     WCHAR uc[300];
     if (wfmt(uc, 300,
@@ -1344,9 +1389,9 @@ static int AddItemRaw(const WCHAR *name, const WCHAR *path, int group,
 
 static void NameFromPath(const WCHAR *path, WCHAR *out, int cch)
 {
-    const WCHAR *p = wcsrchr(path, L'\\');
+    const WCHAR *p = wrchr_(path, L'\\');
     p = p ? p + 1 : path;
-    const WCHAR *dot = wcsrchr(p, L'.');
+    const WCHAR *dot = wrchr_(p, L'.');
     // 只剥"真扩展名"：点必须落在首字符之后。".workbuddy"/".gitignore" 这类
     // 点开头的名字（隐藏目录/文件的命名习惯）从首字符剥会剩一个 "."，
     // 连同 "archive.tar.gz" 只剥最后一截的规则一样，都是取"最后一个真扩展名"。
@@ -1625,7 +1670,7 @@ static void OpenLocation(const WCHAR *path)
 static void IniPath(void)
 {
     GetModuleFileNameW(NULL, g_ini, MAX_PATH);
-    WCHAR *p = wcsrchr(g_ini, L'\\');
+    WCHAR *p = wrchr_(g_ini, L'\\');
     if (p) p[1] = 0;
     wcat(g_ini, MAX_PATH, ININAME);
 }
@@ -1647,7 +1692,7 @@ static BOOL RdLine(RdCtx *r, WCHAR *out, int cch)
     // 行缓冲按"字节"算，而写侧 FmtLine 按 1200 个 WCHAR 封顶——一条含
     // 中文路径的行（每字 UTF-8 至多 3 字节）可到 3600 字节，缓冲小于它
     // 就会把超出的字段静默截掉（读回的路径/参数损坏）。给足最坏值
-    BYTE line[4096];
+    static BYTE line[4096];      // 静态化：帧压在 4KB 以下，编译器不发 __chkstk
     int n = 0;
     for (;;) {
         if (r->pos >= r->len && !RdRefill(r)) {
@@ -1734,14 +1779,14 @@ static void LoadConfig(void)
             continue;
         }
         if (!line[0] || line[0] == L'#' || line[0] == L';') continue;
-        WCHAR *eq = wcschr(line, L'=');
+        WCHAR *eq = wchr_(line, L'=');
         if (!eq) continue;
         *eq = 0;
         WCHAR *key = line, *val = eq + 1;
 
-        if (!wcscmp(section, L"Main")) {
-            if (!wcscmp(key, L"Pinned"))  g_pinned = wToI(val) ? TRUE : FALSE;
-            else if (!wcscmp(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
+        if (!wcmp_(section, L"Main")) {
+            if (!wcmp_(key, L"Pinned"))  g_pinned = wToI(val) ? TRUE : FALSE;
+            else if (!wcmp_(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
                 unsigned mm = 0, vv = 0;
                 if (wScanU2(val, &mm, &vv) == 2 &&
                     (mm & (MOD_CONTROL | MOD_ALT)) &&                 // 至少 Ctrl/Alt 之一
@@ -1752,12 +1797,12 @@ static void LoadConfig(void)
                     g_hotVk = vv;
                 }
             }
-            else if (!wcscmp(key, L"Group"))   g_curGroup = wToI(val);
-            else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(wToI(val));
-            else if (!wcscmp(key, L"Rect"))    wcpy(rect, 64, val);
-        } else if (!wcscmp(section, L"Groups")) {
+            else if (!wcmp_(key, L"Group"))   g_curGroup = wToI(val);
+            else if (!wcmp_(key, L"Cell"))    g_cellBase = ClampCellBase(wToI(val));
+            else if (!wcmp_(key, L"Rect"))    wcpy(rect, 64, val);
+        } else if (!wcmp_(section, L"Groups")) {
             if (key[0] == L'G' && wToI(key + 1) == g_nGroups) AddGroup(val);
-        } else if (!wcscmp(section, L"Items")) {
+        } else if (!wcmp_(section, L"Items")) {
             if (key[0] != L'I') continue;
             if (wToI(key + 1) != g_nItems) continue;
             WCHAR *f[5] = { 0, 0, 0, 0, 0 };
@@ -1765,7 +1810,7 @@ static void LoadConfig(void)
             WCHAR *p = val;
             while (nf < 5) {
                 f[nf++] = p;
-                WCHAR *b = wcschr(p, L'|');
+                WCHAR *b = wchr_(p, L'|');
                 if (!b) break;
                 *b = 0;
                 p = b + 1;
@@ -1801,8 +1846,8 @@ static void SaveConfig(void)
     // 换名取等长替换（claunch.ini→claunch.tmp 同 11 字符），无路径拼接溢出风险
     WCHAR tmp[MAX_PATH];
     wcpy(tmp, MAX_PATH, g_ini);
-    SIZE_T len = wcslen(tmp);
-    if (len < 11 || wcscmp(tmp + len - 11, L"claunch.ini")) return;   // ini 名不符预期：防呆不写
+    SIZE_T len = wlen_(tmp);
+    if (len < 11 || wcmp_(tmp + len - 11, L"claunch.ini")) return;   // ini 名不符预期：防呆不写
     wcpy(tmp + len - 11, 12, L"claunch.tmp");
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1901,7 +1946,7 @@ static BOOL ClipSet(const ClipItem *ci)
             }
         }
     }
-    size_t cb = (wcslen(ci->path) + 1) * sizeof(WCHAR);
+    size_t cb = (wlen_(ci->path) + 1) * sizeof(WCHAR);
     HGLOBAL ht = GlobalAlloc(GMEM_MOVEABLE, cb);
     if (ht) {
         WCHAR *dst = (WCHAR *)GlobalLock(ht);
@@ -2201,7 +2246,7 @@ static void MakeFontsAndBrushes(void)
 // 比较放在写入前，调用方不必拷旧文字来对比（超长按显示的前 79 字符比）
 static BOOL SetHover(const WCHAR *s, BOOL active)
 {
-    BOOL chg = active != g_hoverActive || wcscmp(s, g_hoverText) != 0;
+    BOOL chg = active != g_hoverActive || wcmp_(s, g_hoverText) != 0;
     wcpy(g_hoverText, 80, s);
     g_hoverActive = active;
     return chg;
@@ -2722,6 +2767,20 @@ static void PaintWindow(HDC dc, const RECT *clip)
     SelectObject(dc, old);
 }
 
+// comdlg32 手写延迟加载："浏览"按钮才用到。/DELAYLOAD 要拖 delayimp 与 load
+// config 依赖，自己 LoadLibrary 更干净——导入表上也彻底没有 comdlg32 这一项
+typedef BOOL (WINAPI *PFN_GetOpenFileNameW)(LPOPENFILENAMEW);
+
+static PFN_GetOpenFileNameW GetOpenFileProc(void)
+{
+    static PFN_GetOpenFileNameW p;
+    if (!p) {
+        HMODULE h = LoadLibraryW(L"comdlg32.dll");
+        if (h) p = (PFN_GetOpenFileNameW)GetProcAddress(h, "GetOpenFileNameW");
+    }
+    return p;
+}
+
 // ---------------------------------------------------------------- 对话框（格子属性 / 重命名）
 typedef struct {
     HWND     hwnd;
@@ -2750,7 +2809,8 @@ static void BrowseForFile(HWND edit)
     // 而无工作目录的条目直启时 lpCurrentDirectory=NULL（继承我们的 CWD）——
     // 不拦这一下，浏览过一次之后所有启动的 CWD 都漂了
     of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
-    if (GetOpenFileNameW(&of)) SetWindowTextW(edit, file);
+    PFN_GetOpenFileNameW fn = GetOpenFileProc();
+    if (fn && fn(&of)) SetWindowTextW(edit, file);
 }
 
 // ---------------------------------------------------------------- 对话框：消息处理
@@ -2961,7 +3021,7 @@ static BOOL SetAutostart(BOOL on)
         GetModuleFileNameW(NULL, path, MAX_PATH);
         wfmt(cmd, MAX_PATH + 4, L"\"%s\"", path);   // 路径可能含空格：加引号
         r = RegSetValueExW(k, APPNAME, 0, REG_SZ, (const BYTE *)cmd,
-                           (DWORD)(wcslen(cmd) + 1) * sizeof(WCHAR));
+                           (DWORD)(wlen_(cmd) + 1) * sizeof(WCHAR));
     } else {
         r = RegDeleteValueW(k, APPNAME);
         if (r == ERROR_FILE_NOT_FOUND) r = ERROR_SUCCESS;   // 本来就没有：算成功
@@ -2987,10 +3047,10 @@ static void InitAutostart(void)
     g_autostart = QueryAutostart(runPath, MAX_PATH + 8);
     if (!g_autostart) return;
     WCHAR *q = runPath;                       // 写入时加了引号，比对前剥掉
-    if (*q == L'"') { q++; WCHAR *e = wcschr(q, L'"'); if (e) *e = 0; }
+    if (*q == L'"') { q++; WCHAR *e = wchr_(q, L'"'); if (e) *e = 0; }
     WCHAR self[MAX_PATH];
     GetModuleFileNameW(NULL, self, MAX_PATH);
-    if (wcscmp(q, self) != 0) SetAutostart(TRUE);
+    if (wcmp_(q, self) != 0) SetAutostart(TRUE);
 }
 
 // ---------------------------------------------------------------- 托盘
@@ -3301,7 +3361,7 @@ static void ShowCellMenu(int vi)
             { L"工具提示(T):", it->tip,  96,       0 },
         };
         if (RunDialog(g_hwnd, L"格子属性", f, 4)) {
-            if (wcscmp(oldPath, it->path))   // 目标变了：丢掉旧图标，绘制时按新目标重载
+            if (wcmp_(oldPath, it->path))   // 目标变了：丢掉旧图标，绘制时按新目标重载
                 DropIcon(ii);
             SyncAndSave();
         }
@@ -3365,8 +3425,8 @@ static HWND DesktopListViewFrom(HWND h)
     for (HWND w = h; w; w = GetParent(w)) {
         WCHAR cls[64];
         GetClassNameW(w, cls, 64);
-        if (!wcscmp(cls, L"SysListView32")) return w;
-        if (!wcscmp(cls, L"SHELLDLL_DefView"))
+        if (!wcmp_(cls, L"SysListView32")) return w;
+        if (!wcmp_(cls, L"SHELLDLL_DefView"))
             return FindWindowExW(w, NULL, L"SysListView32", NULL);
     }
     return NULL;
@@ -3412,7 +3472,7 @@ static BOOL IsDesktopPoint(POINT pt)
     if (!root) return FALSE;
     WCHAR cls[64];
     GetClassNameW(root, cls, 64);
-    if (wcscmp(cls, L"Progman") && wcscmp(cls, L"WorkerW")) return FALSE;
+    if (wcmp_(cls, L"Progman") && wcmp_(cls, L"WorkerW")) return FALSE;
 
     // 桌面图标和桌面空白的根窗口都是 Progman/WorkerW，过不了上面的检查只是说明
     // “在桌面上”。双击桌面图标是要启动程序，不能顺带唤醒面板——再拿落点在桌面
@@ -3538,7 +3598,7 @@ static const struct { UINT vk; const WCHAR *name; } VK_NAMES[] = {
 static void HotkeyName(WCHAR *out, int cch)
 {
     ModsName(out, cch, g_hotMods);
-    int n = (int)wcslen(out);
+    int n = (int)wlen_(out);
     UINT vk = g_hotVk;
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
         if (n + 1 < cch) { out[n] = (WCHAR)vk; out[n + 1] = 0; }
@@ -4050,14 +4110,14 @@ static void OnChar(WPARAM w)
     if (g_dlgOpen || g_pressCell >= 0) return;
     if (w == 0x08) {                              // 退格：删一个字符
         if (!g_filter[0]) return;
-        int n = (int)wcslen(g_filter);
+        int n = (int)wlen_(g_filter);
         g_filter[n - 1] = 0;
         ApplyFilter();
         return;
     }
     if (w < 32) return;                         // 其余控制字符不管
     if (w >= '1' && w <= '9' && !g_filter[0]) return;   // 空过滤时数字键归 WM_KEYDOWN 快速启动
-    int n = (int)wcslen(g_filter);
+    int n = (int)wlen_(g_filter);
     if (n >= 20) return;                        // 过滤词上限 20 字符
     g_filter[n++] = (WCHAR)w;
     g_filter[n] = 0;
@@ -4336,7 +4396,13 @@ static IDropTarget g_drop;
 static HRESULT __stdcall DtQueryInterface(IDropTarget *self, REFIID riid, void **out)
 {
     UNREF(self);
-    if (out && (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropTarget))) {
+    // IID_IUnknown / IID_IDropTarget 是 COM ABI 的固定值，自己定义即可（不引
+    // uuid.lib）；逐字节比 16 字节与 IsEqualIID 完全等价
+    static const IID kIID_IUnknown    = { 0x00000000, 0x0000, 0x0000,
+                                          { 0xC0,0,0,0,0,0,0,0x46 } };
+    static const IID kIID_IDropTarget = { 0x00000122, 0x0000, 0x0000,
+                                          { 0xC0,0,0,0,0,0,0,0x46 } };
+    if (out && (memcmp(riid, &kIID_IUnknown, 16) == 0 || memcmp(riid, &kIID_IDropTarget, 16) == 0)) {
         *out = (void *)&g_drop;
         return S_OK;
     }
@@ -4634,7 +4700,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
     WCHAR path[MAX_PATH];
     GetModuleFileNameW(NULL, path, MAX_PATH);
-    WCHAR *slash = wcsrchr(path, L'\\');
+    WCHAR *slash = wrchr_(path, L'\\');
     if (slash) slash[1] = 0;
     wcat(path, MAX_PATH, L"claunch_crash.txt");
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
@@ -4664,7 +4730,7 @@ static BOOL CALLBACK FindLauncherCb(HWND h, LPARAM lp)
     WCHAR cls[64];
     UNREF(lp);
     GetClassNameW(h, cls, 64);
-    if (!wcscmp(cls, APP_CLASS)) { g_searchHit = h; return FALSE; }
+    if (!wcmp_(cls, APP_CLASS)) { g_searchHit = h; return FALSE; }
     return TRUE;
 }
 
@@ -4690,9 +4756,8 @@ static ATOM RegClass(const WCHAR *name, WNDPROC proc)
     return RegisterClassExW(&wc);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
+static int AppMain(HINSTANCE inst)
 {
-    UNREF(prev); UNREF(cmd); UNREF(show);
     g_inst = inst;
 
     // 单实例权威判定：命名互斥体（窗口类检查有 race——同时启动互查不到对方
@@ -4767,3 +4832,55 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     }
     return (int)msg.wParam;
 }
+
+
+// ---------------------------------------------------------------- 入口
+// CLAUNCH_NOCRT：不链 CRT（libcmt/ucrt）的入口自举。同样内容的开关在 build.bat
+// 里由 /D CLAUNCH_NOCRT + /NODEFAULTLIB + /ENTRY:wWinMainCRTStartup 打开。
+// 少掉的正是 CRT 的启动开销（空 GUI 程序的地板就有 102KB）
+#ifndef CLAUNCH_NOCRT
+// 链回 CRT 时的入口壳子：CRT 启动后调 wWinMain，我们只做 AppMain 的转发
+int WINAPI wWinMain(HINSTANCE a, HINSTANCE b, LPWSTR c, int d)
+{
+    UNREF(b); UNREF(c); UNREF(d);
+    return AppMain(a);
+}
+#endif
+
+#ifdef CLAUNCH_NOCRT
+
+// /GS 安全 cookie：uCRT 的存储与初始化都不在，自己来。熵用时间戳与栈地址
+// 抖动——比 uCRT 的多源熵弱，但比没有强得多
+uintptr_t __security_cookie = 0x00002B992DDFA232ULL;
+
+void __cdecl __security_init_cookie(void)   // 签名与 vcruntime.h 一致
+{
+    uintptr_t c = (uintptr_t)GetTickCount64();
+    c ^= (uintptr_t)&c;
+    c ^= c >> 32;
+    if (c < 0x1000) c |= 0x1000;             // 太小等于没有
+    __security_cookie = c;
+}
+
+__declspec(noinline) void __security_check_cookie(uintptr_t cookie)
+{
+    if (cookie != __security_cookie) __fastfail(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE);
+}
+
+__declspec(noreturn) void __report_rangecheckfailure(void)
+{
+    __fastfail(FAST_FAIL_RANGE_CHECK_FAILURE);
+}
+
+// __chkstk 与 __GSHandlerCheck 是编译器/汇编侧的桩，见 chkstk.asm
+
+// 入口：没有 CRT，自己取模块句柄；跑完直接 ExitProcess。
+// 注意 __security_init_cookie 必须在任何带 cookie 的函数之前跑
+void __stdcall wWinMainCRTStartup(void)
+{
+    __security_init_cookie();
+    g_inst = GetModuleHandleW(NULL);
+    ExitProcess((UINT)AppMain(g_inst));
+}
+
+#endif // CLAUNCH_NOCRT
