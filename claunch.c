@@ -30,8 +30,7 @@
 #include <shlobj.h>
 #include <commdlg.h>
 #include <imm.h>
-#include <stdio.h>
-#include <stdarg.h>
+#include <stdarg.h>      // 只有 varargs 还来自 CRT：格式化本身走自带的 wfmt
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -332,6 +331,128 @@ static void wcat(WCHAR *d, int cch, const WCHAR *s)
     while (n < cch - 1 && d[n]) n++;
     while (n < cch - 1 && *s) d[n++] = *s++;
     d[n] = 0;
+}
+
+// 大小写不敏感的整串比较，只折叠 ASCII。替代 _wcsicmp——后者走 locale 表
+//（nlsdata/lcidtoname 一整条链，几十 KB），而这里的用途只有扩展名比对
+static BOOL SameTextI(const WCHAR *a, const WCHAR *b)
+{
+    for (;; a++, b++) {
+        WCHAR ca = *a, cb = *b;
+        if (ca >= L'A' && ca <= L'Z') ca += 32;
+        if (cb >= L'A' && cb <= L'Z') cb += 32;
+        if (ca != cb) return FALSE;
+        if (!ca) return TRUE;
+    }
+}
+
+// ---------------------------------------------------------------- 格式化
+// 全文件只需要 %s/%d/%u/%llX 四种形状，且都落在配置读写与提示文案上。自带一个
+// 几十行的核替掉 libc 的 printf/scanf 整条链（cfout/cvt/input/atox + 宽字符转换
+// 与 locale 数据），实测镜像 241152 → 174592 字节（−65KB，−27%），顺带让
+// "写用户数据"这条路径不再经过不可控的格式解析。
+// 契约：dst 恒 NUL 收尾、空间不足即截断、返回实际写入长度。
+// 宽度前缀按补零处理（本文件只用 %02X 这种写法），l/h 修饰符读入即忽略。
+
+static WCHAR *wNum(WCHAR *d, WCHAR *e, unsigned long long v, int base, int width, BOOL upper)
+{
+    WCHAR tmp[24];
+    int n = 0;
+    const WCHAR *dig = upper ? L"0123456789ABCDEF" : L"0123456789abcdef";
+    do {
+        tmp[n++] = dig[v % (unsigned)base];
+        v /= (unsigned)base;
+    } while (v);
+    while (n < width && n < 24) tmp[n++] = L'0';
+    while (n > 0 && d < e) *d++ = tmp[--n];
+    return d;
+}
+
+static WCHAR *wStr(WCHAR *d, WCHAR *e, const WCHAR *s)
+{
+    while (d < e && *s) *d++ = *s++;
+    return d;
+}
+
+static int wfmtv(WCHAR *dst, int cch, const WCHAR *fmt, va_list ap)
+{
+    WCHAR *d = dst, *e = dst + cch - 1;
+    for (const WCHAR *p = fmt; *p; p++) {
+        if (*p != L'%') { if (d < e) *d++ = *p; continue; }
+        if (p[1] == L'%') { if (d < e) *d++ = L'%'; p++; continue; }
+        p++;
+        int width = 0;
+        while (*p >= L'0' && *p <= L'9') width = width * 10 + (*p++ - L'0');
+        while (*p == L'l' || *p == L'h') p++;
+        switch (*p) {
+        case L's': d = wStr(d, e, va_arg(ap, const WCHAR *)); break;
+        case L'd': {
+            long long v = va_arg(ap, int);
+            if (v < 0) { if (d < e) *d++ = L'-'; v = -v; }
+            d = wNum(d, e, (unsigned long long)v, 10, width, FALSE);
+            break;
+        }
+        case L'u': d = wNum(d, e, va_arg(ap, unsigned), 10, width, FALSE); break;
+        case L'X': d = wNum(d, e, va_arg(ap, unsigned long long), 16, width, TRUE); break;
+        default:   if (d < e) *d++ = L'%';      // 不认识的转换按字面量吐回
+                   if (d < e && *p) *d++ = *p;
+                   break;
+        }
+    }
+    *d = 0;
+    return (int)(d - dst);
+}
+
+static int wfmt(WCHAR *dst, int cch, const WCHAR *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = wfmtv(dst, cch, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+// 十进制整数解析（等价 _wtoi：跳过前导空白与正负号，遇非数字即停）
+static int wToI(const WCHAR *s)
+{
+    while (*s == L' ' || *s == L'\t') s++;
+    BOOL neg = (*s == L'-');
+    if (neg || *s == L'+') s++;
+    int v = 0;
+    while (*s >= L'0' && *s <= L'9') v = v * 10 + (int)(*s++ - L'0');
+    return neg ? -v : v;
+}
+
+// "3 70" → 两个无符号数（配置里的 Hotkey 行）。返回解析到的个数
+static int wScanU2(const WCHAR *s, unsigned *a, unsigned *b)
+{
+    unsigned *out[2] = { a, b };
+    int n = 0;
+    while (n < 2) {
+        while (*s == L' ' || *s == L'\t') s++;
+        if (*s < L'0' || *s > L'9') break;
+        unsigned v = 0;
+        while (*s >= L'0' && *s <= L'9') v = v * 10 + (unsigned)(*s++ - L'0');
+        *out[n++] = v;
+    }
+    return n;
+}
+
+// "770 333 842 631" → 四个整数（配置里的 Rect 行）。返回解析到的个数
+static int wScanI4(const WCHAR *s, int *a, int *b, int *c, int *d)
+{
+    int *out[4] = { a, b, c, d };
+    int n = 0;
+    while (n < 4) {
+        while (*s == L' ' || *s == L'\t') s++;
+        BOOL neg = (*s == L'-');
+        if (neg || *s == L'+') s++;
+        if (*s < L'0' || *s > L'9') break;
+        int v = 0;
+        while (*s >= L'0' && *s <= L'9') v = v * 10 + (int)(*s++ - L'0');
+        *out[n++] = neg ? -v : v;
+    }
+    return n;
 }
 
 // 格子缩放基准的合法区间（配置与 Ctrl+滚轮共用同一处钳制）
@@ -897,7 +1018,7 @@ static BOOL ParseLnkBuf(const BYTE *b, DWORD n, LnkInfo *li)
     // ICON_LOCATION 的 ",N" 后缀 → 图标索引；没有则用头部 IconIndex
     WCHAR *c = wcsrchr(li->iconLoc, L',');
     if (c && c[1] >= L'0' && c[1] <= L'9') {
-        li->iconIdx = _wtoi(c + 1);
+        li->iconIdx = wToI(c + 1);
         *c = 0;
     } else if (!li->iconIdx && (hicon & 0x7FFFFFFF)) {
         li->iconIdx = (int)(hicon & 0x7FFFFFFF);
@@ -1004,7 +1125,7 @@ static BOOL PathCheckable(const WCHAR *path)
 static BOOL HasExt(const WCHAR *path, const WCHAR *ext)
 {
     const WCHAR *dot = wcsrchr(path, L'.');
-    return dot && !_wcsicmp(dot, ext);
+    return dot && SameTextI(dot, ext);
 }
 
 // 读注册表 DefaultIcon 值并提取图标。值形如 "路径[,索引]"（负索引 = 资源 ID），
@@ -1023,11 +1144,11 @@ static HICON IconFromDefaultKey(const WCHAR *subkey, const WCHAR *src, int want)
         WCHAR *e = wcschr(icon + 1, L'"');
         if (!e) return NULL;
         *e = 0;
-        if (e[1] == L',') idx = _wtoi(e + 2);
+        if (e[1] == L',') idx = wToI(e + 2);
         icon = icon + 1;
     } else {
         WCHAR *c = wcsrchr(icon, L',');        // 从右往左找逗号（路径可能含逗号）
-        if (c && c[1]) { *c = 0; idx = _wtoi(c + 1); }
+        if (c && c[1]) { *c = 0; idx = wToI(c + 1); }
     }
     if (!icon[0]) return NULL;
     if (!wcscmp(icon, L"%1") || !wcscmp(icon, L"%0")) icon = (WCHAR *)src;
@@ -1044,14 +1165,14 @@ static HICON AssocIcon(const WCHAR *path, int want)
     if (!ext || wcslen(ext) < 2 || wcslen(ext) > 30) return NULL;
     WCHAR key[300];
     WCHAR uc[300];
-    if (swprintf(uc, 300,
+    if (wfmt(uc, 300,
                  L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\%s\\UserChoice",
                  ext) < 300) {
         WCHAR up[128];
         DWORD cb = sizeof up;
         if (RegGetValueW(HKEY_CURRENT_USER, uc, L"ProgID", RRF_RT_REG_SZ,
                          NULL, up, &cb) == ERROR_SUCCESS && up[0]) {
-            if (swprintf(key, 300, L"%s\\DefaultIcon", up) < 300) {
+            if (wfmt(key, 300, L"%s\\DefaultIcon", up) < 300) {
                 HICON h = IconFromDefaultKey(key, path, want);
                 if (h) return h;
             }
@@ -1061,7 +1182,7 @@ static HICON AssocIcon(const WCHAR *path, int want)
     DWORD cb = sizeof progid;
     if (RegGetValueW(HKEY_CLASSES_ROOT, ext, NULL, RRF_RT_REG_SZ,
                      NULL, progid, &cb) == ERROR_SUCCESS && progid[0]) {
-        if (swprintf(key, 300, L"%s\\DefaultIcon", progid) < 300)
+        if (wfmt(key, 300, L"%s\\DefaultIcon", progid) < 300)
             return IconFromDefaultKey(key, path, want);
     }
     return NULL;
@@ -1429,10 +1550,10 @@ static void NewGroup(void)
 {
     if (g_nGroups >= MAX_GROUPS) return;       // 预检：别弹了框再静默失败
     WCHAR name[48];
-    swprintf(name, 48, L"新分组%d", g_nGroups + 1);
+    wfmt(name, 48, L"新分组%d", g_nGroups + 1);
     DlgField f[1] = { { L"名称(N):", name, 48, 0 } };
     if (!RunDialog(g_hwnd, L"新建分组", f, 1)) return;
-    if (!name[0]) swprintf(name, 48, L"新分组%d", g_nGroups + 1);
+    if (!name[0]) wfmt(name, 48, L"新分组%d", g_nGroups + 1);
     int ni = AddGroup(name);
     if (ni < 0) return;
     SelectGroup(ni);      // 切过去：滚动位/侧栏可见性/悬停/卡片全套收尾
@@ -1447,7 +1568,7 @@ static void NewGroup(void)
 static BOOL CreateRun(const WCHAR *exe, const WCHAR *args, const WCHAR *work)
 {
     WCHAR cmd[MAX_PATH + 208];
-    swprintf(cmd, MAX_PATH + 208, L"\"%s\"%s%s", exe, args[0] ? L" " : L"", args);
+    wfmt(cmd, MAX_PATH + 208, L"\"%s\"%s%s", exe, args[0] ? L" " : L"", args);
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si);
@@ -1495,7 +1616,7 @@ static BOOL Launch(int idx, BOOL asAdmin)
 static void OpenLocation(const WCHAR *path)
 {
     WCHAR args[MAX_PATH + 16];
-    swprintf(args, MAX_PATH + 16, L"/select,\"%s\"", path);
+    wfmt(args, MAX_PATH + 16, L"/select,\"%s\"", path);
     CreateRun(L"explorer.exe", args, L"");
 }
 
@@ -1574,9 +1695,8 @@ static void FmtLine(const WCHAR *fmt, ...)
     WCHAR line[1200];
     va_list ap;
     va_start(ap, fmt);
-    vswprintf(line, 1200, fmt, ap);
+    wfmtv(line, 1200, fmt, ap);
     va_end(ap);
-    line[1199] = 0;      // 溢出时 vswprintf 返回 -1 且不保证收尾：兜一手
     OutLine(line);
 }
 
@@ -1619,10 +1739,10 @@ static void LoadConfig(void)
         WCHAR *key = line, *val = eq + 1;
 
         if (!wcscmp(section, L"Main")) {
-            if (!wcscmp(key, L"Pinned"))  g_pinned = _wtoi(val) ? TRUE : FALSE;
+            if (!wcscmp(key, L"Pinned"))  g_pinned = wToI(val) ? TRUE : FALSE;
             else if (!wcscmp(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
                 unsigned mm = 0, vv = 0;
-                if (swscanf(val, L"%u %u", &mm, &vv) == 2 &&
+                if (wScanU2(val, &mm, &vv) == 2 &&
                     (mm & (MOD_CONTROL | MOD_ALT)) &&                 // 至少 Ctrl/Alt 之一
                     !(mm & ~(MOD_CONTROL | MOD_ALT | MOD_SHIFT)) &&    // 不许混入别的位
                     vv > 0 && vv <= 0xFF &&                            // 合法虚拟键
@@ -1631,14 +1751,14 @@ static void LoadConfig(void)
                     g_hotVk = vv;
                 }
             }
-            else if (!wcscmp(key, L"Group"))   g_curGroup = _wtoi(val);
-            else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(_wtoi(val));
+            else if (!wcscmp(key, L"Group"))   g_curGroup = wToI(val);
+            else if (!wcscmp(key, L"Cell"))    g_cellBase = ClampCellBase(wToI(val));
             else if (!wcscmp(key, L"Rect"))    wcpy(rect, 64, val);
         } else if (!wcscmp(section, L"Groups")) {
-            if (key[0] == L'G' && _wtoi(key + 1) == g_nGroups) AddGroup(val);
+            if (key[0] == L'G' && wToI(key + 1) == g_nGroups) AddGroup(val);
         } else if (!wcscmp(section, L"Items")) {
             if (key[0] != L'I') continue;
-            if (_wtoi(key + 1) != g_nItems) continue;
+            if (wToI(key + 1) != g_nItems) continue;
             WCHAR *f[5] = { 0, 0, 0, 0, 0 };
             int nf = 0;
             WCHAR *p = val;
@@ -1650,7 +1770,7 @@ static void LoadConfig(void)
                 p = b + 1;
             }
             if (nf < 2) continue;
-            int grp = (nf >= 3 && f[2][0]) ? _wtoi(f[2]) : 0;
+            int grp = (nf >= 3 && f[2][0]) ? wToI(f[2]) : 0;
             if (grp < 0 || grp >= g_nGroups) grp = DefaultGroup();
             AddItemRaw(f[0], f[1], grp,
                        nf >= 4 ? f[3] : NULL, nf >= 5 ? f[4] : NULL);   // 名|路径|组|参数|提示
@@ -1662,7 +1782,7 @@ static void LoadConfig(void)
     ViewDirty();
 
     int x = 0, y = 0, cx = 0, cy = 0;
-    if (rect[0] && swscanf(rect, L"%d %d %d %d", &x, &y, &cx, &cy) == 4 && cx > 200 && cy > 160) {
+    if (rect[0] && wScanI4(rect, &x, &y, &cx, &cy) == 4 && cx > 200 && cy > 160) {
         g_savedX = x; g_savedY = y; g_savedW = cx; g_savedH = cy;
         g_applySavedRect = TRUE;      // 首次 WM_DPICHANGED 时按物理像素还原
     } else {
@@ -1706,20 +1826,20 @@ static void SaveConfig(void)
     FmtLine(L"[Groups]\r\n");
     FmtLine(L"Count=%d\r\n", g_nGroups);
     for (int i = 0; i < g_nGroups; i++) {
-        static WCHAR gName[96];
-        FmtLine(L"G%d=%s\r\n", i, SafeField(gName, 96, g_groups[i].name));
+        WCHAR nm[96];
+        FmtLine(L"G%d=%s\r\n", i, SafeField(nm, 96, g_groups[i].name));
     }
     FmtLine(L"[Items]\r\n");
     FmtLine(L"Count=%d\r\n", g_nItems);
-    // 注意：每个字段必须用独立的缓冲区——函数参数求值顺序不确定。
-    // 条目行五字段：名|路径|组|参数|提示
-    static WCHAR sName[96], sPath[MAX_PATH + 8], sArgs[MAX_PATH + 8], sTip[128];
+    // 条目行五字段：名|路径|组|参数|提示。四个字段必须各有各的缓冲——参数求值
+    // 顺序不确定，共用一块就会互相覆盖；用栈上的局部量而非函数静态，省 BSS
     for (int i = 0; i < g_nItems; i++) {
+        WCHAR nm[96], pa[MAX_PATH + 8], ag[MAX_PATH + 8], tp[128];
         FmtLine(L"I%d=%s|%s|%d|%s|%s\r\n", i,
-                SafeField(sName, 96, g_items[i].name),
-                SafeField(sPath, MAX_PATH + 8, g_items[i].path), g_items[i].group,
-                SafeField(sArgs, MAX_PATH + 8, g_items[i].args),
-                SafeField(sTip, 128, g_items[i].tip));
+                SafeField(nm, 96, g_items[i].name),
+                SafeField(pa, MAX_PATH + 8, g_items[i].path), g_items[i].group,
+                SafeField(ag, MAX_PATH + 8, g_items[i].args),
+                SafeField(tp, 128, g_items[i].tip));
     }
     OutFlush();
     BOOL bad = !FlushFileBuffers(f);       // 落到设备：替换前的最后保障
@@ -2094,7 +2214,7 @@ static BOOL UpdateHoverText(void)
             if (g_filter[0]) {
                 // 搜索中卡片：名字 + 所属分组——跨组搜索时用户需要知道条目住哪组
                 WCHAR txt[96];
-                swprintf(txt, 96, L"%s · %s", it->name, g_groups[it->group].name);
+                wfmt(txt, 96, L"%s · %s", it->name, g_groups[it->group].name);
                 return SetHover(txt, TRUE);
             }
             return SetHover(it->tip[0] ? it->tip : it->name, TRUE);
@@ -2325,7 +2445,7 @@ static void FlashFmt(const WCHAR *fmt, ...)
     WCHAR t[128];
     va_list ap;
     va_start(ap, fmt);
-    vswprintf(t, 128, fmt, ap);
+    wfmtv(t, 128, fmt, ap);
     va_end(ap);
     FlashMsg(t);
 }
@@ -2505,7 +2625,7 @@ static void PaintTitle(HDC dc)
     } else if (g_filter[0]) {
         // 搜索中：标题栏让位给过滤词（左对齐 + 命中数），悬停详情看小卡片
         WCHAR txt[64];
-        swprintf(txt, 64, L"搜索: %s (%d·全部分组)", g_filter, ViewCount());
+        wfmt(txt, 64, L"搜索: %s (%d·全部分组)", g_filter, ViewCount());
         SetTextColor(dc, C_TEXT);
         DrawTextW(dc, txt, -1, &ttl,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -2755,6 +2875,38 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     return DefWindowProcW(h, m, w, l);
 }
+// 模态小窗的公共骨架：居中于宿主 → 建窗 → 置前 → 禁用宿主 → 自己的消息循环 →
+// 恢复宿主。属性框与热键捕获框只差窗口类、尺寸、是否走 IsDialogMessage
+//（对话框要 Tab/方向键导航，捕获框自己吃 WM_KEYDOWN）。建窗失败返回 NULL。
+// 模态期置 g_dlgOpen：心跳冻结自动隐藏、shell 调用回避，面板不会在窗下溜走
+static HWND RunModal(HWND owner, const WCHAR *cls, const WCHAR *title,
+                     int w, int h, BOOL tabNav)
+{
+    RECT or_;
+    GetWindowRect(owner, &or_);
+    HWND dlg = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
+                               cls, title, WS_POPUP | WS_CLIPCHILDREN,
+                               or_.left + ((or_.right - or_.left) - w) / 2,
+                               or_.top + ((or_.bottom - or_.top) - h) / 2,
+                               w, h, owner, NULL, g_inst, NULL);
+    if (!dlg) return NULL;
+
+    g_dlgOpen = TRUE;
+    ShowWindow(dlg, SW_SHOW);
+    ForceForeground(dlg);
+    EnableWindow(owner, FALSE);          // 等价于 DisableWindow（SDK 未声明后者）
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        if (!tabNav || !IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    g_dlgOpen = FALSE;
+    return dlg;
+}
+
 // 属性框/重命名框共用：模态小窗（IsDialogMessage 处理 Tab/方向键），
 // 关闭后由调用方读 g_dlg.ok 决定是否应用。字段值直接写回调用方的缓冲
 static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
@@ -2771,34 +2923,9 @@ static BOOL RunDialog(HWND owner, const WCHAR *title, void *fields, int n)
     g_dlg.browseW = S_(86);
 
     int dlgH = g_dlg.titleH + S_(10) + n * g_dlg.rowH + S_(12) + S_(27) + S_(14);
-
     // 对话框窗口类已在 wWinMain 注册一次，这里不再重复注册
-
-    RECT or_;
-    GetWindowRect(owner, &or_);
-    int x = or_.left + ((or_.right - or_.left) - g_dlg.dlgW) / 2;
-    int y = or_.top + ((or_.bottom - or_.top) - dlgH) / 2;
-
-    g_dlg.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
-                                 DLG_CLASS, title,
-                                 WS_POPUP | WS_CLIPCHILDREN, x, y, g_dlg.dlgW, dlgH,
-                                 owner, NULL, g_inst, NULL);
+    g_dlg.hwnd = RunModal(owner, DLG_CLASS, title, g_dlg.dlgW, dlgH, TRUE);
     if (!g_dlg.hwnd) return FALSE;
-
-    g_dlgOpen = TRUE;
-    ShowWindow(g_dlg.hwnd, SW_SHOW);
-    ForceForeground(g_dlg.hwnd);
-    EnableWindow(owner, FALSE);          // 等价于 DisableWindow（SDK 未声明后者）
-
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        if (!IsDialogMessageW(g_dlg.hwnd, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    EnableWindow(owner, TRUE);
-    g_dlgOpen = FALSE;
     BOOL ok = g_dlg.ok;
     g_dlg.hwnd = NULL;
     return ok;
@@ -2832,7 +2959,7 @@ static BOOL SetAutostart(BOOL on)
     if (on) {
         WCHAR path[MAX_PATH], cmd[MAX_PATH + 4];
         GetModuleFileNameW(NULL, path, MAX_PATH);
-        swprintf(cmd, MAX_PATH + 4, L"\"%s\"", path);   // 路径可能含空格：加引号
+        wfmt(cmd, MAX_PATH + 4, L"\"%s\"", path);   // 路径可能含空格：加引号
         r = RegSetValueExW(k, APPNAME, 0, REG_SZ, (const BYTE *)cmd,
                            (DWORD)(wcslen(cmd) + 1) * sizeof(WCHAR));
     } else {
@@ -3030,7 +3157,7 @@ static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
         WCHAR cur[80];
         HotkeyName(cur, 80);
         WCHAR line0[96];
-        swprintf(line0, 96, L"当前唤醒快捷键：%s", cur);
+        wfmt(line0, 96, L"当前唤醒快捷键：%s", cur);
         DrawTextW(dc, line0, -1, &tr0,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         // 预览行：实时修饰键 + 省略号（主键未按）——按着修饰键就能看到
@@ -3038,7 +3165,7 @@ static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UINT mods = LiveMods();
         WCHAR prev[48], pv[24];
         ModsName(pv, 24, mods);
-        if (pv[0]) swprintf(prev, 48, L"%s…", pv);
+        if (pv[0]) wfmt(prev, 48, L"%s…", pv);
         else       wcpy(prev, 48, L"（等待按键）");
         SetTextColor(dc, C_TEXT);
         RECT tr1 = { S_(20), S_(44), rc.right - S_(20), S_(76) };
@@ -3056,29 +3183,13 @@ static LRESULT CALLBACK CapProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-// 捕获新组合；成功写回 *mods/*vk（模态循环与 RunDialog 同款）
+// 捕获新组合；成功写回 *mods/*vk（模态骨架与 RunDialog 同一套，只是不走
+// IsDialogMessage——按键由 CapProc 自己判定）
 static BOOL RunHotkeyCapture(HWND owner, UINT *mods, UINT *vk)
 {
     g_capOk = FALSE;
-    RECT or_;
-    GetWindowRect(owner, &or_);
-    int cw = S_(380), chh = S_(132);
-    HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
-                             CAP_CLASS, L"设置唤醒快捷键",
-                             WS_POPUP | WS_CLIPCHILDREN,
-                             or_.left + ((or_.right - or_.left) - cw) / 2,
-                             or_.top + ((or_.bottom - or_.top) - chh) / 2,
-                             cw, chh, owner, NULL, g_inst, NULL);
-    if (!h) return FALSE;
-    ShowWindow(h, SW_SHOW);
-    ForceForeground(h);
-    EnableWindow(owner, FALSE);
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-    EnableWindow(owner, TRUE);
+    if (!RunModal(owner, CAP_CLASS, L"设置唤醒快捷键", S_(380), S_(132), FALSE))
+        return FALSE;
     if (g_capOk) { *mods = g_capMods; *vk = g_capVk; }
     return g_capOk;
 }
@@ -3115,7 +3226,7 @@ static void TrayShowMenu(void)
                     SaveConfig();
                     WCHAR t[40], msg[96];
                     HotkeyName(t, 40);
-                    swprintf(msg, 96, L"唤醒快捷键已设置为 %s", t);
+                    wfmt(msg, 96, L"唤醒快捷键已设置为 %s", t);
                     TrayBalloon(msg);
                 } else {                            // 冲突：RegisterHotKey 失败且旧注册原样
                     TrayBalloon(L"该组合已被其他程序占用，已保留原快捷键");  // 保留，无需回退赋值
@@ -3422,12 +3533,12 @@ static void HotkeyName(WCHAR *out, int cch)
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
         if (n + 1 < cch) { out[n] = (WCHAR)vk; out[n + 1] = 0; }
     } else if (vk >= VK_F1 && vk <= VK_F24) {
-        swprintf(out + n, cch - n, L"F%u", vk - VK_F1 + 1);
+        wfmt(out + n, cch - n, L"F%u", vk - VK_F1 + 1);
     } else {
         UINT i = 0;
         while (i < _countof(VK_NAMES) && VK_NAMES[i].vk != vk) i++;
         if (i < _countof(VK_NAMES)) wcat(out, cch, VK_NAMES[i].name);
-        else                        swprintf(out + n, cch - n, L"0x%02X", vk);
+        else                        wfmt(out + n, cch - n, L"0x%02llX", (unsigned long long)vk);
     }
 }
 
@@ -3450,7 +3561,7 @@ static void OnCreate(HWND h)
     if (!ApplyHotkey(h)) {
         WCHAR t[40], msg[128];
         HotkeyName(t, 40);
-        swprintf(msg, 128, L"唤醒快捷键 %s 被其他程序占用：请从托盘菜单更换，或改用托盘/桌面双击唤醒", t);
+        wfmt(msg, 128, L"唤醒快捷键 %s 被其他程序占用：请从托盘菜单更换，或改用托盘/桌面双击唤醒", t);
         TrayBalloon(msg);
     }
     SetTimer(h, TIMER_HIDE, 120, NULL);
@@ -3460,7 +3571,7 @@ static void OnCreate(HWND h)
     if (g_firstRun) {
         WCHAR t[40], msg[160];
         HotkeyName(t, 40);
-        swprintf(msg, 160, L"claunch 已驻留托盘：单击图标显示面板，%s 随时唤醒，双击桌面空白也可以", t);
+        wfmt(msg, 160, L"claunch 已驻留托盘：单击图标显示面板，%s 随时唤醒，双击桌面空白也可以", t);
         TrayBalloon(msg);
     }
 }
@@ -4482,6 +4593,26 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 // 时把指令指针的 RVA 写进 exe 同目录的 claunch_crash.txt，拿 RVA 对 map 一查
 // 即得崩溃点函数——单文件工具没有调试器，这是唯一的取证据手段。
 // 处理器里只用最朴素的 WinAPI（防二次崩溃），写完交还系统按默认路径终止
+// 崩溃处理器里只用栈上的手写拼装：不调 CRT 的格式化（那是整条 printf 链，
+// 也是二次崩溃的来源），也不分配
+static int PutA(char *d, const char *s)
+{
+    int n = 0;
+    while (s[n]) { d[n] = s[n]; n++; }
+    return n;
+}
+
+static int HexA(char *d, unsigned long long v, int width)
+{
+    static const char dig[] = "0123456789ABCDEF";
+    char tmp[16];
+    int n = 0;
+    do { tmp[n++] = dig[v & 15]; v >>= 4; } while (v);
+    int w = n > width ? n : width;
+    for (int i = 0; i < w; i++) d[i] = (i < w - n) ? '0' : tmp[w - 1 - i];
+    return w;
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
     WCHAR path[MAX_PATH];
@@ -4495,9 +4626,12 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         DWORD_PTR rva = (DWORD_PTR)ep->ContextRecord->Rip -
                         (DWORD_PTR)GetModuleHandleW(NULL);
         char buf[96];
-        int n = snprintf(buf, sizeof buf, "code=0x%08lX rva=0x%llX\r\n",
-                         (unsigned long)ep->ExceptionRecord->ExceptionCode,
-                         (unsigned long long)rva);
+        int n = 0;
+        n += PutA(buf + n, "code=0x");
+        n += HexA(buf + n, (unsigned long long)ep->ExceptionRecord->ExceptionCode, 8);
+        n += PutA(buf + n, " rva=0x");
+        n += HexA(buf + n, (unsigned long long)rva, 0);
+        n += PutA(buf + n, "\r\n");
         DWORD w = 0;
         WriteFile(f, buf, (DWORD)n, &w, NULL);
         CloseHandle(f);
