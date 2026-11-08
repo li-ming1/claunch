@@ -3688,7 +3688,9 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             // 原来的 IsWindowVisible + GetAsyncKeyState 两次内核查询全省了
             if (!s_lbtnDown) {
                 s_dragInRect = FALSE;
-            } else if (!g_dlgOpen && !IsWindowVisible(g_hwnd)) {
+            } else if (!g_dlgOpen && !g_dock && !IsWindowVisible(g_hwnd)) {
+                // 贴边停靠时静置区即屏幕边缘那条：拖选/拖放高频路过，误唤醒
+                // 成灾——停用静置区弹回，唤出统一交给触边（WM_APP_EDGEEWAKE）
                 // GetWindowRect 是窗口管理器查询不发消息，UI 线程卡死也不拖累钩子
                 MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
                 RECT r;
