@@ -285,6 +285,7 @@ static HHOOK g_hook = NULL;
 static HANDLE g_hookH;              // 钩子专用线程：回调不再与绘制抢 UI 线程
 static DWORD  g_hookTid;
 static WCHAR g_ini[MAX_PATH];
+static WCHAR g_exeDir[MAX_PATH];   // exe 所在目录（带尾反斜杠）：相对条目路径的解析基准
 static int   g_savedX, g_savedY, g_savedW, g_savedH;
 static BOOL  g_applySavedRect = FALSE;
 
@@ -1299,6 +1300,41 @@ static void RefreshVirtualIcons(void)
     }
 }
 
+// ---------------------------------------------------------------- 相对路径（issue #1：U 盘便携）
+// 相对 → 绝对（以 exe 目录为基准）。盘符/UNC/URL/“::”解析名一律原样返回——
+// 相对路径的定义就是“不含冒号且不以 \\ 开头”。返回值可能指向入参也可能指向
+// out：调用方按只读用，不长期持有
+static const WCHAR *AbsPath(const WCHAR *p, WCHAR out[MAX_PATH])
+{
+    if (!p[0] || !g_exeDir[0]) return p;
+    if (p[0] == L'\\' && p[1] == L'\\') return p;            // UNC
+    for (const WCHAR *q = p; *q; q++)
+        if (*q == L':') return p;                            // 盘符/URL/::{CLSID}
+    wcpy(out, MAX_PATH, g_exeDir);
+    wcat(out, MAX_PATH, p);
+    return out;
+}
+
+// exe 目录下的绝对路径改存相对：整目录（连同 exe）挪到 U 盘/别的机器后条目
+// 依旧有效。前缀不匹配（别的盘/别的目录）原样保留。ini 读入也走这里——
+// 旧配置里同目录的绝对路径在下次落盘时自然迁移成相对
+static void MakeRelative(WCHAR *path)
+{
+    if (!g_exeDir[0]) return;
+    const WCHAR *a = path, *b = g_exeDir;
+    while (*b) {                                             // 前缀比较：忽略大小写（FindTextI 同款）
+        WCHAR ca = *a, cb = *b;
+        if (ca >= L'A' && ca <= L'Z') ca += 32;
+        if (cb >= L'A' && cb <= L'Z') cb += 32;
+        if (ca != cb) return;
+        a++; b++;
+    }
+    if (!*a) return;                                         // 路径就是 exe 目录本身：不动
+    int n = 0;                                               // 去掉前缀：余下部分原地前移
+    while (a[n]) { path[n] = a[n]; n++; }
+    path[n] = 0;
+}
+
 static HICON IconFor(const WCHAR *path, int want)
 {
     HICON h = NULL;
@@ -1362,7 +1398,8 @@ static void EnsureIcon(int i)
     if (g_items[i].iconTried) return;
     g_items[i].iconTried = TRUE;
     if (!g_items[i].path[0]) return;
-    HICON h = IconFor(g_items[i].path, IconSize());
+    WCHAR abs[MAX_PATH];
+    HICON h = IconFor(AbsPath(g_items[i].path, abs), IconSize());
     if (h) { g_items[i].icon = h; g_items[i].ownIcon = TRUE; }
     else    g_items[i].icon = LoadIconW(NULL, IDI_APPLICATION);   // 共享图标，不销毁
 }
@@ -1374,6 +1411,7 @@ static void ItemSetText(Item *it, const WCHAR *name, const WCHAR *path,
 {
     wcpy(it->name, 48, name);
     wcpy(it->path, MAX_PATH, path);
+    MakeRelative(it->path);   // exe 目录下的目标存相对：新建/换目标/粘贴/ini 读入四处共用此收敛
     wcpy(it->args, 192, args ? args : L"");
     wcpy(it->tip, 96, tip ? tip : L"");
 }
@@ -1539,7 +1577,8 @@ static BOOL PruneInvalidItems(void)
 {
     BOOL removed = FALSE;
     for (int i = 0; i < g_nItems; ) {
-        const WCHAR *p = g_items[i].path;
+        WCHAR abs[MAX_PATH];
+        const WCHAR *p = AbsPath(g_items[i].path, abs);   // 相对路径不解析会被误判失效删除
         if (!p[0] || !PathCheckable(p)) { i++; continue; }
         if (GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) {
             RemoveItemAt(i);
@@ -1637,9 +1676,11 @@ static BOOL Launch(int idx, BOOL asAdmin)
 {
     if (idx < 0 || idx >= g_nItems) return FALSE;
     const Item *it = &g_items[idx];
-    if (!it->path[0]) return FALSE;              // 空格：没有可启动的目标
+    WCHAR abs[MAX_PATH];
+    const WCHAR *path = AbsPath(it->path, abs);
+    if (!path[0]) return FALSE;                  // 空格：没有可启动的目标
     if (!asAdmin) {
-        if (HasExt(it->path, L".lnk")) {
+        if (HasExt(path, L".lnk")) {
             LnkInfo lnk;
             if (ParseLnk(it->path, &lnk) && lnk.target[0]) {
                 // .lnk 的工作目录常含环境变量（如 Git CMD 的 %HOMEDRIVE%%HOMEPATH%），
@@ -1652,20 +1693,21 @@ static BOOL Launch(int idx, BOOL asAdmin)
                 if (CreateRun(lnk.target, it->args[0] ? it->args : lnk.args, work))
                     return TRUE;
             }
-        } else if (CreateRun(it->path, it->args, L"")) {
+        } else if (CreateRun(path, it->args, L"")) {
             return TRUE;
         }
         // CreateProcess 不认识的目标（文件夹/文档/协议）：退回 shell
     }
     // ShellExecuteW 返回值 ≤32 即失败（SE_ERR_*）；调用方据此给启动反馈
-    return (INT_PTR)ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", it->path,
+    return (INT_PTR)ShellExecuteW(g_hwnd, asAdmin ? L"runas" : L"open", path,
                                   it->args[0] ? it->args : NULL,
                                   NULL, SW_SHOWNORMAL) > 32;
 }
 
 static void OpenLocation(const WCHAR *path)
 {
-    WCHAR args[MAX_PATH + 16];
+    WCHAR abs[MAX_PATH], args[MAX_PATH + 16];
+    path = AbsPath(path, abs);
     wfmt(args, MAX_PATH + 16, L"/select,\"%s\"", path);
     CreateRun(L"explorer.exe", args, L"");
 }
@@ -1675,7 +1717,10 @@ static void IniPath(void)
 {
     GetModuleFileNameW(NULL, g_ini, MAX_PATH);
     WCHAR *p = wrchr_(g_ini, L'\\');
-    if (p) p[1] = 0;
+    if (p) {
+        p[1] = 0;
+        wcpy(g_exeDir, MAX_PATH, g_ini);   // 此刻 g_ini 恰为“目录\”：直接存作解析基准
+    }
     wcat(g_ini, MAX_PATH, ININAME);
 }
 
