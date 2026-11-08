@@ -240,6 +240,7 @@ static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;  
 static int  g_grpPadX, g_grpPadTop, g_grpRowGap, g_grpPadY, g_grpSelBar;
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
+static int  g_gapR = 0;    // 列宽整除余数（0..列数-1）：摊进前 g_gapR 个列间隙，右边缘冲齐
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
 static int  g_dock = DOCK_OFF;   // 贴边唤出档位：钩子线程跨线程只读（同 g_dlgOpen 的对齐整型读）
@@ -673,6 +674,10 @@ static void UpdateCell(void)
     g_cols = c < 1 ? 1 : c;
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
     if (g_cell < 8) g_cell = 8;
+    // 整除零头摊进列间隙（每隙 ≤1px 肉眼不可分），右边缘永远冲齐——
+    // 原来全堆在右边缘，裸出一条背景色“断格”缝（issue 反馈的观感问题）
+    g_gapR = (g_cw - g_sideW - (g_cols - 1) * g_gap) - g_cols * g_cell;
+    if (g_gapR < 0) g_gapR = 0;   // g_cell 撞 8px 下限钳制时可能为负：放弃摊平
     g_slots = g_cols * Rows();   // 每帧命中/绘制/滚动钳制直接读缓存
     UpdateBtnRects();            // 标题栏按钮随窗口宽度重定位
 }
@@ -683,11 +688,27 @@ static int Rows(void)
     return r < 1 ? 1 : r;
 }
 
+// 第 col 列的左缘：格子等宽，余数摊进前 g_gapR 个间隙（每隙 +1px）。
+// 横向坐标的唯一来源——绘制/命中/卡片锚点全走这里，不会各算一套
+static int ColX(int col)
+{
+    return g_sideW + col * (g_cell + g_gap) + (col < g_gapR ? col : g_gapR);
+}
+
+// 均匀步长除法给出的列估计 → 真实列号：摊匀后每列距偏差 ≤1px、累计不足一列，
+// 最多回退/前进各一步。命中是鼠标移动的最高频路径，保持 O(1)
+static int ColSnap(int x, int col)
+{
+    while (col > 0 && x < ColX(col)) col--;
+    while (col + 1 < g_cols && x >= ColX(col + 1)) col++;
+    return col;
+}
+
 static RECT CellRect(int vi)
 {
     int c = g_cols, col = vi % c, row = vi / c;
     RECT r;
-    r.left   = g_sideW + col * (g_cell + g_gap);
+    r.left   = ColX(col);
     r.top    = g_titleH + row * (g_cell + g_gap) - g_scroll;
     r.right  = r.left + g_cell;
     r.bottom = r.top + g_cell;
@@ -766,6 +787,7 @@ static int SlotAt(POINT p)
     // 列数取整后右边缘可能剩一条窄带：落进去的 col 会等于 g_cols，算出的
     // vi 就窜到下一行行首——拖放落点会指错格。拦在这里
     if (col >= g_cols) return -1;
+    col = ColSnap(p.x, col);     // 余数摊进间隙后列距不均匀：按真实列缘校正
     int vi = ((p.y - g_titleH + g_scroll) / step) * g_cols + col;
     return vi < g_slots ? vi : -1;
 }
@@ -779,8 +801,9 @@ static int CellAt(POINT p)
     int step = g_cell + g_gap;
     int col = (p.x - g_sideW) / step;
     if (col >= g_cols) return -1;
+    col = ColSnap(p.x, col);     // 余数摊进间隙后列距不均匀：按真实列缘校正
     int row = (p.y - g_titleH + g_scroll) / step;
-    int x = g_sideW + col * step, y = g_titleH + row * step - g_scroll;
+    int x = ColX(col), y = g_titleH + row * step - g_scroll;
     // 已保证 p.x >= x、p.y >= y（除法取整的构造），只需查右/下边界
     if (p.x >= x + g_cell || p.y >= y + g_cell) return -1;
     int vi = row * g_cols + col;
@@ -2536,8 +2559,8 @@ static void InvalidateCells(int a, int b)
     int lo = (ra == rb) ? a % c : 0;      // 同行取两端，跨行铺满宽
     int hi = (ra == rb) ? b % c : c - 1;
     RECT r;
-    r.left   = g_sideW + lo * (g_cell + g_gap);
-    r.right  = g_sideW + hi * (g_cell + g_gap) + g_cell;
+    r.left   = ColX(lo);
+    r.right  = ColX(hi) + g_cell;
     r.top    = g_titleH + ra * (g_cell + g_gap) - g_scroll;
     r.bottom = g_titleH + rb * (g_cell + g_gap) + g_cell - g_scroll;
     InvalidateRect(g_hwnd, &r, FALSE);
@@ -2820,9 +2843,9 @@ static void PaintGrid(HDC dc, const RECT *clip)
         int y = g_titleH + row * step - g_scroll;
         if (y >= g_ch) break;                       // 整行在可视区下方
         if (y + g_cell <= g_titleH) continue;       // 整行已滚出上方
-        int x = g_sideW;
         int vi = row * g_cols;
-        for (int col = 0; col < g_cols; col++, x += step, vi++) {
+        for (int col = 0; col < g_cols; col++, vi++) {
+            int x = ColX(col);
             RECT r = { x, y, x + g_cell, y + g_cell };
             // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
@@ -3910,6 +3933,12 @@ static void OnPaint(HWND h)
 {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
+    // 自愈：缓存的 g_cw/g_ch 与真实客户区不一致（DPI 切换/跨屏等路径丢过
+    // WM_SIZE）时，绘制前补一次 OnSize 同步——布局永远贴着真实客户区，
+    // 最后一列不再被窗口边缘切断。同步后 InvalidateRect 会再排一次干净的重绘
+    RECT crc;
+    GetClientRect(h, &crc);
+    if (crc.right != g_cw || crc.bottom != g_ch) OnSize(h, MAKELPARAM(crc.right, crc.bottom));
     // 隐藏窗没有可画的内容：启动期实测 Windows 会给不可见的层面板发
     // WM_PAINT——整段跳过（图标/shell 管线/离屏缓冲全不碰），一次省
     // ~16MB 工作集 + ~50 GDI。唤醒后窗口可见，照常全量绘制
