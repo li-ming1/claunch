@@ -109,6 +109,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define TIMER_FADE      2
 #define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
 #define TIMER_ICONS     4    // 缩放手势停稳后重解析图标
+#define TIMER_SCROLL    5    // 滚动缓动：每拍指数逼近 g_scrollTo，收敛即停
 #define HOTKEY_ID       1
 #define CAP_CLASS       L"ClaunchCapWnd"     // 热键捕获对话框类
 
@@ -255,7 +256,8 @@ static UINT g_clipFmt = 0;       // 私有剪贴板格式原子（Ctrl+C/V；注
 static BOOL g_cfgDirty = FALSE;  // 配置有待落盘：缩放等连续操作防抖，避免每格滚轮都写文件
 static int  g_curGroup = 0;
 static WCHAR g_filter[24];   // 名称搜索过滤词（瞬态，不持久化）：非空时视图只保留名称含它的条目
-static int  g_scroll = 0;       // 格子区滚动（像素）
+static int  g_scroll = 0;       // 格子区滚动（像素）：布局权威值，命中/绘制直读
+static int  g_scrollTo = 0;     // 滚动缓动终点：滚轮/翻页改它，TIMER_SCROLL 每拍收敛 g_scroll
 static int  g_grpScroll = 0;    // 侧栏滚动（像素）
 static int  g_scrollMemo[MAX_GROUPS];   // 每个分组各自的格子滚动位：切组时保存/恢复
 
@@ -810,27 +812,46 @@ static int CellAt(POINT p)
     return vi < g_slots && vi < ViewCount() ? vi : -1;
 }
 
-static void ClampScroll(void)
+static int ScrollMax(void)
 {
     int need = ViewCount();
     int visible = g_slots;
-    int maxS = need > visible ? (need - visible + g_cols - 1) / g_cols * (g_cell + g_gap) : 0;
-    if (g_scroll > maxS) g_scroll = maxS;
-    if (g_scroll < 0) g_scroll = 0;
+    return need > visible ? (need - visible + g_cols - 1) / g_cols * (g_cell + g_gap) : 0;
 }
 
-// 把视图格 vi 滚进可视区（最小滚动量）。返回滚动量是否真的变了——
-// 调用方据此决定要不要整窗重绘（Home/End/翻页键走这条）
+static void ClampScroll(void)
+{
+    int maxS = ScrollMax();
+    if (g_scroll > maxS) g_scroll = maxS;
+    if (g_scroll < 0) g_scroll = 0;
+    if (g_scrollTo > maxS) g_scrollTo = maxS;   // 终点与当前位一并钳制
+    if (g_scrollTo < 0) g_scrollTo = 0;
+}
+
+// 滚动缓动（“丝滑”）：只改终点，TIMER_SCROLL 每拍指数逼近、快起缓停。
+// 连续滚轮时终点累积、动画连续不丢步。终点与当前位一致就不起表
+static void ScrollTo(int target)
+{
+    g_scrollTo = target;
+    ClampScroll();
+    if (g_scroll != g_scrollTo)
+        SetTimer(g_hwnd, TIMER_SCROLL, 16, NULL);
+}
+
+// 把视图格 vi 滚进可视区（最小滚动量）。返回是否会有位移——
+// 调用方据此决定要不要整窗重绘（Home/End/翻页键走这条）；
+// 位移由 TIMER_SCROLL 缓动完成，重绘在各拍里做
 static BOOL ScrollCellIntoView(int vi)
 {
     if (vi < 0 || vi >= ViewCount()) return FALSE;
-    int old = g_scroll;
+    int oldT = g_scrollTo;
     int top = (vi / g_cols) * (g_cell + g_gap);
     int view = g_ch - g_titleH;
-    if (top < g_scroll) g_scroll = top;
-    else if (top + g_cell > g_scroll + view) g_scroll = top + g_cell - view;
+    if (top < g_scrollTo) g_scrollTo = top;
+    else if (top + g_cell > g_scrollTo + view) g_scrollTo = top + g_cell - view;
     ClampScroll();
-    return g_scroll != old;
+    if (g_scrollTo != oldT) SetTimer(g_hwnd, TIMER_SCROLL, 16, NULL);
+    return g_scroll != g_scrollTo || g_scrollTo != oldT;
 }
 
 // 侧栏分组列表的虚拟内容高度（行高 + 上下留白）：滚动钳制与滚动条
@@ -871,6 +892,7 @@ static void SelectGroup(int gi)
     g_curGroup = gi;
     ViewDirty();
     g_scroll = g_scrollMemo[gi];            // 恢复目标组上次的滚动位
+    g_scrollTo = g_scroll;                  // 切组瞬时定位：缓动不跨组内容
     ClampScroll();                          // 内容可能变了：钳回范围
     EnsureGroupVisible(gi);
     UpdateHoverText();
@@ -2244,6 +2266,8 @@ static void StepFade(void)
                 SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
+            KillTimer(g_hwnd, TIMER_SCROLL);   // 缓动随隐藏收尾：终点直接落位
+            g_scroll = g_scrollTo;
             ReleaseMemBuffer();                // 双缓冲 ~2MB 随隐藏释放，唤醒首绘重建
             g_flashAt = 0;                    // 心跳停了：反馈不可能再过期重绘，直接收掉
             if (g_cfgDirty) { g_cfgDirty = FALSE; SaveConfig(); }   // 心跳将停：待落盘的立即落
@@ -4059,8 +4083,9 @@ static void OnLButtonDown(HWND h, LPARAM l)
     if (g_hoverGroup >= 0) {
         if (g_hoverGroup == g_curGroup) {
             // 点当前组 = 回到顶部（既有行为）
-            if (g_scroll) {
+            if (g_scroll || g_scrollTo) {
                 g_scroll = 0;
+                g_scrollTo = 0;             // 回顶是明确意图：瞬时，不滑
                 ClampScroll();
                 InvalidateRect(h, NULL, FALSE);
                 RefreshCard();
@@ -4195,14 +4220,7 @@ static void OnWheel(HWND h, UINT m, WPARAM w, LPARAM l)
         if (gi >= g_nGroups) gi = 0;
         SelectGroup(gi);
     } else {
-        int before = g_scroll;
-        g_scroll += (d > 0 ? -1 : 1) * (g_cell + g_gap);
-        ClampScroll();
-        if (g_scroll != before) {
-            RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-            InvalidateRect(h, &gr, FALSE);
-            RefreshCard();       // 格子滚动了：卡片跟着锚点走
-        }
+        ScrollTo(g_scrollTo + (d > 0 ? -1 : 1) * (g_cell + g_gap));
     }
 }
 
@@ -4745,6 +4763,7 @@ static void OnTimer(HWND h, WPARAM w)
         int old = g_scroll;
         g_scroll += g_oleAutoDir * S_(28);
         ClampScroll();
+        g_scrollTo = g_scroll;         // 拖滚直写：同步缓动终点，避免拉扯
         if (g_scroll == old) {         // 到顶/到底：内容不再位移，停表省空转
             g_oleAutoDir = 0;
             KillTimer(h, TIMER_DRAGSCROLL);
@@ -4753,6 +4772,17 @@ static void OnTimer(HWND h, WPARAM w)
         RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
         InvalidateRect(h, &gr, FALSE);
         OleUpdateOver((POINTL){ g_oleAutoPt.x, g_oleAutoPt.y });
+    } else if (w == TIMER_SCROLL) {
+        // 缓动步进：每拍走掉剩余的 1/3（指数缓停），尾程一次落位防小步振荡。
+        // 卡片锚点随拍刷新，与滚轮直滚同一观感
+        int remain = g_scrollTo - g_scroll;
+        if (remain) {
+            g_scroll = (remain > -3 && remain < 3) ? g_scrollTo : g_scroll + remain / 3;
+            RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
+            InvalidateRect(h, &gr, FALSE);
+            RefreshCard();
+        }
+        if (g_scroll == g_scrollTo) KillTimer(h, TIMER_SCROLL);
     } else if (w == TIMER_ICONS) {
         // 缩放手势停稳：图标尺寸已定，丢掉旧图标，下次绘制按新尺寸重解析
         KillTimer(h, TIMER_ICONS);
