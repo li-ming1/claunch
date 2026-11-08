@@ -2054,6 +2054,15 @@ static void StartFadeIn(void)
     g_outSince = 0;
     g_wakeAt = GetTickCount64();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
     RefreshVirtualIcons();       // 唤醒即对时：回收站空/满等状态化图标对齐当前真实状态
+    // 呼出即抬 TOPMOST：非置顶面板在前台是全屏（游戏）或管理员权限窗口时，
+    // SW_SHOW 后被整个压住——热键/托盘呼出“看似没反应”。隐藏完成再还原
+    // （见 StepFade），可见期间始终保证看得见（NOACTIVATE 不抢前台）
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (g_fadeDir < 0) {         // 淡出途中被唤回：就地反向淡入，不闪黑重淡
+        g_fadeDir = 1;           // TIMER_FADE 还在跑，交给 StepFade 继续爬
+        return;
+    }
     g_alpha = 0;
     SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA);
     g_fadeDir = 1;
@@ -2113,6 +2122,9 @@ static void StepFade(void)
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
             ShowWindow(g_hwnd, SW_HIDE);
+            if (!g_pinned)                     // 还原非置顶：呼出时的置顶只在可见期间成立
+                SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             KillTimer(g_hwnd, TIMER_HIDE);     // 已隐藏：停掉移出检测心跳，进托盘零轮询
             ReleaseMemBuffer();                // 双缓冲 ~2MB 随隐藏释放，唤醒首绘重建
             g_flashAt = 0;                    // 心跳停了：反馈不可能再过期重绘，直接收掉
@@ -4649,7 +4661,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                                break;
     case WM_DROPFILES:         OnDropFiles(h, w);                        return 0;
     case WM_TIMER:             OnTimer(h, w);                            return 0;
-    case WM_HOTKEY:            if (IsWindowVisible(h)) BeginHide(TRUE);
+    // 淡出途中面板仍“可见”（IsWindowVisible 为真）：这时热键是唤回不是再隐藏，
+    // 按可见与否判断会把这一按吞掉——面板正在消失，用户感知“按了不显示”
+    case WM_HOTKEY:            if (IsWindowVisible(h) && g_fadeDir >= 0) BeginHide(TRUE);
                                else ShowLauncher();                      return 0;
     // 托盘图标：左键单击显示面板，右键弹菜单
     case WM_TRAY:            { UINT ev = LOWORD(l);   // NOTIFYICON_VERSION_4：事件在 lParam 低字
