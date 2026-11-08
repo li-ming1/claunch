@@ -104,6 +104,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define WM_APP_WHEEL    (WM_APP + 3)   // 低级钩子转发的滚轮（面板置顶且未聚焦时也可用）
 #define WM_APP_WAKE_CAND (WM_APP + 4)  // 钩子转发的“疑似桌面双击”候选，UI 线程确认后再唤醒
 #define WM_APP_DRAGWAKE  (WM_APP + 5)  // 钩子转发的“拖动进入面板静置区”：面板就地弹回（不抢前台）
+#define WM_APP_EDGEEWAKE (WM_APP + 6)  // 钩子转发的“光标贴上停靠边”：UI 线程确认后停靠弹出
 #define TIMER_HIDE      1
 #define TIMER_FADE      2
 #define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
@@ -116,6 +117,13 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define HIDE_DELAY_MS   150    // 光标移出多久开始淡出
 #define FLASH_MS        1200   // 标题栏反馈消息的停留时间
 #define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
+#define EDGE_TOUCH      2      // 触边唤出：光标离工作区边多近算“贴上”
+#define EDGE_RELEASE    16     // 触边唤出：离开沿口多远才重新武装（迟滞防抖）
+#define EDGE_INSET      64     // 触边唤出：沿口两端角部避让（物理像素，防误触角落）
+#define DOCK_OFF        0      // 贴边停靠档位：托盘“贴边唤出”四项与 ini Dock= 共用
+#define DOCK_TOP        1
+#define DOCK_LEFT       2
+#define DOCK_RIGHT      3
 
 // 标题栏按钮编码（同 g_hoverBtn / g_pressBtn）：1=钉住 2=关闭
 #define BTN_PIN         1
@@ -146,6 +154,10 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define IDM_TRAY_PIN        1102
 #define IDM_TRAY_AUTO       1103
 #define IDM_TRAY_HOTKEY     1105
+#define IDM_TRAY_DOCK_OFF   1110    // 贴边唤出四项：命令值-DOCK_OFF 即档位 0..3
+#define IDM_TRAY_DOCK_TOP   1111
+#define IDM_TRAY_DOCK_LEFT  1112
+#define IDM_TRAY_DOCK_RIGHT 1113
 
 #define DLG_OK          1
 #define DLG_CANCEL      2
@@ -230,6 +242,7 @@ static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateC
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
 static int  g_cellBase = 56;   // 格子目标宽基准：Ctrl+滚轮调节，配置持久化（UpdateCell 据此算列数）
 static BOOL g_pinned = FALSE;    // 置顶：常驻不自动隐藏 + HWND_TOPMOST（原“定住”与“置顶”合并）
+static int  g_dock = DOCK_OFF;   // 贴边唤出档位：钩子线程跨线程只读（同 g_dlgOpen 的对齐整型读）
 static BOOL g_needPrune;         // 静默启动把失效清理延到首次唤醒：托盘就绪不该等磁盘
 static BOOL g_firstRun;          // 无配置文件：首跑给一条引导气球（可发现性）
 // 唤醒快捷键（用户可配置，默认 Ctrl+Alt+K；配置行 Hotkey=<mods> <vk>）。
@@ -313,6 +326,7 @@ typedef struct {
 static void ClampToWorkArea(void);
 static void MoveToPoint(POINT pt);
 static void BeginHide(BOOL force);
+static void FitRectToWorkArea(RECT *wr, const RECT *wa);   // ShowDocked 在定义之前用
 static void ReleaseMemBuffer(void);   // 双缓冲释放：隐藏即放，唤醒首绘重建
 static void InitOleDrop(HWND h);   // 延迟到首次唤醒（见定义处注释：静默态不付 COM 的钱）
 static void HotkeyName(WCHAR *out, int cch);   // 唤醒快捷键的可读名（定义在 OnCreate 区）
@@ -1835,6 +1849,7 @@ static void LoadConfig(void)
 
         if (!wcmp_(section, L"Main")) {
             if (!wcmp_(key, L"Pinned"))  g_pinned = wToI(val) ? TRUE : FALSE;
+            else if (!wcmp_(key, L"Dock"))   { int v = wToI(val); g_dock = (v >= DOCK_TOP && v <= DOCK_RIGHT) ? v : DOCK_OFF; }
             else if (!wcmp_(key, L"Hotkey")) {           // Hotkey=<mods> <vk>
                 unsigned mm = 0, vv = 0;
                 if (wScanU2(val, &mm, &vv) == 2 &&
@@ -1915,6 +1930,7 @@ static void SaveConfig(void)
     FmtLine(L"Rect=%d %d %d %d\r\n", r.left, r.top,
             r.right - r.left, r.bottom - r.top);
     FmtLine(L"Pinned=%d\r\n", g_pinned ? 1 : 0);
+    FmtLine(L"Dock=%d\r\n", g_dock);
     FmtLine(L"Hotkey=%u %u\r\n", g_hotMods, g_hotVk);
     FmtLine(L"Group=%d\r\n", g_curGroup);
     FmtLine(L"Cell=%d\r\n", g_cellBase);
@@ -2139,6 +2155,40 @@ static void ShowLauncher(void)
     ForceForeground(g_hwnd);
     StartFadeIn();
     SetTimer(g_hwnd, TIMER_HIDE, 120, NULL);   // 隐藏期间定时器是停的，这里才重启
+}
+
+// 贴边停靠弹出（issue #1）：面板在触发沿口所在屏滑出，停靠边居中、不跟光标、
+// 不抢前台（SW_SHOWNA：鼠标唤出，点下哪格哪格自然激活）。隐藏与自动隐藏仍走
+// TIMER_HIDE 心跳，收尾与热键呼出共用同一套
+static void ShowDocked(POINT pt)
+{
+    WakePrune();
+    InitOleDrop(g_hwnd);
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    RECT wr;
+    GetWindowRect(g_hwnd, &wr);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    RECT wa = mi.rcWork;
+    if (g_dock == DOCK_TOP) {
+        wr.left = wa.left + (wa.right - wa.left - w) / 2;
+        wr.top  = wa.top;
+    } else if (g_dock == DOCK_LEFT) {
+        wr.left = wa.left;
+        wr.top  = wa.top + (wa.bottom - wa.top - h) / 2;
+    } else {                                   // DOCK_RIGHT
+        wr.left = wa.right - w;
+        wr.top  = wa.top + (wa.bottom - wa.top - h) / 2;
+    }
+    wr.right = wr.left + w;
+    wr.bottom = wr.top + h;
+    FitRectToWorkArea(&wr, &mi.rcWork);        // 兜底：面板不小于工作区时收进来
+    SetWindowPos(g_hwnd, NULL, wr.left, wr.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (!IsWindowVisible(g_hwnd)) ShowWindow(g_hwnd, SW_SHOWNA);
+    StartFadeIn();
+    SetTimer(g_hwnd, TIMER_HIDE, 120, NULL);
 }
 
 static void BeginHide(BOOL force)
@@ -3329,6 +3379,13 @@ static void TrayShowMenu(void)
         AppendMenuW(m, MF_STRING, IDM_TRAY_HOTKEY, L"设置唤醒快捷键(&H)...");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), IDM_TRAY_PIN, L"置顶窗口");
+        // 贴边唤出（issue #1）：选边后光标贴该工作区边即停靠弹出；勾选态随档位
+        HMENU dm = CreatePopupMenu();
+        AppendMenuW(dm, MF_STRING | (g_dock == DOCK_OFF  ? MF_CHECKED : 0), IDM_TRAY_DOCK_OFF,  L"不贴边");
+        AppendMenuW(dm, MF_STRING | (g_dock == DOCK_TOP  ? MF_CHECKED : 0), IDM_TRAY_DOCK_TOP,  L"贴上沿");
+        AppendMenuW(dm, MF_STRING | (g_dock == DOCK_LEFT ? MF_CHECKED : 0), IDM_TRAY_DOCK_LEFT, L"贴左沿");
+        AppendMenuW(dm, MF_STRING | (g_dock == DOCK_RIGHT ? MF_CHECKED : 0), IDM_TRAY_DOCK_RIGHT, L"贴右沿");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)dm, L"贴边唤出");
         // 自启是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
         // 效果，文本里注明生效时机，免得看着像打钩没反应
         AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
@@ -3338,6 +3395,11 @@ static void TrayShowMenu(void)
         int cmd = PopupAt(m);
 
         if (cmd == IDM_TRAY_PIN)    { TogglePin();       continue; }
+        if (cmd >= IDM_TRAY_DOCK_OFF && cmd <= IDM_TRAY_DOCK_RIGHT) {
+            g_dock = cmd - IDM_TRAY_DOCK_OFF;
+            SaveConfig();
+            continue;                // 就地重弹：勾选态当场更新（同置顶开关的交互）
+        }
         if (cmd == IDM_TRAY_AUTO)   { ToggleAutostart(); continue; }
         if (cmd == IDM_TRAY_HOTKEY) {
             UINT nm = g_hotMods, nv = g_hotVk;
@@ -3468,6 +3530,7 @@ static void ShowTitleMenu(void)
 static ULONGLONG s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
 static BOOL   s_dragInRect;     // 拖动光标是否在面板静置区内（只报“从区外进入”的沿口）
+static BOOL   s_edgeIn;         // 光标是否已报过贴边候选（本线程私有：进沿口只报一次）
 static BOOL   s_lbtnDown;       // 左键按住的本地镜像：钩子自己看得到按下/抬起，
                                 // 移动事件里就不必再问 GetAsyncKeyState
 static DWORD s_dblClick;      // 双击间隔/双击容差：钩子线程启动时读一次——
@@ -3589,6 +3652,41 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                 s_dragInRect = inside;
             } else {
                 s_dragInRect = FALSE;
+            }
+            // 触边唤出（贴边停靠）：光标贴上停靠边、避开两角的窄沿口时报一次
+            // 候选（WM_APP_EDGEEWAKE），UI 线程确认可见性/模态后再停靠弹出。
+            // GetMonitorInfoW 同 GetWindowRect 是窗口管理器查询不发消息，不拖累
+            // 全局输入；进出沿口做状态机（s_edgeIn 本线程私有）：贴边悬停不重复
+            // 报，离开 EDGE_RELEASE 才重新武装——防沿口抖动时面板反复弹
+            if (g_dock && !s_lbtnDown && !g_dlgOpen && !IsWindowVisible(g_hwnd)) {
+                MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+                MONITORINFO mi;
+                ZeroMemory(&mi, sizeof mi);
+                mi.cbSize = sizeof mi;
+                if (GetMonitorInfoW(MonitorFromPoint(p->pt, MONITOR_DEFAULTTONEAREST), &mi)) {
+                    RECT wa = mi.rcWork;
+                    BOOL in = FALSE, out = FALSE;
+                    if (g_dock == DOCK_TOP) {
+                        in  = p->pt.y <= wa.top + EDGE_TOUCH
+                              && p->pt.x >= wa.left + EDGE_INSET && p->pt.x <= wa.right - EDGE_INSET;
+                        out = p->pt.y > wa.top + EDGE_RELEASE;
+                    } else if (g_dock == DOCK_LEFT) {
+                        in  = p->pt.x <= wa.left + EDGE_TOUCH
+                              && p->pt.y >= wa.top + EDGE_INSET && p->pt.y <= wa.bottom - EDGE_INSET;
+                        out = p->pt.x > wa.left + EDGE_RELEASE;
+                    } else if (g_dock == DOCK_RIGHT) {
+                        in  = p->pt.x >= wa.right - EDGE_TOUCH
+                              && p->pt.y >= wa.top + EDGE_INSET && p->pt.y <= wa.bottom - EDGE_INSET;
+                        out = p->pt.x < wa.right - EDGE_RELEASE;
+                    }
+                    if (in && !s_edgeIn) {
+                        s_edgeIn = TRUE;
+                        PostMessageW(g_hwnd, WM_APP_EDGEEWAKE, 0,
+                                     MAKELPARAM((WORD)p->pt.x, (WORD)p->pt.y));
+                    } else if (out) {
+                        s_edgeIn = FALSE;
+                    }
+                }
             }
         } else if (wParam == WM_MOUSEWHEEL) {
             // 接管条件收到最窄，缺一不可：面板可见、置顶（这一像素确实属于
@@ -4719,6 +4817,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     // 桌面双击唤醒候选：钩子只报时序，这里在 UI 线程确认落点确实是桌面再唤醒
     case WM_APP_WAKE_CAND:   { POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
                                if (!IsWindowVisible(h) && IsDesktopPoint(p)) ShowLauncher();
+                                                                        return 0; }
+    // 触边候选：钩子只报贴边，这里确认面板确实收着、没有模态挡着再停靠弹出
+    case WM_APP_EDGEEWAKE:   { POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+                               if (!IsWindowVisible(h) && !g_dlgOpen && !g_menuOpen
+                                   && !g_extDrag && g_dock) ShowDocked(p);
                                                                         return 0; }
     // 拖放唤醒：面板隐藏时拖动光标进入其静置区——就地显示但不抢前台
     //（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动（落点就在原地）
