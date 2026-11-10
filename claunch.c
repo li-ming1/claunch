@@ -222,6 +222,7 @@ static int  g_nGroups = 0;
 // 之后 ViewCount/ItemAtView 都是 O(1) 读表——绘制、悬停、滚轮每帧都走这条路。
 static int  g_viewIdx[MAX_ITEMS];
 static int  g_viewN = 0;
+static int  g_viewEnd = 0;   // 最后一个非空格的后一位：滚动/键盘末界（尾部空格只是落点槽位，不撑范围）
 static BOOL g_viewValid = FALSE;
 
 // ---------------------------------------------------------------- 状态
@@ -748,11 +749,15 @@ static void ViewRebuild(void)
             hits[j + 1].idx = idx; hits[j + 1].score = sc;
         }
         for (int i = 0; i < n; i++) g_viewIdx[g_viewN++] = hits[i].idx;
+        g_viewEnd = g_viewN;         // 搜索命中的都是真实条目
     } else {
+        int end = 0;
         for (int i = 0; i < g_nItems; i++) {
             if (g_items[i].group != g_curGroup) continue;
             g_viewIdx[g_viewN++] = i;
+            if (g_items[i].path[0]) end = g_viewN;
         }
+        g_viewEnd = end;
     }
     g_viewValid = TRUE;
 }
@@ -819,7 +824,8 @@ static int CellAt(POINT p)
 
 static int ScrollMax(void)
 {
-    int need = ViewCount();
+    if (!g_viewValid) ViewRebuild();
+    int need = g_viewEnd;        // 只算到最后一个非空条目：尾部空格不撑滚动范围
     int visible = g_slots;
     return need > visible ? (need - visible + g_cols - 1) / g_cols * (g_cell + g_gap) : 0;
 }
@@ -4370,6 +4376,12 @@ static void OnKeyDown(WPARAM w)
     if (n <= 0) return;
     int c = g_hoverCell;
     if (c < 0 || c >= n) c = 0;                     // 悬停失效时从第一格起
+    // 键盘悬停末界：内容末格与当前滚动下的可视末格取大者。滚动范围不再为
+    // 尾部空格延伸，键盘也不能停到既无内容又滚不到的空格上
+    int visLast = g_slots + (g_scroll / (g_cell + g_gap)) * g_cols - 1;
+    if (visLast > n - 1) visLast = n - 1;
+    int contentLast = (g_viewEnd ? g_viewEnd : n) - 1;
+    int navMax = contentLast > visLast ? contentLast : visLast;
     // Home/End/PageUp/PageDown：跳到首末格或翻整页（顺带把目标行滚进
     // 可视区——键盘导航没有"光标带着视图走"就等于跳丢）
     if (w == VK_HOME || w == VK_END || w == VK_PRIOR || w == VK_NEXT) {
@@ -4381,7 +4393,7 @@ static void OnKeyDown(WPARAM w)
         else if (w == VK_PRIOR)       nc = c - page;
         else                          nc = c + page;
         if (nc < 0) nc = 0;
-        if (nc >= n) nc = n - 1;
+        if (nc > navMax) nc = navMax;
         int og = g_hoverGroup;
         BOOL moved = ScrollCellIntoView(nc);
         g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
@@ -4398,7 +4410,7 @@ static void OnKeyDown(WPARAM w)
     case VK_DOWN:  nc = c + g_cols; break;
     default: return;
     }
-    if (nc < 0 || nc >= n) return;
+    if (nc < 0 || nc > navMax) return;
     int og = g_hoverGroup;
     g_hoverCell = nc; g_hoverGroup = -1; g_hoverBtn = 0;
     UpdateHoverText();
