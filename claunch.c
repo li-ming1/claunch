@@ -13,12 +13,11 @@
 // Ctrl+滚轮缩放（40~160 记忆）；键入即跨分组搜索（前缀>词首>子串>拼音首字母>
 // 路径排序，jsb→记事本），回车启动最优，Esc 清空。Ctrl+C/V 复制/粘贴悬停格。
 // 托盘菜单：显示面板 / 设置唤醒快捷键 / 开机自启（写 HKCU Run）/ 退出。
-// 内存红线（实测）：配置流式读写、图标按需加载、SHGetFileInfo 只作兜底、
+// 内存红线：配置流式读写、图标按需加载、SHGetFileInfo 只作兜底、
 // .lnk 解析 + CreateProcess 直启替代 ShellExecute、主窗断开 IME、
 // OLE 初始化与图标管线延迟到唤醒（见 InitOleDrop 注释）——破防会拖进
 // 15~30MB 外部模块链。注意"延迟"延的是初始化与管线，不是 DLL 本身：
-// ole32/combase 被 shell32 静态拖着，托盘态 32 个模块里那 9 个去不掉
-// （tmp\mods.c 实测，两次试图摘掉都被证伪）。
+// ole32/combase 被 shell32 静态拖着，托盘态模块里那 9 个去不掉。
 // 绘制走整窗离屏缓冲：直接绘制在快速滚动时露"画一半"中间帧，频闪。
 // 运行时零依赖：不链 libcmt/ucrt 也不链 vcruntime（构建命令行里 /NODEFAULTLIB
 // + /D CLAUNCH_NOCRT，见 README）。
@@ -242,8 +241,7 @@ static HBITMAP g_memBmp;
 static BOOL   g_memFresh;       // 缓冲重建后第一帧必须整窗重画
 
 static int  g_titleH = 34, g_sideW = 104, g_gap = 3, g_cell = 72, g_grpH = 34;   // 格子正方形
-// 侧栏分行几何：ScaleMetrics 随 DPI 一次算好，五个函数共用（原来裸 6/3/12
-// 散落五处且不随 DPI 缩放）
+// 侧栏分行几何：ScaleMetrics 随 DPI 一次算好，五个函数共用
 static int  g_grpPadX, g_grpPadTop, g_grpRowGap, g_grpPadY, g_grpSelBar;
 static int  g_cols = 1;    // 列数：只随窗口宽度变（WM_SIZE→UpdateCell），命中/绘制路径缓存读
 static int  g_slots = 1;   // 可视格数=列×行：同出处缓存，命中/绘制/滚动钳制直接读
@@ -424,8 +422,7 @@ static BOOL SameTextI(const WCHAR *a, const WCHAR *b)
 // ---------------------------------------------------------------- 格式化
 // 全文件只需要 %s/%d/%u/%llX 四种形状，且都落在配置读写与提示文案上。自带一个
 // 几十行的核替掉 libc 的 printf/scanf 整条链（cfout/cvt/input/atox + 宽字符转换
-// 与 locale 数据），实测镜像 241152 → 174592 字节（−65KB，−27%），顺带让
-// "写用户数据"这条路径不再经过不可控的格式解析。
+// 与 locale 数据），顺带让"写用户数据"这条路径不再经过不可控的格式解析。
 // 契约：dst 恒 NUL 收尾、空间不足即截断、返回实际写入长度。
 // 宽度前缀按补零处理（本文件只用 %02X 这种写法），l/h 修饰符读入即忽略。
 
@@ -683,8 +680,7 @@ static void UpdateCell(void)
     g_cols = c < 1 ? 1 : c;
     g_cell = (g_cw - g_sideW - (g_cols - 1) * g_gap) / g_cols;
     if (g_cell < 8) g_cell = 8;
-    // 整除零头摊进列间隙（每隙 ≤1px 肉眼不可分），右边缘永远冲齐——
-    // 原来全堆在右边缘，裸出一条背景色“断格”缝（issue 反馈的观感问题）
+    // 整除零头摊进列间隙（每隙 ≤1px 肉眼不可分），右边缘永远冲齐
     g_gapR = (g_cw - g_sideW - (g_cols - 1) * g_gap) - g_cols * g_cell;
     if (g_gapR < 0) g_gapR = 0;   // g_cell 撞 8px 下限钳制时可能为负：放弃摊平
     g_slots = g_cols * Rows();   // 每帧命中/绘制/滚动钳制直接读缓存
@@ -801,9 +797,8 @@ static int SlotAt(POINT p)
     return vi < g_slots ? vi : -1;
 }
 
-// 格子命中：列/行一次除到位，槽位与整格上界同源算清——原来经
-// SlotAt + CellRect 要四次除法，而这是鼠标移动的最高频路径。
-// 格子间隙里的点击不算命中（保持原语义）
+// 格子命中：列/行一次除到位，槽位与整格上界同源算清——这是鼠标移动的
+// 最高频路径，省掉多次除法。格子间隙里的点击不算命中（保持原语义）
 static int CellAt(POINT p)
 {
     if (p.x < g_sideW || p.y < g_titleH) return -1;
@@ -1156,7 +1151,7 @@ static BOOL ParseLnk(const WCHAR *path, LnkInfo *li)
 }
 
 // 图标画布：32bpp 自上而下 DIBSection 当颜色位图。GDI 绘制不动 alpha
-// （实测还会把触碰处 alpha 清 0），所以 alpha 必须画完后在 CanvasEnd 写；
+// （还会把触碰处 alpha 清 0），所以 alpha 必须画完后在 CanvasEnd 写；
 // 掩码位图只是占位——32bpp 颜色位图下 CreateIconIndirect 忽略掩码内容
 typedef struct { HDC dc; HBITMAP col, msk; DWORD *bits; } IconCanvas;
 
@@ -1325,8 +1320,8 @@ static HICON ShellIcon(const WCHAR *path)
 }
 
 // shell 命名空间项（回收站/此电脑/控制面板…）的图标：路径是 "::{CLSID}"
-// 解析名，SHGetFileInfo 直接吃字符串不认（实测 FAIL），经 SHParseDisplayName
-// 拿 PIDL 再走 SHGFI_PIDL 就能取到资源管理器同款（实测真图标）。纯注册表/
+// 解析名，SHGetFileInfo 直接吃字符串不认，经 SHParseDisplayName
+// 拿 PIDL 再走 SHGFI_PIDL 就能取到资源管理器同款真图标。纯注册表/
 // 内存操作，无文件系统 I/O，UI 线程安全
 static HICON NamespaceIcon(const WCHAR *path)
 {
@@ -2797,8 +2792,8 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         if (r.bottom < g_titleH || r.top > g_ch) continue;
         if (clip && !IntersectRect(&hit, &r, clip)) continue;   // 行不在脏区：整行跳过
         BOOL sel = (i == g_curGroup), hov = (i == g_hoverGroup);
-        // 选中/悬停行画成内缩圆角胶囊（选中绿调淡底、悬停格色浅底），
-        // 取代旧的整行平涂——行与行之间留出呼吸，侧栏不再是一块整板
+        // 选中/悬停行画成内缩圆角胶囊（选中绿调淡底、悬停格色浅底）——
+        // 行与行之间留出呼吸，侧栏不再是一块整板
         RECT pill = r;
         InflateRect(&pill, -S_(1), -S_(2));
         if (sel || hov) {
@@ -2807,7 +2802,7 @@ static void PaintSidebar(HDC dc, const RECT *clip)
             RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, S_(6), S_(6));
             SelectObject(dc, op); SelectObject(dc, ob);
         }
-        // 选中行左侧圆头竖指示条（取代旧的底部横条），文字让开它
+        // 选中行左侧圆头竖指示条，文字让开它
         if (sel) {
             int bh = (pill.bottom - pill.top) * 3 / 5;
             int cy = (pill.top + pill.bottom) / 2;
@@ -2819,7 +2814,9 @@ static void PaintSidebar(HDC dc, const RECT *clip)
             SelectObject(dc, op); SelectObject(dc, ob);
         }
         SetTextColor(dc, sel ? C_ACCEL : (hov ? C_TEXT : C_DIM));
-        RECT tr = { r.left + pad + (sel ? S_(6) : 0), r.top, r.right - pad, r.bottom };
+        // 让开左指示条时两侧对称内缩：DT_CENTER 下选中行文字与未选中行保持同一中心
+        int inset = sel ? S_(6) : 0;
+        RECT tr = { r.left + pad + inset, r.top, r.right - pad - inset, r.bottom };
         DrawTextW(dc, g_groups[i].name, -1, &tr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
@@ -2885,7 +2882,7 @@ static void PaintGrid(HDC dc, const RECT *clip)
     const int limit  = n > g_slots ? n : g_slots;
     const int rad0   = g_cell / 2 - 1;
     const int rad    = rad0 > S_(8) ? S_(8) : rad0;
-    // 每格要用的缩放量全部提到循环外：原来每格 5 次 S_、两次除法
+    // 每格要用的缩放量全部提到循环外：每格 5 次 S_、两次除法
     const int lblIn  = S_(2), lblTop = S_(17), lblBot = S_(3);
     const int iconX  = (g_cell - isz) / 2;        // 图标在格内的相对位置
     const int iconY  = (g_cell - S_(20) - isz) / 2;
@@ -3376,7 +3373,7 @@ static void TrayAdd(void)
     g_nid.hWnd = g_hwnd;
     g_nid.uID = TRAY_ID;
     // NIF_SHOWTIP 与 NIF_TIP 必须同时给：V4 行为下只给 NIF_TIP 的话，
-    // szTip 存得进去但悬停时不弹提示（实测复现：鼠标浮动托盘什么都没有）
+    // szTip 存得进去但悬停时不弹提示（鼠标浮动托盘什么都没有）
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAY;
     g_nid.hIcon = g_trayIcon;
@@ -3765,7 +3762,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
             // 就地弹回面板（WM_APP_DRAGWAKE → SW_SHOWNA 不抢拖放源的前台），
             // 让落点重新可投递。只在进入沿口发一次；普通移动/悬停零打扰。
             // 没按左键的移动是系统里最频繁的事件：先看本地镜像直接走掉，
-            // 原来的 IsWindowVisible + GetAsyncKeyState 两次内核查询全省了
+            // 省掉 IsWindowVisible + GetAsyncKeyState 两次内核查询
             if (!s_lbtnDown) {
                 s_dragInRect = FALSE;
             } else if (!g_dlgOpen && !g_dock && !IsWindowVisible(g_hwnd)) {
@@ -4045,7 +4042,7 @@ static void OnPaint(HWND h)
     RECT crc;
     GetClientRect(h, &crc);
     if (crc.right != g_cw || crc.bottom != g_ch) OnSize(h, MAKELPARAM(crc.right, crc.bottom));
-    // 隐藏窗没有可画的内容：启动期实测 Windows 会给不可见的层面板发
+    // 隐藏窗没有可画的内容：Windows 会给不可见的层面板发
     // WM_PAINT——整段跳过（图标/shell 管线/离屏缓冲全不碰），一次省
     // ~16MB 工作集 + ~50 GDI。唤醒后窗口可见，照常全量绘制
     if (IsWindowVisible(h)) {
@@ -4903,7 +4900,7 @@ static void OnDestroy(HWND h)
     }
     UnregisterHotKey(h, HOTKEY_ID);
     for (int i = 0; i < g_nItems; i++) DropIcon(i);
-    // GDI 对象收尾：数组一遍过（原来 13 条逐项 if+DeleteObject，缩进还乱）
+    // GDI 对象收尾：数组一遍过
     HGDIOBJ objs[] = {
         g_font, g_fontT,
         g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine,
