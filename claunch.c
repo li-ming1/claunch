@@ -109,6 +109,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define TIMER_DRAGSCROLL 3   // 拖放悬停网格边缘的自动滚动
 #define TIMER_ICONS     4    // 缩放手势停稳后重解析图标
 #define TIMER_SCROLL    5    // 滚动缓动：每拍指数逼近 g_scrollTo，收敛即停
+#define TIMER_DRAGDWELL 6    // 拖放静置：按住左键在静置区停住够久才唤醒（滤掉拖选文字路过）
 #define HOTKEY_ID       1
 #define CAP_CLASS       L"ClaunchCapWnd"     // 热键捕获对话框类
 
@@ -118,6 +119,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define FLASH_MS        1200   // 标题栏反馈消息的停留时间
 #define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
 #define EDGE_TOUCH      2      // 触边唤出：光标离工作区边多近算“贴上”
+#define DRAG_WAKE_DWELL_MS 350 // 拖放唤醒：按住左键在静置区停住多久才弹回面板
 #define EDGE_RELEASE    16     // 触边唤出：离开沿口多远才重新武装（迟滞防抖）
 #define EDGE_INSET      64     // 触边唤出：沿口两端角部避让（物理像素，防误触角落）
 #define DOCK_OFF        0      // 贴边停靠档位：托盘“贴边唤出”四项与 ini Dock= 共用
@@ -4899,6 +4901,21 @@ static void OnTimer(HWND h, WPARAM w)
         KillTimer(h, TIMER_ICONS);
         for (int i = 0; i < g_nItems; i++) DropIcon(i);
         InvalidateRect(h, NULL, FALSE);
+    } else if (w == TIMER_DRAGDWELL) {
+        // 静置到点：确认仍在拖放（左键仍按下）、光标仍在静置区内，再就地弹回面板。
+        // 中途移出/松手（如拖选文字路过）则什么都不做
+        KillTimer(h, TIMER_DRAGDWELL);
+        if (IsWindowVisible(h) || g_dlgOpen) return;
+        if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
+        POINT p; GetCursorPos(&p);
+        RECT r; GetWindowRect(h, &r);
+        if (!PtInRect(&r, p)) return;
+        // 就地显示但不抢前台（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动
+        InitOleDrop(h);      // 先注册拖放目标再显示：可被命中时目标必已就位
+        WakePrune();
+        ShowWindow(h, SW_SHOWNA);
+        StartFadeIn();
+        SetTimer(h, TIMER_HIDE, 120, NULL);
     }
 }
 
@@ -4993,15 +5010,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                                if (!IsWindowVisible(h) && !g_dlgOpen && !g_menuOpen
                                    && !g_extDrag && g_dock) ShowDocked(p);
                                                                         return 0; }
-    // 拖放唤醒：面板隐藏时拖动光标进入其静置区——就地显示但不抢前台
-    //（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动（落点就在原地）
-    case WM_APP_DRAGWAKE:      if (!IsWindowVisible(h) && !g_dlgOpen) {
-                                   InitOleDrop(h);      // 先注册拖放目标再显示：
-                                   WakePrune();        // 可被命中时目标必已就位
-                                   ShowWindow(h, SW_SHOWNA);
-                                   StartFadeIn();
-                                   SetTimer(h, TIMER_HIDE, 120, NULL);
-                               }                                     return 0;
+    // 拖放唤醒：面板隐藏时拖动光标进入其静置区——先起静置计时，停住够久才弹回。
+    // 一进入就弹会把"拖选文字"这类普通拖动也当成拖放（整块面板都是静置区，
+    // 拖选路过就误唤醒）；静置判定让普通拖动路过不打扰，真拖文件来放才弹
+    case WM_APP_DRAGWAKE:      if (!IsWindowVisible(h) && !g_dlgOpen)
+                                   SetTimer(h, TIMER_DRAGDWELL, DRAG_WAKE_DWELL_MS, NULL);
+                                                                        return 0;
     case WM_DESTROY:           OnDestroy(h);                             return 0;
     default:                                                             break;
     }
