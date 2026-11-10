@@ -4066,8 +4066,7 @@ static void OnPaint(HWND h)
             PaintWindow(dc, NULL);       // 缓冲不可用：直绘兜底，无裁剪全画
         } else {
             // 只重画更新区域：整窗重画会拖垮消息队列（悬停文字/右键跟着卡）。
-            // 上屏的永远是同帧刚画过的 rc——缓冲其余部分从不直接上屏
-            //（TIMER_SCROLL 的位块平移只搬屏幕，缓冲里的旧滚动位不会被读到）
+            // 上屏的永远是同帧刚画过的 rc——缓冲其余部分保持上一帧、与屏幕一致
             RECT rc = ps.rcPaint;
             if (g_memFresh) { rc.left = 0; rc.top = 0; rc.right = g_cw; rc.bottom = g_ch; }
             // 裁剪走 IntersectClipRect：memDC 每次画完都 SelectClipRgn(NULL)
@@ -4872,28 +4871,14 @@ static void OnTimer(HWND h, WPARAM w)
         OleUpdateOver((POINTL){ g_oleAutoPt.x, g_oleAutoPt.y });
     } else if (w == TIMER_SCROLL) {
         // 缓动步进：每拍走掉剩余的 1/3（指数缓停），尾程一次落位防小步振荡。
-        // 位移走 ScrollWindowEx 位块平移：屏幕内容整体搬 dy，只重画露出条带，
-        // 每拍成本从"全部可视格"降到"条带相交的一行格"。
-        // 卡片先在旧滚动位下同步擦掉再平移——否则卡片像素被一并搬走，
-        // 旧卡矩形的擦除够不着平移后的残影
+        // 每拍整格区重绘。曾用 ScrollWindowEx 位块平移只画露出条带（省 CPU），
+        // 但滚到底部露出条带边缘会累积 1px 残影、静止时可见，遂回退——画面正确优先
         int remain = g_scrollTo - g_scroll;
         if (remain) {
-            int ns = (remain > -3 && remain < 3) ? g_scrollTo : g_scroll + remain / 3;
-            int dy = ns - g_scroll;
-            if (g_cardOn) {
-                InvalidateRect(h, &g_cardRect, FALSE);
-                g_cardOn = FALSE;
-                UpdateWindow(h);
-            }
-            g_scroll = ns;
+            g_scroll = (remain > -3 && remain < 3) ? g_scrollTo : g_scroll + remain / 3;
             RECT gr = { g_sideW, g_titleH, g_cw, g_ch };
-            if (ScrollWindowEx(h, 0, -dy, &gr, &gr, NULL, NULL, SW_INVALIDATE) == ERROR)
-                InvalidateRect(h, &gr, FALSE);   // 平移失败兜底：整格区重绘
-            // 条带先单独画掉：ps.rcPaint 是更新区的外接矩形，若与随后的
-            // 卡片矩形合并，包围盒会铺满大半个网格，脏区剔除就此失效
-            UpdateWindow(h);
+            InvalidateRect(h, &gr, FALSE);
             RefreshCard();
-            UpdateWindow(h);   // 卡片同拍画完：擦除到重现之间不留可被合成的空帧
         }
         if (g_scroll == g_scrollTo) KillTimer(h, TIMER_SCROLL);
     } else if (w == TIMER_ICONS) {
