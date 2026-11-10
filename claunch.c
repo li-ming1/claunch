@@ -4305,25 +4305,21 @@ static void OnRButtonUp(LPARAM l)
     }
 }
 
-// 滚轮：Ctrl+滚轮缩放格子（光标在左右区域都响应）；侧栏滚轮切分组
-//（等同于点击相邻分组，到头循环）；格子区滚动一格并让卡片跟随
+// 滚轮：Ctrl+滚轮缩放格子；普通滚轮在面板任意区域都是切换分组
+//（与侧栏滚轮同一语义，到头循环）
 static void OnWheel(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-    if (m == WM_MOUSEWHEEL) ScreenToClient(h, &p);
+    UNREF(h);
+    UNREF(l);
     int d = (m == WM_APP_WHEEL) ? (int)(short)w : (int)GET_WHEEL_DELTA_WPARAM(w);
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
         ApplyCellBase(g_cellBase + (d > 0 ? 4 : -4));
         return;
     }
-    if (p.x < g_sideW) {
-        int gi = g_curGroup + (d > 0 ? -1 : 1);
-        if (gi < 0) gi = g_nGroups - 1;
-        if (gi >= g_nGroups) gi = 0;
-        SelectGroup(gi);
-    } else {
-        ScrollTo(g_scrollTo + (d > 0 ? -1 : 1) * (g_cell + g_gap));
-    }
+    int gi = g_curGroup + (d > 0 ? -1 : 1);
+    if (gi < 0) gi = g_nGroups - 1;
+    if (gi >= g_nGroups) gi = 0;
+    SelectGroup(gi);
 }
 
 static void OnKeyDown(WPARAM w)
