@@ -120,6 +120,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
 #define EDGE_TOUCH      2      // 触边唤出：光标离工作区边多近算“贴上”
 #define DRAG_WAKE_DWELL_MS 350 // 拖放唤醒：按住左键在静置区停住多久才弹回面板
+#define DRAG_STILL_MS   200    // 拖放唤醒：光标要静止多久才算“停在面板上”而不是拖选路过
 #define EDGE_RELEASE    16     // 触边唤出：离开沿口多远才重新武装（迟滞防抖）
 #define EDGE_INSET      64     // 触边唤出：沿口两端角部避让（物理像素，防误触角落）
 #define DOCK_OFF        0      // 贴边停靠档位：托盘“贴边唤出”四项与 ini Dock= 共用
@@ -3674,6 +3675,7 @@ static void ShowTitleMenu(void)
 static ULONGLONG s_lastClick = 0;
 static POINT  s_lastPt = { 0, 0 };
 static BOOL   s_dragInRect;     // 拖动光标是否在面板静置区内（只报“从区外进入”的沿口）
+static ULONGLONG s_lastMoveAt;  // 最近一次按住左键的移动时刻：UI 线程定时器读（x64 对齐 64 位读原子）
 static BOOL   s_edgeIn;         // 光标是否已报过贴边候选（本线程私有：进沿口只报一次）
 static BOOL   s_lbtnDown;       // 左键按住的本地镜像：钩子自己看得到按下/抬起，
                                 // 移动事件里就不必再问 GetAsyncKeyState
@@ -3762,6 +3764,11 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (wParam == WM_LBUTTONDOWN) {
             MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
             s_lbtnDown = TRUE;
+            // 起点已在静置区内 = 在面板位置底下选东西，不是从外面拖进来。
+            // 不记这一笔，隐藏面板压着的任何选区拖动都会被当成“进入”而误唤醒
+            RECT wr;
+            GetWindowRect(g_hwnd, &wr);
+            s_dragInRect = PtInRect(&wr, p->pt) != 0;
             ULONGLONG now = GetTickCount64();
             int dx = p->pt.x - s_lastPt.x, dy = p->pt.y - s_lastPt.y;
             if (dx < 0) dx = -dx;
@@ -3791,6 +3798,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
                 // 成灾——停用静置区弹回，唤出统一交给触边（WM_APP_EDGEEWAKE）
                 // GetWindowRect 是窗口管理器查询不发消息，UI 线程卡死也不拖累钩子
                 MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+                s_lastMoveAt = GetTickCount64();   // 定时器据此要求“停住”才唤醒
                 RECT r;
                 GetWindowRect(g_hwnd, &r);
                 BOOL inside = PtInRect(&r, p->pt) != 0;
@@ -4903,6 +4911,16 @@ static void OnTimer(HWND h, WPARAM w)
         POINT p; GetCursorPos(&p);
         RECT r; GetWindowRect(h, &r);
         if (!PtInRect(&r, p)) return;
+        // 还在动 = 拖选/拖放路过而不是要往面板上放：续期，等真的停下来再判
+        if (GetTickCount64() - s_lastMoveAt < DRAG_STILL_MS) {
+            SetTimer(h, TIMER_DRAGDWELL, 100, NULL);
+            return;
+        }
+        // I 形光标 = 文字拖选（编辑器/浏览器里选字），不是往面板里拖文件
+        CURSORINFO ci;
+        ZeroMemory(&ci, sizeof ci);
+        ci.cbSize = sizeof ci;
+        if (GetCursorInfo(&ci) && ci.hCursor == LoadCursorW(NULL, IDC_IBEAM)) return;
         // 就地显示但不抢前台（SW_SHOWNA：前台一抢，拖放源的拖动就断了），位置不动
         InitOleDrop(h);      // 先注册拖放目标再显示：可被命中时目标必已就位
         WakePrune();
