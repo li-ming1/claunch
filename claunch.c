@@ -3681,8 +3681,10 @@ static HWND DesktopListViewFrom(HWND h)
 }
 
 // 跨进程命中测试：LVHITTESTINFO 必须放在目标进程的内存里，
-// 裸 SendMessage 传指针跨进程是未定义行为。任何一步失败都按“命中图标”处理——
-// 宁可漏唤醒，也绝不能在双击图标启动程序时误弹面板。
+// 裸 SendMessage 传指针跨进程是未定义行为。命中测试能跑通时按实际结果判定
+// （图标上不唤醒）；跑不通时（新版 Windows 对 explorer 加固，跨进程内存
+// 分配/读写被拒）无法区分图标与空白——按空白处理照常唤醒：宁可偶在双击
+// 图标时多弹一次面板，也不让桌面双击唤醒整体失效。
 static BOOL PointHitsDesktopIcon(HWND lv, POINT ptScr)
 {
     struct { POINT pt; UINT flags; int iItem; int iSubItem; } hi;
@@ -3693,11 +3695,11 @@ static BOOL PointHitsDesktopIcon(HWND lv, POINT ptScr)
 
     DWORD pid = 0;
     GetWindowThreadProcessId(lv, &pid);
-    if (!pid) return TRUE;
+    if (!pid) return FALSE;
     HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ |
                             PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!hp) return TRUE;
-    BOOL hit = TRUE;
+    if (!hp) return FALSE;
+    BOOL hit = FALSE;                 // 测不了 = 按空白（唤醒），不是按图标
     void *rm = VirtualAllocEx(hp, NULL, sizeof hi, MEM_COMMIT, PAGE_READWRITE);
     if (rm && WriteProcessMemory(hp, rm, &hi, sizeof hi, NULL)) {
         DWORD_PTR res = 0;
@@ -3705,7 +3707,6 @@ static BOOL PointHitsDesktopIcon(HWND lv, POINT ptScr)
                                 SMTO_ABORTIFHUNG, 120, &res) &&
             ReadProcessMemory(hp, rm, &hi, sizeof hi, NULL))
             hit = (hi.iItem != -1);   // 未命中任何图标 = 桌面空白
-        // 超时/读写失败：hit 保持 TRUE（保守：当成图标，不唤醒）
     }
     if (rm) VirtualFreeEx(hp, rm, 0, MEM_RELEASE);
     CloseHandle(hp);
