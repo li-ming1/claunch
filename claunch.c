@@ -167,17 +167,22 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 // 注意：输入框与浏览按钮的 ID 段必须分开。输入框会发 EN_* 通知，
 // 若与浏览按钮 ID 相同，打开对话框的瞬间就会被当成“点击浏览”而弹出文件选择框。
 
-// 配色（暗色，格子可见边框）
-#define C_BG        RGB(0x2B, 0x2D, 0x31)
-#define C_SIDE      RGB(0x23, 0x25, 0x28)
-#define C_CELL      RGB(0x38, 0x3B, 0x40)
-#define C_CELL_HI   RGB(0x47, 0x4B, 0x53)
-#define C_LINE      RGB(0x4D, 0x51, 0x59)
-#define C_ACCENT    RGB(0x3D, 0x7B, 0xE7)
-#define C_ACCEL     RGB(0x35, 0xC4, 0x6A)   // 选中分组的高亮色（与参考实现一致：绿）
-#define C_TEXT      RGB(0xEC, 0xED, 0xEF)
-#define C_DIM       RGB(0x9C, 0x9F, 0xA5)
-#define C_PANEL     RGB(0x33, 0x35, 0x3A)
+// 配色（暗色·分层卡片）：背景 deepest，侧栏次之，格子是浮起的小卡片。
+// 边框压成低对比细线（只在空格/卡片/分隔处出现），常规格子靠底色差+圆角
+// 与间隙分离，去掉"满屏盒子"的噪声。强调色统一驱动焦点态。
+#define C_BG        RGB(0x24, 0x26, 0x2B)
+#define C_SIDE      RGB(0x1C, 0x1E, 0x22)
+#define C_CELL      RGB(0x31, 0x34, 0x3B)
+#define C_CELL_HI   RGB(0x3E, 0x42, 0x4B)
+#define C_LINE      RGB(0x3C, 0x3F, 0x46)
+#define C_ACCENT    RGB(0x5B, 0x9B, 0xF0)
+#define C_ACCEL     RGB(0x3E, 0xCF, 0x7A)   // 选中分组的高亮色（与参考实现一致：绿）
+#define C_TEXT      RGB(0xF2, 0xF3, 0xF5)
+#define C_DIM       RGB(0x9A, 0x9E, 0xA7)
+#define C_PANEL     RGB(0x2C, 0x2E, 0x34)
+#define C_SHADOW    RGB(0x14, 0x15, 0x18)   // 卡片假阴影：比背景更深一档
+#define C_SIDE_SEL  RGB(0x26, 0x3A, 0x30)   // 选中分组胶囊：绿调淡底（呼应 C_ACCEL）
+#define C_BAD       RGB(0xF1, 0x6A, 0x5E)   // 启动失败反馈文字：亮红（暗底上可读）
 #define C_CLOSE     RGB(0xC4, 0x2B, 0x2B)   // 关闭键悬停底：Windows 标题栏惯例暗红
 #define C_CLOSE_PR  RGB(0x9C, 0x22, 0x22)   // 关闭键按下底：深一档
 #define C_BTN_PR    RGB(0x41, 0x44, 0x4B)   // 钉住键按下底：比悬停底深一档
@@ -225,6 +230,7 @@ static int       g_dpi = 96;
 
 static HFONT  g_font, g_fontT;
 static HBRUSH g_brBG, g_brSide, g_brCell, g_brCellHi, g_brLine, g_brAccent, g_brAccel, g_brPanel;
+static HBRUSH g_brShadow, g_brSideSel;   // 卡片假阴影 / 选中分组胶囊底
 static HPEN   g_penLine;              // 格子/卡片边框（1px C_LINE）
 static HPEN   g_penAccent;            // 格子悬停/拖动焦点环（1px C_ACCENT）
 // 标题栏按钮的图形对象（缓存，见 MakeGdiObjects）：钉住三态填色 +
@@ -267,6 +273,7 @@ static BOOL  g_cardOn = FALSE;  // 悬停小卡片可见（悬停格子/分组�
 static RECT  g_cardRect;        // 卡片区域：悬停目标变化时重算，绘制只读
 static WCHAR g_cardText[80];    // 卡片文字：程序名/组名
 static WCHAR g_flashText[80];   // 标题栏启动反馈（"已启动/启动失败: 名"）
+static COLORREF g_flashColor = C_TEXT;  // 反馈文字色：成功绿 / 失败红 / 其余中性
 static ULONGLONG g_flashAt = 0;  // 反馈起始时刻；1.2s 后自然过期（0=无）。64 位时刻：无 49 天回绕
 
 static int  g_pressCell = -1;   // 按下的格子：原地抬起=启动，拖过阈值=排序
@@ -2368,6 +2375,8 @@ static void MakeBrushes(void)
     g_brAccent = CreateSolidBrush(C_ACCENT);
     g_brAccel  = CreateSolidBrush(C_ACCEL);
     g_brPanel  = CreateSolidBrush(C_PANEL);
+    g_brShadow = CreateSolidBrush(C_SHADOW);
+    g_brSideSel = CreateSolidBrush(C_SIDE_SEL);
 }
 
 // 标题栏按钮与格子边框的 GDI 对象：颜色固定，DPI 变化时整套重建
@@ -2548,12 +2557,18 @@ static void DrawCard(HDC dc)
 {
     RECT r = g_cardRect;
     int rad = S_(8);
-    HPEN op = (HPEN)SelectObject(dc, g_penLine);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, g_brPanel);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);   // 圆角面板：填充+边框一枚调用
+    int sh  = S_(3);                       // 假阴影偏移：面板内缩于卡矩形，阴影落在右下，
+    RECT panel  = { r.left, r.top, r.right - sh, r.bottom - sh };   // 全程不越 g_cardRect——
+    RECT shadow = { r.left + sh, r.top + sh, r.right, r.bottom };   // 失效区/锚定几何都不用改
+    HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+    HBRUSH ob = (HBRUSH)SelectObject(dc, g_brShadow);
+    RoundRect(dc, shadow.left, shadow.top, shadow.right, shadow.bottom, rad, rad);
+    SelectObject(dc, g_penLine);
+    SelectObject(dc, g_brPanel);
+    RoundRect(dc, panel.left, panel.top, panel.right, panel.bottom, rad, rad);   // 填充+边框一枚
     SelectObject(dc, op); SelectObject(dc, ob);
     SetTextColor(dc, C_TEXT);
-    DrawTextW(dc, g_cardText, -1, &r,
+    DrawTextW(dc, g_cardText, -1, &panel,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
@@ -2642,6 +2657,7 @@ static void InvalidateSidebar(void)
 static void FlashMsg(const WCHAR *text)
 {
     wcpy(g_flashText, 80, text);
+    g_flashColor = C_TEXT;       // 通用反馈中性色；FlashLaunch 随后按结果覆写
     g_flashAt = GetTickCount64();
     InvalidateTitle();
 }
@@ -2660,6 +2676,7 @@ static void FlashFmt(const WCHAR *fmt, ...)
 static void FlashLaunch(BOOL ok, const WCHAR *name)
 {
     FlashFmt(ok ? L"已启动: %s" : L"启动失败: %s", name);
+    g_flashColor = ok ? C_ACCEL : C_BAD;   // 结果一眼可辨：成功绿 / 失败红
 }
 
 static BOOL FlashActive(void)
@@ -2780,18 +2797,31 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         if (r.bottom < g_titleH || r.top > g_ch) continue;
         if (clip && !IntersectRect(&hit, &r, clip)) continue;   // 行不在脏区：整行跳过
         BOOL sel = (i == g_curGroup), hov = (i == g_hoverGroup);
-        // 选中行常亮底 + 下方指示条；未选中行悬停时给同一层浅底，让
-        // “这一行有反应”可感知（两者互斥取同一刷子，不会叠加）
-        if (sel || hov) FillRect(dc, &r, g_brCell);
+        // 选中/悬停行画成内缩圆角胶囊（选中绿调淡底、悬停格色浅底），
+        // 取代旧的整行平涂——行与行之间留出呼吸，侧栏不再是一块整板
+        RECT pill = r;
+        InflateRect(&pill, -S_(1), -S_(2));
+        if (sel || hov) {
+            HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+            HBRUSH ob = (HBRUSH)SelectObject(dc, sel ? g_brSideSel : g_brCell);
+            RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, S_(6), S_(6));
+            SelectObject(dc, op); SelectObject(dc, ob);
+        }
+        // 选中行左侧圆头竖指示条（取代旧的底部横条），文字让开它
+        if (sel) {
+            int bh = (pill.bottom - pill.top) * 3 / 5;
+            int cy = (pill.top + pill.bottom) / 2;
+            RECT bar = { pill.left + S_(3), cy - bh / 2,
+                         pill.left + S_(3) + g_grpSelBar, cy + bh / 2 };
+            HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+            HBRUSH ob = (HBRUSH)SelectObject(dc, g_brAccel);
+            RoundRect(dc, bar.left, bar.top, bar.right, bar.bottom, g_grpSelBar, g_grpSelBar);
+            SelectObject(dc, op); SelectObject(dc, ob);
+        }
         SetTextColor(dc, sel ? C_ACCEL : (hov ? C_TEXT : C_DIM));
-        RECT tr = { r.left + pad, r.top, r.right - pad, r.bottom };
+        RECT tr = { r.left + pad + (sel ? S_(6) : 0), r.top, r.right - pad, r.bottom };
         DrawTextW(dc, g_groups[i].name, -1, &tr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        // 选中标记放在下方（原来在左侧）
-        if (sel) {
-            RECT bar = { r.left, r.bottom - g_grpSelBar, r.right, r.bottom };
-            FillRect(dc, &bar, g_brAccel);
-        }
         // 分组重排的落点高亮（源行即当前选中行，已有底色，不重复画）
         if (g_dragGroup && i == g_dropGroup && i != g_pressGroup)
             FrameInset(dc, r, S_(2), g_brAccent);
@@ -2811,8 +2841,11 @@ static void PaintSidebar(HDC dc, const RECT *clip)
         if (thumbH > trackH) thumbH = trackH;
         int maxS = content - view;
         int thumbY = trackTop + (maxS > 0 ? (trackH - thumbH) * g_grpScroll / maxS : 0);
-        RECT th = { g_sideW - S_(5), thumbY, g_sideW - S_(3), thumbY + thumbH };
-        FillRect(dc, &th, g_brLine);
+        RECT th = { g_sideW - S_(6), thumbY, g_sideW - S_(3), thumbY + thumbH };
+        HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+        HBRUSH ob = (HBRUSH)SelectObject(dc, g_brLine);
+        RoundRect(dc, th.left, th.top, th.right, th.bottom, S_(3), S_(3));   // 圆头细条
+        SelectObject(dc, op); SelectObject(dc, ob);
     }
 }
 
@@ -2822,7 +2855,7 @@ static void PaintTitle(HDC dc)
     RECT ttl = { g_sideW + S_(8), 0, g_cw - g_btnZoneW - S_(8), g_titleH };
     if (FlashActive()) {
         // 启动反馈优先：刚点过启动，先让用户看到结果（悬停/搜索都让位）
-        SetTextColor(dc, C_TEXT);
+        SetTextColor(dc, g_flashColor);
         DrawTextW(dc, g_flashText, -1, &ttl,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     } else if (g_filter[0]) {
@@ -2851,15 +2884,16 @@ static void PaintGrid(HDC dc, const RECT *clip)
     const int n      = ViewCount();               // 一次定表：循环里直读 g_viewIdx
     const int limit  = n > g_slots ? n : g_slots;
     const int rad0   = g_cell / 2 - 1;
-    const int rad    = rad0 > S_(6) ? S_(6) : rad0;
+    const int rad    = rad0 > S_(8) ? S_(8) : rad0;
     // 每格要用的缩放量全部提到循环外：原来每格 5 次 S_、两次除法
     const int lblIn  = S_(2), lblTop = S_(17), lblBot = S_(3);
     const int iconX  = (g_cell - isz) / 2;        // 图标在格内的相对位置
     const int iconY  = (g_cell - S_(20) - isz) / 2;
-    // 边框 pen / 底色 brush 循环外只选一次（普通态）；一枚 RoundRect 同时
-    // 完成填充+边框+圆角。悬停/拖动格换 accent 边——焦点环贴着圆角走
-    // （替代旧的内缩 FrameRect），悬停重绘反而少一次 GDI 调用
-    HPEN   op = (HPEN)SelectObject(dc, g_penLine);
+    // 常规格子是无边卡片：NULL_PEN + 格色一枚 RoundRect 搞定，间隙即分隔。
+    // 空格 recess 成背景色凹洞 + 低对比细框（看得出是可落位的槽）；悬停/拖动
+    // 换 accent 边 + 提亮底。pen/brush 循环外只选一次普通态，少数焦点态/空格
+    // 才临时换对象再还原——密集绘制路径不为美化加每格间接层
+    HPEN   op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
     HBRUSH ob = (HBRUSH)SelectObject(dc, g_brCell);
     SetTextColor(dc, C_TEXT);            // 所有格子的标签同色：循环外设一次
     RECT hit;
@@ -2874,6 +2908,7 @@ static void PaintGrid(HDC dc, const RECT *clip)
             // 脏区剔除：悬停/拖动时只脏 1~2 格，与更新区不相交的整格连 GDI 调用都不发
             if (clip && !IntersectRect(&hit, &r, clip)) continue;
             int ii = vi < n ? g_viewIdx[vi] : -1;   // 视图表直读：省掉脏检查与边界重验
+            BOOL empty = (ii < 0 || !g_items[ii].path[0]);
             BOOL hov = (vi == g_hoverCell) && ii >= 0;
             // 拖动标示两路共用：内部排序（g_dragging）与外部 OLE 拖放（g_extDrag，
             // 无按下格概念）互斥，任一激活时落点格画常规底 + accent 边
@@ -2883,13 +2918,19 @@ static void PaintGrid(HDC dc, const RECT *clip)
             if (hov || drag) {          // 焦点态：accent 边 + 提亮底（悬停）/常规底（拖动标示）
                 SelectObject(dc, g_penAccent);
                 SelectObject(dc, hov ? g_brCellHi : g_brCell);
-            }
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
-            if (hov || drag) {          // 恢复普通态对象，后续格子不必重选
-                SelectObject(dc, g_penLine);
+                RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+                SelectObject(dc, GetStockObject(NULL_PEN));
                 SelectObject(dc, g_brCell);
+            } else if (empty) {         // 空格：背景色凹洞 + 低对比细框，无图标/名字
+                SelectObject(dc, g_penLine);
+                SelectObject(dc, g_brBG);
+                RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+                SelectObject(dc, GetStockObject(NULL_PEN));
+                SelectObject(dc, g_brCell);
+                continue;
+            } else {                    // 常规无边卡片：对象已是普通态，直接一枚 RoundRect
+                RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
             }
-            if (ii < 0 || !g_items[ii].path[0]) continue;   // 空格：只画底框，无图标/名字
             if (!g_items[ii].iconTried) EnsureIcon(ii);     // 已解析的格子省一次调用
             if (g_items[ii].icon)
                 DrawIconEx(dc, x + iconX, y + iconY, g_items[ii].icon, isz, isz,
@@ -2922,6 +2963,15 @@ static void PaintWindow(HDC dc, const RECT *clip)
     if (!clip || IntersectRect(&hit, &gr, clip)) PaintGrid(dc, clip);
     // 小卡片最后画：压在侧栏/标题/格子之上；脏区不碰卡片时整段跳过
     if (g_cardOn && (!clip || IntersectRect(&hit, &g_cardRect, clip))) DrawCard(dc);
+    // 窗口外缘 1px 圆角描边：暗色面板在任意桌面上都有清晰边界。
+    // 只在脏区触及四缘时画（内部悬停重绘不碰它），空心刷只描边不填底
+    if (!clip || clip->left <= 0 || clip->top <= 0 ||
+        clip->right >= g_cw || clip->bottom >= g_ch) {
+        HPEN op = (HPEN)SelectObject(dc, g_penLine);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        RoundRect(dc, 0, 0, g_cw, g_ch, S_(10), S_(10));
+        SelectObject(dc, op); SelectObject(dc, ob);
+    }
     SelectObject(dc, old);
 }
 
@@ -2985,7 +3035,7 @@ static void OnDlgCreate(HWND h)
                                   h, (HMENU)(INT_PTR)(2000 + i), g_inst, NULL);
         int ex = S_(16) + c->labW;
         int ew = c->dlgW - ex - S_(14) - (c->f[i].mode ? c->browseW + S_(6) : 0);
-        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", c->f[i].buf,
+        HWND ed = CreateWindowExW(0, L"EDIT", c->f[i].buf,
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | ES_AUTOHSCROLL,
                                   ex, y, ew, S_(23), h,
                                   (HMENU)(INT_PTR)(ID_EDIT_BASE + i), g_inst, NULL);
@@ -2994,7 +3044,7 @@ static void OnDlgCreate(HWND h)
         c->ed[i] = ed;
         if (c->f[i].mode) {
             HWND b = CreateWindowExW(0, L"BUTTON", L"浏览(&B)...",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      c->dlgW - S_(14) - c->browseW, y, c->browseW, S_(23),
                                      h, (HMENU)(INT_PTR)(DLG_BROWSE + i), g_inst, NULL);
             SendMessageW(b, WM_SETFONT, (WPARAM)g_font, TRUE);
@@ -3004,17 +3054,44 @@ static void OnDlgCreate(HWND h)
     int bw = S_(84), bh = S_(27);
     int by = c->titleH + S_(10) + c->n * c->rowH + S_(12);
     HWND ok = CreateWindowExW(0, L"BUTTON", L"确定",
-                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                               c->dlgW - S_(14) - bw * 2 - S_(8), by, bw, bh,
                               h, (HMENU)(INT_PTR)DLG_OK, g_inst, NULL);
     HWND cancel = CreateWindowExW(0, L"BUTTON", L"取消",
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                   c->dlgW - S_(14) - bw, by, bw, bh,
                                   h, (HMENU)(INT_PTR)DLG_CANCEL, g_inst, NULL);
     SendMessageW(ok, WM_SETFONT, (WPARAM)g_font, TRUE);
     SendMessageW(cancel, WM_SETFONT, (WPARAM)g_font, TRUE);
+    // owner-draw 不吃 BS_DEFPUSHBUTTON 样式：默认钮改由 DM_SETDEFID 指定，
+    // IsDialogMessage 的回车触发认它（绘制态主按钮另按 CtlID 判，ODS_DEFAULT
+    // 对纯 owner-draw 不一定置位）
+    SendMessageW(h, DM_SETDEFID, DLG_OK, 0);
     SetFocus(c->n > 0 ? c->ed[0] : ok);
     if (c->n > 0) SendMessageW(c->ed[0], EM_SETSEL, 0, -1);
+}
+
+// 自绘按钮：暗色圆角，与主窗同一视觉语言。默认钮（确定）强调色底，
+// 其余格色；按下深一档，焦点 accent 边。文字从控件取（owner-draw 不带文本）
+static void OnDlgDrawItem(const DRAWITEMSTRUCT *di)
+{
+    HDC dc = di->hDC;
+    RECT r = di->rcItem;
+    BOOL sel   = (di->itemState & ODS_SELECTED) != 0;
+    BOOL def   = (di->CtlID == DLG_OK);   // 主按钮恒为确定：ODS_DEFAULT 对纯 owner-draw 不一定置位
+    BOOL focus = (di->itemState & ODS_FOCUS) != 0;
+    HPEN   op = (HPEN)SelectObject(dc, focus ? g_penAccent : g_penLine);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, sel ? g_brBtnPress : (def ? g_brAccent : g_brCell));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, S_(6), S_(6));
+    SelectObject(dc, op); SelectObject(dc, ob);
+    WCHAR txt[64];
+    GetWindowTextW(di->hwndItem, txt, 64);
+    HFONT old = (HFONT)SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, C_TEXT);
+    InflateRect(&r, -S_(4), 0);
+    DrawTextW(dc, txt, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
 }
 
 static void OnDlgCommand(HWND h, WPARAM w)
@@ -3077,6 +3154,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_ERASEBKGND:      { RECT rc; GetClientRect(h, &rc);
                                FillRect((HDC)w, &rc, g_brPanel);  return 1; }
     case WM_PAINT:             OnDlgPaint(h);                      return 0;
+    case WM_DRAWITEM:          OnDlgDrawItem((const DRAWITEMSTRUCT *)l); return TRUE;
     case WM_CTLCOLORSTATIC:    SetBkMode((HDC)w, TRANSPARENT);
                                SetTextColor((HDC)w, C_DIM);
                                                      return (LRESULT)g_brPanel;
@@ -3251,17 +3329,19 @@ static HICON MakeTrayIcon(int sz)
     FillRect(cv.dc, &all, bg);
     DeleteObject(bg);
 
-    // 2x2 浅色格子
+    // 2x2 格子：左上角染强调色做品牌识别，其余浅色
     int pad = sz / 6, gap = sz / 10;
     int cw = (sz - pad * 2 - gap) / 2;
-    HBRUSH fg = CreateSolidBrush(RGB(0xEC, 0xED, 0xEF));
+    HBRUSH fg = CreateSolidBrush(C_TEXT);
+    HBRUSH ac = CreateSolidBrush(C_ACCENT);
     for (int i = 0; i < 2; i++)
         for (int j = 0; j < 2; j++) {
             RECT r = { pad + j * (cw + gap), pad + i * (cw + gap),
                        pad + j * (cw + gap) + cw, pad + i * (cw + gap) + cw };
-            FillRect(cv.dc, &r, fg);
+            FillRect(cv.dc, &r, (i == 0 && j == 0) ? ac : fg);
         }
     DeleteObject(fg);
+    DeleteObject(ac);
 
     // 圆角外挖空：keep 区之外的像素 alpha 清 0（RGB 保留，只动 alpha 字节）
     HRGN rgn = CreateRoundRectRgn(0, 0, sz + 1, sz + 1, sz / 3, sz / 3);
