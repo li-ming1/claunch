@@ -114,7 +114,7 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 
 // 时间与容差（毫秒 / 像素）：唤醒行为的一组参数，集中在这里调
 #define WAKE_GRACE_MS   3000   // 唤醒后光标不在窗口上的宽限：误唤醒不会立刻隐去
-#define HIDE_DELAY_MS   150    // 光标移出多久开始淡出
+#define HIDE_DELAY_MS   100    // 光标移出多久开始淡出
 #define FLASH_MS        1200   // 标题栏反馈消息的停留时间
 #define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
 #define EDGE_TOUCH      2      // 触边唤出：光标离工作区边多近算“贴上”
@@ -2259,7 +2259,7 @@ static void StepFade(void)
         if (g_alpha >= 255) { g_alpha = 255; g_fadeDir = 0; KillTimer(g_hwnd, TIMER_FADE); }
         SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
     } else if (g_fadeDir < 0) {
-        g_alpha -= 45;
+        g_alpha -= 70;               // 消失比出现利落：淡入 45（柔），淡出 70（干脆）
         if (g_alpha <= 0) {
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
@@ -3516,10 +3516,10 @@ static void TrayShowMenu(void)
         AppendMenuW(dm, MF_STRING | (g_dock == DOCK_LEFT ? MF_CHECKED : 0), IDM_TRAY_DOCK_LEFT, L"贴左沿");
         AppendMenuW(dm, MF_STRING | (g_dock == DOCK_RIGHT ? MF_CHECKED : 0), IDM_TRAY_DOCK_RIGHT, L"贴右沿");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)dm, L"贴边唤出");
-        // 自启是“重启后生效”的持久偏好（而非即时开关）：勾了当下没有可见
-        // 效果，文本里注明生效时机，免得看着像打钩没反应
+        // 自启写 HKCU Run，只在下次登录 Windows 时生效（重启程序不会触发）：
+        // 勾了当下没有可见效果，文本里注明生效时机，免得看着像打钩没反应
         AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0), IDM_TRAY_AUTO,
-                    L"开机自启动（重启生效）");
+                    L"开机自启动（下次开机生效）");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出程序");
         int cmd = PopupAt(m);
