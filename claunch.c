@@ -2929,13 +2929,19 @@ static void PaintGrid(HDC dc, const RECT *clip)
                 RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
             }
             if (!g_items[ii].iconTried) EnsureIcon(ii);     // 已解析的格子省一次调用
-            if (g_items[ii].icon)
-                DrawIconEx(dc, x + iconX, y + iconY, g_items[ii].icon, isz, isz,
-                           0, NULL, DI_NORMAL);
+            // 滚动露出条带只切到格子的一段：图标/文字各自与脏区不相交就跳过，
+            // 省掉 GDI 裁剪前的字形整形/图标解码开销（整格重绘时两判定恒真）
+            if (g_items[ii].icon) {
+                RECT ir = { x + iconX, y + iconY, x + iconX + isz, y + iconY + isz };
+                if (!clip || IntersectRect(&hit, &ir, clip))
+                    DrawIconEx(dc, x + iconX, y + iconY, g_items[ii].icon, isz, isz,
+                               0, NULL, DI_NORMAL);
+            }
             RECT lr = { x + lblIn, y + g_cell - lblTop,
                         x + g_cell - lblIn, y + g_cell - lblBot };
-            DrawTextW(dc, g_items[ii].name, -1, &lr,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (!clip || IntersectRect(&hit, &lr, clip))
+                DrawTextW(dc, g_items[ii].name, -1, &lr,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
     }
     SelectObject(dc, ob); SelectObject(dc, op);
