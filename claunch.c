@@ -113,8 +113,8 @@ __declspec(noinline) WCHAR *wstr_(const WCHAR *h, const WCHAR *nd)
 #define CAP_CLASS       L"ClaunchCapWnd"     // 热键捕获对话框类
 
 // 时间与容差（毫秒 / 像素）：唤醒行为的一组参数，集中在这里调
-#define WAKE_GRACE_MS   3000   // 唤醒后光标不在窗口上的宽限：误唤醒不会立刻隐去
-#define HIDE_DELAY_MS   100    // 光标移出多久开始淡出
+#define WAKE_GRACE_MS   500    // 唤醒后光标从未进过面板时的宽限：误唤醒不会立刻隐去
+#define HIDE_DELAY_MS   30     // 光标移出多久开始淡出（心跳 120ms 一拍才是主要延迟）
 #define FLASH_MS        1200   // 标题栏反馈消息的停留时间
 #define CURSOR_SLOP     2      // 光标在窗口判定上的外扩：贴边时不“卡”在边缘
 #define EDGE_TOUCH      2      // 触边唤出：光标离工作区边多近算“贴上”
@@ -297,6 +297,7 @@ static BOOL g_tracking = FALSE;
 
 static ULONGLONG g_outSince = 0;
 static ULONGLONG g_wakeAt = 0;
+static BOOL  g_entered = FALSE;   // 唤醒后光标进过面板：进过则移出即快速隐藏，宽限不再拦
 static int   g_alpha = 255, g_fadeDir = 0;
 static BOOL  g_dlgOpen = FALSE;
 static BOOL  g_menuOpen = FALSE;   // TrackPopupMenu 弹着（模态循环里 WM_TIMER 仍会派发：
@@ -2160,7 +2161,12 @@ static void ForceForeground(HWND h)
 static void StartFadeIn(void)
 {
     g_outSince = 0;
-    g_wakeAt = GetTickCount64();   // 给足 3s 宽限，否则光标不在窗口上时约 0.3s 就自动隐藏
+    g_wakeAt = GetTickCount64();
+    // 宽限只保护"唤醒后光标从未进过面板"的误唤醒；唤醒时光标已在面板上就免宽限，
+    // 移出立刻走快速隐藏——否则唤醒后几秒内移出都不消失，体感很慢
+    POINT cp; GetCursorPos(&cp);
+    RECT wr; GetWindowRect(g_hwnd, &wr);
+    g_entered = PtInRect(&wr, cp);
     RefreshVirtualIcons();       // 唤醒即对时：回收站空/满等状态化图标对齐当前真实状态
     // 呼出即抬 TOPMOST：非置顶面板在前台是全屏（游戏）或管理员权限窗口时，
     // SW_SHOW 后被整个压住——热键/托盘呼出“看似没反应”。隐藏完成再还原
@@ -2259,7 +2265,7 @@ static void StepFade(void)
         if (g_alpha >= 255) { g_alpha = 255; g_fadeDir = 0; KillTimer(g_hwnd, TIMER_FADE); }
         SetLayeredWindowAttributes(g_hwnd, 0, (BYTE)g_alpha, LWA_ALPHA);
     } else if (g_fadeDir < 0) {
-        g_alpha -= 70;               // 消失比出现利落：淡入 45（柔），淡出 70（干脆）
+        g_alpha -= 100;              // 消失比出现利落：淡入 45（柔），淡出 100（干脆）
         if (g_alpha <= 0) {
             g_alpha = 0; g_fadeDir = 0;
             KillTimer(g_hwnd, TIMER_FADE);
@@ -4082,6 +4088,7 @@ static void OnPaint(HWND h)
 static void OnMouseMove(HWND h, LPARAM l)
 {
     POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+    g_entered = TRUE;                      // 光标在面板上：此后移出即快速隐藏
     if (g_pressCell >= 0) {                 // 拖动排序进行中
         if (!g_dragging) {
             // 拖动排序按视图序号操作：过滤中的视图是子集，序号含义不同，
@@ -4147,6 +4154,7 @@ static void OnMouseMove(HWND h, LPARAM l)
 static void OnMouseLeave(void)
 {
     g_tracking = FALSE;
+    g_outSince = GetTickCount64();   // 精确移出时刻：下一拍心跳即可触发隐藏
     g_pressBtn = 0;     // 光标离开：按压态作废（按下中移出窗口很常见）
     int oc = g_hoverCell;
     g_hoverCell = g_hoverGroup = -1;
@@ -4822,7 +4830,6 @@ static void OnTimer(HWND h, WPARAM w)
             return;
         }
         if (g_pinned || !IsWindowVisible(h) || g_fadeDir) { g_outSince = 0; return; }
-        if (GetTickCount64() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; return; }
         if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) { g_outSince = 0; return; }
         POINT p;
         GetCursorPos(&p);
@@ -4830,9 +4837,11 @@ static void OnTimer(HWND h, WPARAM w)
         GetWindowRect(h, &r);
         InflateRect(&r, CURSOR_SLOP, CURSOR_SLOP);
         if (PtInRect(&r, p)) {
+            g_entered = TRUE;
             g_outSince = 0;
-            if (g_fadeDir < 0) g_fadeDir = 1;
         } else {
+            // 宽限只拦"从未进过面板"的误唤醒；进过的，移出即快速隐藏
+            if (!g_entered && GetTickCount64() - g_wakeAt < WAKE_GRACE_MS) { g_outSince = 0; return; }
             ULONGLONG now = GetTickCount64();
             if (!g_outSince) g_outSince = now;
             else if (now - g_outSince > HIDE_DELAY_MS) BeginHide(FALSE);   // 移出即开始消失
